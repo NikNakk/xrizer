@@ -242,11 +242,21 @@ mod platform {
                 );
 
                 if env_enabled("XRIZER_D3D11_TEST_CLEAR") && eye == vr::EVREye::Right {
-                    match self.device.CreateRenderTargetView(&*dst, None) {
-                        Ok(rtv) => {
-                            // Loud magenta: unmistakable if the array swapchain reaches the HMD.
-                            self.context
-                                .ClearRenderTargetView(&rtv, &[1.0, 0.0, 1.0, 1.0]);
+                    let mut rtv = None;
+                    match self
+                        .device
+                        .CreateRenderTargetView(&*dst, None, Some(&mut rtv))
+                    {
+                        Ok(()) => {
+                            if let Some(rtv) = rtv {
+                                // Loud magenta: unmistakable if the array swapchain reaches the HMD.
+                                self.context
+                                    .ClearRenderTargetView(&rtv, &[1.0, 0.0, 1.0, 1.0]);
+                            } else {
+                                log::warn!(
+                                    "D3D11 diagnostic test clear succeeded without returning an RTV"
+                                );
+                            }
                         }
                         Err(err) => {
                             log::warn!("D3D11 diagnostic test clear failed to create RTV: {err}");
