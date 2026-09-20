@@ -116,4 +116,6 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: xrizer-windows-x64
-        path: target/release/bin/vrclient_x64.dll
+        path: |
+          target/release/bin/vrclient_x64.dll
+          target/release/openvr_api.dll
