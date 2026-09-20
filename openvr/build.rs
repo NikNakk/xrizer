@@ -1058,6 +1058,7 @@ fn generate_vtable_trait(
     let mut mod_fns = Vec::new();
     // The fields of the vtable, filled using the mod functions above
     let mut vtable_fields_init = Vec::new();
+    let mut needs_runtime_vtable = false;
     // The fields and init of the generated fntable
     let mut fntable_fields = Vec::new();
     let mut fntable_init = Vec::new();
@@ -1093,6 +1094,32 @@ fn generate_vtable_trait(
         let fn_name = syn::Ident::new(fn_name, field.ident.as_ref().unwrap().span());
         let fn_output = &f.output;
 
+        // The Microsoft x64 C++ ABI keeps `this` in RCX and puts the hidden
+        // return buffer for a large aggregate in RDX. Rust's `extern "C"`
+        // free-function ABI puts the return buffer in RCX and shifts `this`
+        // to RDX instead. Most OpenVR methods are unaffected, but a native
+        // MSVC game calling this C++ vtable method otherwise passes xrizer a
+        // matrix return buffer where it expects its interface wrapper.
+        //
+        // Keep the ordinary ABI for FnTable callers. Only the C++ vtable
+        // entry needs the explicit Microsoft member-function return shim.
+        let windows_member_sret_types = [
+            "DistortionCoordinates_t",
+            "HiddenAreaMesh_t",
+            "HmdMatrix34_t",
+            "HmdMatrix44_t",
+        ];
+        let needs_windows_member_sret = match fn_output {
+            syn::ReturnType::Type(_, ty) => match ty.as_ref() {
+                syn::Type::Path(path) => path.path.segments.last().is_some_and(|segment| {
+                    windows_member_sret_types.contains(&segment.ident.to_string().as_str())
+                }),
+                _ => false,
+            },
+            syn::ReturnType::Default => false,
+        };
+        needs_runtime_vtable |= needs_windows_member_sret;
+
         let fn_args = f
             .inputs
             .iter()
@@ -1109,7 +1136,7 @@ fn generate_vtable_trait(
             parse_quote! { log::trace!(target: "openvr_calls", #s); }
         };
 
-        let bare: syn::ItemFn = {
+        let mut bare: syn::ItemFn = {
             let params = fn_args.clone();
             let call_args = fn_args_names_only.clone();
             parse_quote! {
@@ -1124,7 +1151,46 @@ fn generate_vtable_trait(
                 }
             }
         };
+        if needs_windows_member_sret {
+            bare.attrs
+                .push(parse_quote!(#[cfg(not(target_os = "windows"))]));
+        }
         mod_fns.push(syn::Item::from(bare));
+
+        let windows_member_sret_name = format_ident!("{fn_name}_WindowsMemberSret");
+        if needs_windows_member_sret {
+            let output_ty = match fn_output {
+                syn::ReturnType::Type(_, ty) => ty,
+                syn::ReturnType::Default => unreachable!(),
+            };
+            let this = f.inputs.first().unwrap();
+            let this_param = ty_to_fnarg(&this.name.as_ref().unwrap().0, &this.ty);
+            let other_params = f
+                .inputs
+                .iter()
+                .skip(1)
+                .map(|arg| ty_to_fnarg(&arg.name.as_ref().unwrap().0, &arg.ty));
+            let call_args = fn_args_names_only.clone();
+            let windows_bare: syn::ItemFn = parse_quote! {
+                #[cfg(target_os = "windows")]
+                extern "C" fn #windows_member_sret_name<T: super::#trait_ident>(
+                    #this_param,
+                    result: *mut #output_ty,
+                    #(#other_params),*
+                ) -> *mut #output_ty {
+                    #[cfg(feature = "tracing")]
+                    let _span = tracy_client::span!();
+                    #fn_enter_log
+                    let this = unsafe {
+                        &*(this as *const _ as *const crate::VtableWrapper<super::#interface_ident, T>)
+                    };
+                    let value = this.wrapped.upgrade().expect("Interface is no more!").#fn_name(#(#call_args),*);
+                    unsafe { result.write(value); }
+                    result
+                }
+            };
+            mod_fns.push(syn::Item::from(windows_bare));
+        }
 
         let fn_name_fntable = format_ident!("{fn_name}_FnTable");
         let fntable_fn: syn::ItemFn = {
@@ -1155,7 +1221,41 @@ fn generate_vtable_trait(
         };
         mod_fns.push(syn::Item::from(fntable_fn));
 
-        let field: syn::FieldValue = parse_quote!(#field_ident: #fn_name::<T>);
+        let field: syn::FieldValue = if needs_windows_member_sret {
+            let params = fn_args.clone();
+            let this = f.inputs.first().unwrap();
+            let this_param = ty_to_fnarg(&this.name.as_ref().unwrap().0, &this.ty);
+            let other_params = f
+                .inputs
+                .iter()
+                .skip(1)
+                .map(|arg| ty_to_fnarg(&arg.name.as_ref().unwrap().0, &arg.ty));
+            let output_ty = match fn_output {
+                syn::ReturnType::Type(_, ty) => ty,
+                syn::ReturnType::Default => unreachable!(),
+            };
+            parse_quote!(#field_ident: {
+                #[cfg(target_os = "windows")]
+                {
+                    unsafe {
+                        std::mem::transmute::<
+                            unsafe extern "C" fn(
+                                #this_param,
+                                result: *mut #output_ty,
+                                #(#other_params),*
+                            ) -> *mut #output_ty,
+                            unsafe extern "C" fn(#(#params),*) #fn_output
+                        >(#windows_member_sret_name::<T>)
+                    }
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    #fn_name::<T>
+                }
+            })
+        } else {
+            parse_quote!(#field_ident: #fn_name::<T>)
+        };
         vtable_fields_init.push(field);
         let fntable_field: syn::Field = {
             // The FnTable version of the vtables are the same, except they omit the `this: *mut <interface>` argument
@@ -1258,6 +1358,31 @@ fn generate_vtable_trait(
             std::ffi::CStr::from_bytes_with_nul_unchecked(s.as_bytes())
         })
     };
+    let vtable_init: TokenStream = if needs_runtime_vtable {
+        parse_quote! {{
+            #[cfg(target_os = "windows")]
+            {
+                // The ABI shim requires a transmuted function pointer, which
+                // prevents promotion of the vtable literal to static storage.
+                // Give this interface vtable a stable address explicitly.
+                Box::leak(Box::new(#vtable_ident {
+                    #(#vtable_fields_init),*
+                }))
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                &#vtable_ident {
+                    #(#vtable_fields_init),*
+                }
+            }
+        }}
+    } else {
+        parse_quote! {
+            &#vtable_ident {
+                #(#vtable_fields_init),*
+            }
+        }
+    };
     GeneratedInterfaceData {
         gen_trait: parse_quote! {
             pub trait #trait_ident: Sync + Send + 'static {
@@ -1296,9 +1421,7 @@ fn generate_vtable_trait(
                     fn new_wrapped(wrapped: &Arc<Self>) -> VtableWrapper<#interface_ident, Self> {
                         VtableWrapper {
                             base: #interface_ident {
-                                vtable_: &#vtable_ident {
-                                    #(#vtable_fields_init),*
-                                }
+                                vtable_: #vtable_init
                             },
                             wrapped: Arc::downgrade(wrapped)
                         }
