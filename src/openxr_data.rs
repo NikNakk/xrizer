@@ -487,8 +487,14 @@ impl SessionData {
         create_info: Option<&SessionCreateInfo>,
     ) -> Result<(Self, xr::FrameWaiter, FrameStream), SessionCreationError> {
         let temporary_info;
+        #[cfg(target_os = "windows")]
+        let temp_vulkan = None;
+        #[cfg(not(target_os = "windows"))]
         let mut temp_vulkan = None;
+        #[cfg(target_os = "windows")]
         let mut temp_d3d11 = None;
+        #[cfg(not(target_os = "windows"))]
+        let temp_d3d11 = None;
         let info = if let Some(info) = create_info {
             if let SessionCreateInfo::Vulkan(info) = info {
                 // Monado seems to (incorrectly) give validation errors unless we call this.
