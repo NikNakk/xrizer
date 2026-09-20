@@ -21,8 +21,8 @@ impl GraphicsBackend for GlData {
 
     fn session_create_info(&self) -> <Self::Api as xr::Graphics>::SessionCreateInfo {
         xr::opengl::SessionCreateInfo::Windows {
-            h_dc: std::ptr::null_mut(),
-            h_glrc: std::ptr::null_mut(),
+            h_dc: 0,
+            h_glrc: 0,
         }
     }
 
