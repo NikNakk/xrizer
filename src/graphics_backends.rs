@@ -1,3 +1,4 @@
+mod d3d11;
 #[cfg(target_os = "linux")]
 mod gl;
 #[cfg(target_os = "windows")]
@@ -5,6 +6,7 @@ mod gl_stub;
 mod vulkan;
 
 use derive_more::{From, TryInto};
+pub use d3d11::D3D11Data;
 #[cfg(target_os = "linux")]
 pub use gl::GlData;
 #[cfg(target_os = "windows")]
@@ -60,6 +62,7 @@ pub trait GraphicsBackend: Into<SupportedBackend> {
 #[try_into(owned, ref)]
 #[allow(clippy::large_enum_variant)]
 pub enum SupportedBackend {
+    D3D11(D3D11Data),
     Vulkan(VulkanData),
     OpenGL(GlData),
     #[cfg(test)]
@@ -116,6 +119,7 @@ pub trait WithAnyGraphicsOwned<G>: WithAnyGraphicsParams {
 impl SupportedBackend {
     pub fn is_texture_type_supported(texture_type: vr::ETextureType) -> bool {
         match texture_type {
+            vr::ETextureType::DirectX => cfg!(target_os = "windows"),
             vr::ETextureType::Vulkan => true,
             vr::ETextureType::OpenGL => cfg!(target_os = "linux"),
             #[cfg(test)]
@@ -126,6 +130,7 @@ impl SupportedBackend {
 
     pub fn new(texture: &vr::Texture_t, _bounds: vr::VRTextureBounds_t) -> Option<Self> {
         match texture.eType {
+            vr::ETextureType::DirectX => D3D11Data::new(texture).map(Self::D3D11),
             vr::ETextureType::Vulkan => {
                 let vk_texture = unsafe { &*(texture.handle as *const vr::VRVulkanTextureData_t) };
                 Some(Self::Vulkan(VulkanData::new(vk_texture)))
