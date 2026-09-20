@@ -11,8 +11,10 @@ mod platform {
     use windows::Win32::Foundation::HMODULE;
     use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
     use windows::Win32::Graphics::Direct3D11::{
-        D3D11_BOX, D3D11_CREATE_DEVICE_FLAG, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
-        D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
+        D3D11_BOX, D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_FLAG, D3D11_MAP_READ,
+        D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
+        D3D11_USAGE_STAGING, D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext,
+        ID3D11Texture2D,
     };
     use windows::core::Interface;
 
@@ -116,6 +118,91 @@ mod platform {
                     height: bottom.saturating_sub(top) as i32,
                 },
             )
+
+        fn cpu_copy_region(
+            &self,
+            src: &ID3D11Texture2D,
+            src_desc: &D3D11_TEXTURE2D_DESC,
+            src_box: &D3D11_BOX,
+            dst: &ID3D11Texture2D,
+            dst_subresource: u32,
+            extent: xr::Extent2Di,
+        ) -> Result<(), String> {
+            let mut staging_desc = D3D11_TEXTURE2D_DESC::default();
+            staging_desc.Width = extent.width.max(1) as u32;
+            staging_desc.Height = extent.height.max(1) as u32;
+            staging_desc.MipLevels = 1;
+            staging_desc.ArraySize = 1;
+            staging_desc.Format = src_desc.Format;
+            staging_desc.SampleDesc.Count = 1;
+            staging_desc.SampleDesc.Quality = 0;
+            staging_desc.Usage = D3D11_USAGE_STAGING;
+            staging_desc.BindFlags = 0;
+            staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
+            staging_desc.MiscFlags = 0;
+
+            let mut staging = None;
+            unsafe {
+                self.device
+                    .CreateTexture2D(&staging_desc, None, Some(&mut staging))
+                    .map_err(|err| format!("CreateTexture2D(staging) failed: {err}"))?;
+            }
+            let staging = staging.ok_or("CreateTexture2D(staging) returned no texture")?;
+
+            unsafe {
+                self.context.CopySubresourceRegion(
+                    &staging,
+                    0,
+                    0,
+                    0,
+                    0,
+                    src,
+                    0,
+                    Some(src_box as *const D3D11_BOX),
+                );
+            }
+
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            unsafe {
+                self.context
+                    .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                    .map_err(|err| format!("Map(staging) failed: {err}"))?;
+            }
+
+            if mapped.pData.is_null() {
+                unsafe { self.context.Unmap(&staging, 0) };
+                return Err("Map(staging) returned a null data pointer".into());
+            }
+
+            if env_enabled("XRIZER_D3D11_DIAGNOSTICS") {
+                let x = (staging_desc.Width / 2) as usize;
+                let y = (staging_desc.Height / 2) as usize;
+                let offset = y * mapped.RowPitch as usize + x * 4;
+                let pixel = unsafe {
+                    let ptr = (mapped.pData as *const u8).add(offset);
+                    [*ptr, *ptr.add(1), *ptr.add(2), *ptr.add(3)]
+                };
+                log::info!(
+                    "D3D11 CPU-copy sample: dst_subresource={dst_subresource} row_pitch={} center_rgba={pixel:?}",
+                    mapped.RowPitch
+                );
+            }
+
+            unsafe {
+                self.context.UpdateSubresource(
+                    dst,
+                    dst_subresource,
+                    None,
+                    mapped.pData,
+                    mapped.RowPitch,
+                    mapped.DepthPitch,
+                );
+                self.context.Unmap(&staging, 0);
+            }
+
+            Ok(())
+        }
+
         }
     }
 
@@ -255,18 +342,33 @@ mod platform {
                 }
             }
 
-            unsafe {
-                self.context.CopySubresourceRegion(
-                    &*dst,
+            if env_enabled("XRIZER_D3D11_CPU_COPY") {
+                if let Err(err) = self.cpu_copy_region(
+                    &src,
+                    &src_desc,
+                    &src_box,
+                    &dst,
                     eye as u32,
-                    0,
-                    0,
-                    0,
-                    &*src,
-                    0,
-                    Some(&src_box as *const D3D11_BOX),
-                );
+                    extent,
+                ) {
+                    log::warn!("D3D11 CPU-copy diagnostic failed: {err}");
+                }
+            } else {
+                unsafe {
+                    self.context.CopySubresourceRegion(
+                        &*dst,
+                        eye as u32,
+                        0,
+                        0,
+                        0,
+                        &*src,
+                        0,
+                        Some(&src_box as *const D3D11_BOX),
+                    );
+                }
+            }
 
+            unsafe {
                 if env_enabled("XRIZER_D3D11_TEST_CLEAR") && eye == vr::EVREye::Right {
                     let mut rtv = None;
                     match self
