@@ -869,12 +869,13 @@ impl vr::IVRSystem026_Interface for System {
         }
 
         let output = match texture_type {
-            vr::ETextureType::Vulkan if !instance.is_null() => self
-                .openxr
-                .instance
-                .vulkan_graphics_device(self.openxr.system_id, instance as _)
-                .map(|device| device as u64)
-                .unwrap_or(0),
+            vr::ETextureType::Vulkan if !instance.is_null() => unsafe {
+                self.openxr
+                    .instance
+                    .vulkan_graphics_device(self.openxr.system_id, instance as _)
+                    .map(|device| device as u64)
+                    .unwrap_or(0)
+            },
             #[cfg(target_os = "windows")]
             vr::ETextureType::DirectX | vr::ETextureType::DirectX12 => {
                 self.d3d_adapter_luid().unwrap_or(0)
