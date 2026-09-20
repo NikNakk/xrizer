@@ -192,6 +192,17 @@ impl System {
         let mut views = self.views.lock().unwrap();
         views.get_views(&session, self.openxr.display_time.get(), ty)
     }
+
+    #[cfg(target_os = "windows")]
+    fn d3d_adapter_luid(&self) -> Option<u64> {
+        let requirements = self
+            .openxr
+            .instance
+            .graphics_requirements::<xr::D3D11>(self.openxr.system_id)
+            .ok()?;
+        let luid = requirements.adapter_luid;
+        Some(((luid.HighPart as u32 as u64) << 32) | luid.LowPart as u64)
+    }
 }
 
 impl vr::IVRSystem026_Interface for System {
@@ -853,29 +864,36 @@ impl vr::IVRSystem026_Interface for System {
         texture_type: vr::ETextureType,
         instance: *mut vr::VkInstance_T,
     ) {
-        if texture_type != vr::ETextureType::Vulkan {
-            // Proton doesn't seem to properly translate this function, but it doesn't appear to
-            // actually matter.
-            log::error!("Unsupported texture type: {texture_type:?}");
+        if device.is_null() {
             return;
         }
 
-        unsafe {
-            *device = self
+        let output = match texture_type {
+            vr::ETextureType::Vulkan if !instance.is_null() => self
                 .openxr
                 .instance
                 .vulkan_graphics_device(self.openxr.system_id, instance as _)
-                .expect("Failed to get vulkan physical device") as _;
-        }
+                .map(|device| device as u64)
+                .unwrap_or(0),
+            #[cfg(target_os = "windows")]
+            vr::ETextureType::DirectX | vr::ETextureType::DirectX12 => {
+                self.d3d_adapter_luid().unwrap_or(0)
+            }
+            other => {
+                log::warn!("No output-device mapping for texture type: {other:?}");
+                0
+            }
+        };
+
+        unsafe { *device = output };
     }
-    fn GetDXGIOutputInfo(&self, output_info: *mut i32) {
-        crate::warn_unimplemented!("GetDXGIOutputInfo");
-        if !output_info.is_null() {
-            unsafe { output_info.write(0) };
+    fn GetDXGIOutputInfo(&self, adapter_index: *mut i32) {
+        if let Some(adapter_index) = unsafe { adapter_index.as_mut() } {
+            // Our Wine/DXMT path currently exposes a single DXGI adapter.
+            *adapter_index = 0;
         }
     }
     fn GetD3D9AdapterIndex(&self) -> i32 {
-        crate::warn_unimplemented!("GetD3D9AdapterIndex");
         0
     }
 }
@@ -915,12 +933,18 @@ impl vr::IVRSystem017On019 for System {
 
 impl vr::IVRSystem016On017 for System {
     fn GetOutputDevice(&self, device: *mut u64, texture_type: vr::ETextureType) {
-        vr::IVRSystem022_Interface::GetOutputDevice(
-            self,
-            device,
-            texture_type,
-            std::ptr::null_mut(),
-        )
+        if device.is_null() {
+            return;
+        }
+
+        let output = match texture_type {
+            #[cfg(target_os = "windows")]
+            vr::ETextureType::DirectX | vr::ETextureType::DirectX12 => {
+                self.d3d_adapter_luid().unwrap_or(0)
+            }
+            _ => 0,
+        };
+        unsafe { *device = output };
     }
 }
 
