@@ -8,9 +8,7 @@ mod platform {
     use std::ffi::c_void;
     use std::mem::ManuallyDrop;
     use windows::Win32::Foundation::HMODULE;
-    use windows::Win32::Graphics::Direct3D::{
-        D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL,
-    };
+    use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
     use windows::Win32::Graphics::Direct3D11::{
         D3D11_BOX, D3D11_CREATE_DEVICE_FLAG, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
         D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
@@ -61,7 +59,7 @@ mod platform {
                     None,
                     D3D11_SDK_VERSION,
                     Some(&mut device),
-                    None::<*mut D3D_FEATURE_LEVEL>,
+                    None,
                     Some(&mut context),
                 )
                 .is_err()
@@ -187,7 +185,7 @@ mod platform {
             let src_desc = Self::texture_desc(texture);
             let (src_box, extent) = Self::rect_from_bounds(&src_desc, bounds);
             let src = Self::borrow_texture(texture);
-            let dst = Self::borrow_texture(dst.cast());
+            let dst = Self::borrow_texture(dst.cast::<c_void>());
 
             unsafe {
                 self.context.CopySubresourceRegion(
@@ -218,7 +216,7 @@ mod platform {
             let src_desc = Self::texture_desc(texture);
             let (src_box, extent) = Self::rect_from_bounds(&src_desc, bounds);
             let src = Self::borrow_texture(texture);
-            let dst = Self::borrow_texture(dst.cast());
+            let dst = Self::borrow_texture(dst.cast::<c_void>());
 
             unsafe {
                 self.context.CopySubresourceRegion(
