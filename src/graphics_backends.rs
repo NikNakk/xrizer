@@ -1,7 +1,9 @@
+#[cfg(target_os = "linux")]
 mod gl;
 mod vulkan;
 
 use derive_more::{From, TryInto};
+#[cfg(target_os = "linux")]
 pub use gl::GlData;
 use openvr as vr;
 use openxr as xr;
@@ -55,6 +57,7 @@ pub trait GraphicsBackend: Into<SupportedBackend> {
 #[allow(clippy::large_enum_variant)]
 pub enum SupportedBackend {
     Vulkan(VulkanData),
+    #[cfg(target_os = "linux")]
     OpenGL(GlData),
     #[cfg(test)]
     Fake(crate::compositor::FakeGraphicsData),
@@ -110,7 +113,9 @@ pub trait WithAnyGraphicsOwned<G>: WithAnyGraphicsParams {
 impl SupportedBackend {
     pub fn is_texture_type_supported(texture_type: vr::ETextureType) -> bool {
         match texture_type {
-            vr::ETextureType::Vulkan | vr::ETextureType::OpenGL => true,
+            vr::ETextureType::Vulkan => true,
+            #[cfg(target_os = "linux")]
+            vr::ETextureType::OpenGL => true,
             #[cfg(test)]
             vr::ETextureType::Reserved => true,
             _ => false,
@@ -123,6 +128,7 @@ impl SupportedBackend {
                 let vk_texture = unsafe { &*(texture.handle as *const vr::VRVulkanTextureData_t) };
                 Some(Self::Vulkan(VulkanData::new(vk_texture)))
             }
+            #[cfg(target_os = "linux")]
             vr::ETextureType::OpenGL => GlData::new().map(Self::OpenGL),
             #[cfg(test)]
             vr::ETextureType::Reserved => Some(Self::Fake(
