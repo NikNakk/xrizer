@@ -193,13 +193,31 @@ mod platform {
                 if n < 16 {
                     let mut dst_desc = D3D11_TEXTURE2D_DESC::default();
                     unsafe { dst.GetDesc(&mut dst_desc) };
+
+                    let src_device = unsafe { src.GetDevice().ok() };
+                    let dst_device = unsafe { dst.GetDevice().ok() };
+                    let src_device_ptr = src_device
+                        .as_ref()
+                        .map(|device| device.as_raw())
+                        .unwrap_or(std::ptr::null_mut());
+                    let dst_device_ptr = dst_device
+                        .as_ref()
+                        .map(|device| device.as_raw())
+                        .unwrap_or(std::ptr::null_mut());
+                    let backend_device_ptr = self.device.as_raw();
+
                     log::info!(
                         "D3D11 eye copy #{n}: eye={eye:?} image_index={image_index} \
-                         src={:p} src={}x{} fmt={} mips={} array={} samples={} quality={} \
+                         src={:p} src_device={:p} backend_device={:p} same_src_device={} \
+                         src={}x{} fmt={} mips={} array={} samples={} quality={} \
                          bounds=({:.6},{:.6})-({:.6},{:.6}) \
                          box=({},{})->({},{}) extent={}x{} \
-                         dst={:p} dst={}x{} fmt={} mips={} array={} samples={} quality={}",
+                         dst={:p} dst_device={:p} same_dst_device={} \
+                         dst={}x{} fmt={} mips={} array={} samples={} quality={}",
                         texture,
+                        src_device_ptr,
+                        backend_device_ptr,
+                        src_device_ptr == backend_device_ptr,
                         src_desc.Width,
                         src_desc.Height,
                         src_desc.Format.0,
@@ -218,6 +236,8 @@ mod platform {
                         extent.width,
                         extent.height,
                         dst.as_raw(),
+                        dst_device_ptr,
+                        dst_device_ptr == backend_device_ptr,
                         dst_desc.Width,
                         dst_desc.Height,
                         dst_desc.Format.0,
@@ -226,6 +246,12 @@ mod platform {
                         dst_desc.SampleDesc.Count,
                         dst_desc.SampleDesc.Quality,
                     );
+
+                    if src_device_ptr != backend_device_ptr {
+                        log::warn!(
+                            "D3D11 submitted texture belongs to a different device than the OpenXR session"
+                        );
+                    }
                 }
             }
 
