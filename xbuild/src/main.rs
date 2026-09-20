@@ -116,6 +116,14 @@ fn main() {
             eprintln!("Failed to copy Windows vrclient DLL to '{vrclient_path:?}': {e:?}");
             std::process::exit(1);
         }
+
+        // Also emit a drop-in client DLL. This is the form used by games when
+        // xrizer replaces the application's bundled openvr_api.dll directly.
+        let openvr_api_path = parent.join("openvr_api.dll");
+        if let Err(e) = std::fs::copy(&lib_path, &openvr_api_path) {
+            eprintln!("Failed to copy drop-in OpenVR DLL to '{openvr_api_path:?}': {e:?}");
+            std::process::exit(1);
+        }
     } else {
         #[cfg(unix)]
         {
