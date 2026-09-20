@@ -1,0 +1,98 @@
+name: Windows OpenXR
+
+on:
+  push:
+    branches:
+      - windows-openxr-d3d11
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  XRIZER_VERSION: ci
+  WINDOWS_TARGET: x86_64-pc-windows-gnu
+
+jobs:
+  windows-openxr:
+    name: Windows x64 (GNU) OpenXR
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cross-build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            mingw-w64 \
+            glslc
+          x86_64-w64-mingw32-gcc --version
+          glslc --version
+
+      - uses: dtolnay/rust-toolchain@1.85.0
+        with:
+          targets: ${{ env.WINDOWS_TARGET }}
+
+      - name: Build Windows OpenVR runtime
+        run: |
+          cargo xbuild \
+            --release \
+            --target "${WINDOWS_TARGET}" \
+            --no-default-features \
+            --verbose
+
+      - name: Cross-compile Windows tests
+        run: |
+          cargo test \
+            -p xrizer \
+            --target "${WINDOWS_TARGET}" \
+            --no-default-features \
+            --no-run \
+            --verbose
+
+      - name: Verify packaged DLLs
+        run: |
+          release_dir="target/${WINDOWS_TARGET}/release"
+          test -f "${release_dir}/openvr_api.dll"
+          test -f "${release_dir}/bin/vrclient_x64.dll"
+          file "${release_dir}/openvr_api.dll"
+          file "${release_dir}/bin/vrclient_x64.dll"
+
+      - name: Verify OpenVR exports
+        shell: bash
+        run: |
+          dll="target/${WINDOWS_TARGET}/release/openvr_api.dll"
+          exports="$(x86_64-w64-mingw32-objdump -p "${dll}")"
+          printf '%s\n' "${exports}" > /tmp/xrizer-openvr-exports.txt
+          for symbol in \
+            VR_InitInternal2 \
+            VR_InitInternal \
+            VR_ShutdownInternal \
+            VR_GetGenericInterface \
+            VR_IsInterfaceVersionValid \
+            VR_IsHmdPresent \
+            VR_IsRuntimeInstalled \
+            VR_GetInitToken \
+            VR_GetRuntimePath \
+            VR_GetVRInitErrorAsSymbol \
+            VR_GetVRInitErrorAsEnglishDescription
+          do
+            printf '%s\n' "${exports}" | grep -F "${symbol}" >/dev/null || {
+              echo "Missing required export: ${symbol}" >&2
+              exit 1
+            }
+          done
+
+      - name: Upload Windows runtime
+        uses: actions/upload-artifact@v4
+        with:
+          name: xrizer-windows-x64-gnu
+          if-no-files-found: error
+          path: |
+            target/${{ env.WINDOWS_TARGET }}/release/openvr_api.dll
+            target/${{ env.WINDOWS_TARGET }}/release/bin/vrclient_x64.dll
