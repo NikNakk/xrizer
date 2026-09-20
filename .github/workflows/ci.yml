@@ -97,3 +97,23 @@ jobs:
       with:
         name: xrizer-nightly-release
         path: out
+
+
+  windows-build:
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@1.85.0
+    - name: Build Windows OpenVR runtime DLL
+      env:
+        XRIZER_VERSION: ci
+      run: cargo xbuild --release --no-default-features --verbose
+    - name: Run Windows tests
+      env:
+        XRIZER_VERSION: ci
+      run: cargo test --no-default-features --verbose
+    - name: Upload Windows runtime
+      uses: actions/upload-artifact@v4
+      with:
+        name: xrizer-windows-x64
+        path: target/release/bin/vrclient_x64.dll
