@@ -430,6 +430,18 @@ impl vr::IVRCompositor029_Interface for Compositor {
         vr::EVRCompositorError::IncompatibleVersion
     }
     fn SuspendRendering(&self, bSuspend: bool) {
+        let ignore_suspend = std::env::var("XRIZER_IGNORE_SUSPEND_RENDERING")
+            .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"));
+
+        info!(
+            "SuspendRendering({bSuspend}){}",
+            if ignore_suspend {
+                " ignored by XRIZER_IGNORE_SUSPEND_RENDERING"
+            } else {
+                ""
+            }
+        );
+
         #[macros::any_graphics(DynFrameController)]
         fn set_suspend_render<G: GraphicsBackend + 'static>(
             ctrl: &mut FrameController<G>,
@@ -438,6 +450,7 @@ impl vr::IVRCompositor029_Interface for Compositor {
             ctrl.app_suspend_render = app_suspend_render;
         }
 
+        let effective_suspend = bSuspend && !ignore_suspend;
         self.openxr
             .session_data
             .get()
@@ -446,7 +459,7 @@ impl vr::IVRCompositor029_Interface for Compositor {
             .lock()
             .unwrap()
             .iter_mut()
-            .for_each(|ctrl| ctrl.with_any_graphics_mut::<set_suspend_render>(bSuspend));
+            .for_each(|ctrl| ctrl.with_any_graphics_mut::<set_suspend_render>(effective_suspend));
     }
     fn ForceReconnectProcess(&self) {
         todo!()
