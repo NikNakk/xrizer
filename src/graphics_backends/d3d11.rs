@@ -31,9 +31,7 @@ mod platform {
                 let texture = ManuallyDrop::new(ID3D11Texture2D::from_raw(texture.handle));
                 let device = texture.GetDevice().ok()?;
 
-                let mut context = None;
-                device.GetImmediateContext(&mut context);
-                let context = context?;
+                let context = device.GetImmediateContext().ok()?;
 
                 Some(Self {
                     device,
