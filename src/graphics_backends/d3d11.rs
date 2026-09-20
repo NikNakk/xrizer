@@ -18,8 +18,7 @@ mod platform {
     pub struct D3D11Data {
         device: ID3D11Device,
         context: ID3D11DeviceContext,
-        images: Vec<*mut xr::sys::platform::ID3D11Texture2D>,
-        format: u32,
+        images: Vec<usize>,
     }
 
     impl D3D11Data {
@@ -42,7 +41,6 @@ mod platform {
                     device,
                     context,
                     images: Vec::new(),
-                    format: 0,
                 })
             }
         }
@@ -71,7 +69,6 @@ mod platform {
                     device: device?,
                     context: context?,
                     images: Vec::new(),
-                    format: 0,
                 })
             }
         }
@@ -165,8 +162,8 @@ mod platform {
             images: Vec<<Self::Api as xr::Graphics>::SwapchainImage>,
             format: u32,
         ) {
-            self.images = images;
-            self.format = format;
+            self.images = images.into_iter().map(|image| image as usize).collect();
+            let _ = format;
         }
 
         fn copy_texture_to_swapchain(
@@ -185,7 +182,7 @@ mod platform {
             let src_desc = Self::texture_desc(texture);
             let (src_box, extent) = Self::rect_from_bounds(&src_desc, bounds);
             let src = Self::borrow_texture(texture);
-            let dst = Self::borrow_texture(dst.cast::<c_void>());
+            let dst = Self::borrow_texture(dst as *mut c_void);
 
             unsafe {
                 self.context.CopySubresourceRegion(
@@ -216,7 +213,7 @@ mod platform {
             let src_desc = Self::texture_desc(texture);
             let (src_box, extent) = Self::rect_from_bounds(&src_desc, bounds);
             let src = Self::borrow_texture(texture);
-            let dst = Self::borrow_texture(dst.cast::<c_void>());
+            let dst = Self::borrow_texture(dst as *mut c_void);
 
             unsafe {
                 self.context.CopySubresourceRegion(
