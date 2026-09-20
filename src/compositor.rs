@@ -1377,7 +1377,19 @@ impl<G: GraphicsBackend> FrameController<G> {
         }
         let overlay_layers;
         if let Some(overlay_man) = overlays {
-            overlay_layers = overlay_man.get_layers(session_data, self.app_fade_grid);
+            let hide_skybox_with_projection =
+                std::env::var("XRIZER_HIDE_SKYBOX_WITH_PROJECTION")
+                    .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"));
+            let render_skybox = self.app_fade_grid
+                && !(hide_skybox_with_projection && proj_layer.is_some());
+
+            if self.app_fade_grid && !render_skybox {
+                trace!(
+                    "suppressing skybox while projection layer is present by XRIZER_HIDE_SKYBOX_WITH_PROJECTION"
+                );
+            }
+
+            overlay_layers = overlay_man.get_layers(session_data, render_skybox);
             layers.extend(overlay_layers.iter().map(Deref::deref));
         }
 
