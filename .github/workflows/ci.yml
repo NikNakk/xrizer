@@ -47,7 +47,7 @@ jobs:
   ubuntu-build:
     runs-on: ubuntu-latest
     needs: check-should-build-container
-    if: ${{ needs.check-should-build-container.outputs.should-build == 'true' || inputs.forceContainerBuild }}
+    if: ${{ github.repository == 'Supreeeme/xrizer' && (needs.check-should-build-container.outputs.should-build == 'true' || inputs.forceContainerBuild) }}
     permissions:
       contents: read
       packages: write
@@ -71,7 +71,7 @@ jobs:
 
   build:
     needs: [ubuntu-build, check-should-build-container]
-    if: ${{ always() && (needs.ubuntu-build.result == 'success' || needs.ubuntu-build.result == 'skipped') }}
+    if: ${{ github.repository == 'Supreeeme/xrizer' && always() && (needs.ubuntu-build.result == 'success' || needs.ubuntu-build.result == 'skipped') }}
     runs-on: ubuntu-latest
     container:
       image: ${{ needs.check-should-build-container.outputs.container-path }}-ubuntu:latest
@@ -98,3 +98,38 @@ jobs:
         name: xrizer-nightly-release
         path: out
 
+
+
+  fork-build:
+    name: Linux regression (fork)
+    if: ${{ github.repository != 'Supreeeme/xrizer' }}
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install Linux build dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install --no-install-recommends -y \
+          cmake \
+          ninja-build \
+          clang \
+          libvulkan-dev \
+          libopenxr-dev \
+          libx11-xcb-dev \
+          glslc
+    - uses: dtolnay/rust-toolchain@stable
+    - uses: dtolnay/rust-toolchain@nightly
+      with:
+        components: miri
+    - name: Build
+      run: cargo xbuild --release --features static-openxr --verbose
+    - name: Run tests
+      run: cargo test --verbose
+    - name: Set up Miri
+      run: cargo +nightly miri setup
+    - name: Run tests with Miri
+      run: cargo +nightly miri test
+    - name: Format check
+      run: cargo fmt --check
+    - name: Clippy
+      run: cargo clippy --workspace --all-targets
