@@ -1,9 +1,6 @@
 name: Windows OpenXR
 
 on:
-  push:
-    branches:
-      - windows-openxr-d3d11
   pull_request:
     branches:
       - main
