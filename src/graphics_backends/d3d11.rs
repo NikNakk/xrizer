@@ -29,9 +29,7 @@ mod platform {
 
             unsafe {
                 let texture = ManuallyDrop::new(ID3D11Texture2D::from_raw(texture.handle));
-                let mut device = None;
-                texture.GetDevice(&mut device);
-                let device = device?;
+                let device = texture.GetDevice().ok()?;
 
                 let mut context = None;
                 device.GetImmediateContext(&mut context);
@@ -186,12 +184,12 @@ mod platform {
 
             unsafe {
                 self.context.CopySubresourceRegion(
-                    &dst,
+                    &*dst,
                     eye as u32,
                     0,
                     0,
                     0,
-                    &src,
+                    &*src,
                     0,
                     Some(&src_box as *const D3D11_BOX),
                 );
@@ -217,12 +215,12 @@ mod platform {
 
             unsafe {
                 self.context.CopySubresourceRegion(
-                    &dst,
+                    &*dst,
                     0,
                     0,
                     0,
                     0,
-                    &src,
+                    &*src,
                     0,
                     Some(&src_box as *const D3D11_BOX),
                 );
