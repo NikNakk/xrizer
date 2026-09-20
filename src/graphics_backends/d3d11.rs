@@ -7,6 +7,7 @@ mod platform {
     use super::*;
     use std::ffi::c_void;
     use std::mem::ManuallyDrop;
+    use std::sync::atomic::{AtomicU32, Ordering};
     use windows::Win32::Foundation::HMODULE;
     use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
     use windows::Win32::Graphics::Direct3D11::{
@@ -14,6 +15,13 @@ mod platform {
         D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
     };
     use windows::core::Interface;
+
+    static COPY_DIAGNOSTIC_COUNT: AtomicU32 = AtomicU32::new(0);
+
+    fn env_enabled(name: &str) -> bool {
+        std::env::var(name)
+            .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+    }
 
     pub struct D3D11Data {
         device: ID3D11Device,
@@ -180,6 +188,47 @@ mod platform {
             let src = Self::borrow_texture(texture);
             let dst = Self::borrow_texture(dst as *mut c_void);
 
+            if env_enabled("XRIZER_D3D11_DIAGNOSTICS") {
+                let n = COPY_DIAGNOSTIC_COUNT.fetch_add(1, Ordering::Relaxed);
+                if n < 16 {
+                    let mut dst_desc = D3D11_TEXTURE2D_DESC::default();
+                    unsafe { dst.GetDesc(&mut dst_desc) };
+                    log::info!(
+                        "D3D11 eye copy #{n}: eye={eye:?} image_index={image_index} \
+                         src={:p} src={}x{} fmt={} mips={} array={} samples={} quality={} \
+                         bounds=({:.6},{:.6})-({:.6},{:.6}) \
+                         box=({},{})->({},{}) extent={}x{} \
+                         dst={:p} dst={}x{} fmt={} mips={} array={} samples={} quality={}",
+                        texture,
+                        src_desc.Width,
+                        src_desc.Height,
+                        src_desc.Format.0,
+                        src_desc.MipLevels,
+                        src_desc.ArraySize,
+                        src_desc.SampleDesc.Count,
+                        src_desc.SampleDesc.Quality,
+                        bounds.uMin,
+                        bounds.vMin,
+                        bounds.uMax,
+                        bounds.vMax,
+                        src_box.left,
+                        src_box.top,
+                        src_box.right,
+                        src_box.bottom,
+                        extent.width,
+                        extent.height,
+                        dst.as_raw(),
+                        dst_desc.Width,
+                        dst_desc.Height,
+                        dst_desc.Format.0,
+                        dst_desc.MipLevels,
+                        dst_desc.ArraySize,
+                        dst_desc.SampleDesc.Count,
+                        dst_desc.SampleDesc.Quality,
+                    );
+                }
+            }
+
             unsafe {
                 self.context.CopySubresourceRegion(
                     &*dst,
@@ -191,6 +240,10 @@ mod platform {
                     0,
                     Some(&src_box as *const D3D11_BOX),
                 );
+
+                if env_enabled("XRIZER_D3D11_FLUSH") {
+                    self.context.Flush();
+                }
             }
 
             extent
