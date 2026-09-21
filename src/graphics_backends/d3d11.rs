@@ -9,10 +9,13 @@ mod platform {
     use std::mem::ManuallyDrop;
     use std::sync::atomic::{AtomicU32, Ordering};
     use windows::Win32::Foundation::HMODULE;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
     use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
     use windows::Win32::Graphics::Direct3D11::{
         D3D11_BOX, D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_FLAG, D3D11_MAP_READ,
-        D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
+        D3D11_MAPPED_SUBRESOURCE, D3D11_RENDER_TARGET_VIEW_DESC,
+        D3D11_RENDER_TARGET_VIEW_DESC_0, D3D11_RTV_DIMENSION_TEXTURE2D,
+        D3D11_SDK_VERSION, D3D11_TEX2D_RTV, D3D11_TEXTURE2D_DESC,
         D3D11_USAGE_STAGING, D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext,
         ID3D11Texture2D,
     };
@@ -336,7 +339,7 @@ mod platform {
                     log::info!(
                         "D3D11 eye copy #{n}: eye={eye:?} image_index={image_index} \
                          src={:p} src_device={:p} backend_device={:p} same_src_device={} \
-                         src={}x{} fmt={} mips={} array={} samples={} quality={} \
+                         src={}x{} fmt={} mips={} array={} samples={} quality={} usage={:?} bind=0x{:x} cpu=0x{:x} misc=0x{:x} \
                          bounds=({:.6},{:.6})-({:.6},{:.6}) \
                          box=({},{})->({},{}) extent={}x{} \
                          dst={:p} dst_device={:p} same_dst_device={} \
@@ -352,6 +355,10 @@ mod platform {
                         src_desc.ArraySize,
                         src_desc.SampleDesc.Count,
                         src_desc.SampleDesc.Quality,
+                        src_desc.Usage,
+                        src_desc.BindFlags,
+                        src_desc.CPUAccessFlags,
+                        src_desc.MiscFlags,
                         bounds.uMin,
                         bounds.vMin,
                         bounds.uMax,
@@ -378,6 +385,44 @@ mod platform {
                         log::warn!(
                             "D3D11 submitted texture belongs to a different device than the OpenXR session"
                         );
+                    }
+                }
+            }
+
+            if env_enabled("XRIZER_D3D11_TEST_CLEAR_SOURCE") && eye == vr::EVREye::Left {
+                let desc = D3D11_RENDER_TARGET_VIEW_DESC {
+                    Format: DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+                    ViewDimension: D3D11_RTV_DIMENSION_TEXTURE2D,
+                    Anonymous: D3D11_RENDER_TARGET_VIEW_DESC_0 {
+                        Texture2D: D3D11_TEX2D_RTV { MipSlice: 0 },
+                    },
+                };
+                let mut rtv = None;
+                unsafe {
+                    match self
+                        .device
+                        .CreateRenderTargetView(&*src, Some(&desc), Some(&mut rtv))
+                    {
+                        Ok(()) => {
+                            if let Some(rtv) = rtv {
+                                self.context
+                                    .ClearRenderTargetView(&rtv, &[1.0, 0.0, 1.0, 1.0]);
+                                if env_enabled("XRIZER_D3D11_DIAGNOSTICS") {
+                                    log::info!(
+                                        "D3D11 source diagnostic clear: cleared submitted texture to magenta"
+                                    );
+                                }
+                            } else {
+                                log::warn!(
+                                    "D3D11 source diagnostic clear succeeded without returning an RTV"
+                                );
+                            }
+                        }
+                        Err(err) => {
+                            log::warn!(
+                                "D3D11 source diagnostic clear failed to create typed RTV: {err}"
+                            );
+                        }
                     }
                 }
             }
