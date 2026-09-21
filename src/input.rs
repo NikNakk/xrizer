@@ -415,11 +415,26 @@ macro_rules! get_subaction_path {
 impl<C: openxr_data::Compositor> vr::IVRInput011_Interface for Input<C> {
     fn GetBindingVariant(
         &self,
-        _: vr::VRInputValueHandle_t,
-        _: *mut c_char,
-        _: u32,
+        device_path: vr::VRInputValueHandle_t,
+        variant: *mut c_char,
+        variant_size: u32,
     ) -> vr::EVRInputError {
-        crate::warn_unimplemented!("GetBindingVariant");
+        let key = InputSourceKey::from(KeyData::from_ffi(device_path));
+        if key != self.left_hand_key && key != self.right_hand_key {
+            return vr::EVRInputError::InvalidHandle;
+        }
+
+        let value = c"default".to_bytes_with_nul();
+        if variant.is_null() || variant_size as usize < value.len() {
+            return vr::EVRInputError::BufferTooSmall;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                value.as_ptr().cast::<c_char>(),
+                variant,
+                value.len(),
+            );
+        }
         vr::EVRInputError::None
     }
     fn OpenBindingUI(
