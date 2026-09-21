@@ -425,7 +425,7 @@ impl<C: openxr_data::Compositor> vr::IVRInput011_Interface for Input<C> {
         }
 
         let value = c"default".to_bytes_with_nul();
-        if variant.is_null() || variant_size as usize < value.len() {
+        if variant.is_null() || (variant_size as usize) < value.len() {
             return vr::EVRInputError::BufferTooSmall;
         }
         unsafe {
@@ -557,7 +557,7 @@ impl<C: openxr_data::Compositor> vr::IVRInput011_Interface for Input<C> {
         };
 
         let bytes = label.to_bytes_with_nul();
-        if name.is_null() || name_size as usize < bytes.len() {
+        if name.is_null() || (name_size as usize) < bytes.len() {
             return vr::EVRInputError::BufferTooSmall;
         }
         unsafe {
