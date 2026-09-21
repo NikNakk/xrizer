@@ -157,22 +157,24 @@ impl StageAsset {
                     }
                 }
 
-                let (loaded_path, image) = loaded.ok_or_else(|| {
-                    format!(
-                        "stage texture {:?} failed to load; tried {}",
+                if let Some((loaded_path, image)) = loaded {
+                    let image = image.to_rgba8();
+                    let (width, height) = image.dimensions();
+                    log::info!(
+                        "loaded stage texture {:?}: {}x{} RGBA",
+                        loaded_path,
+                        width,
+                        height
+                    );
+                    (image.into_raw(), width, height)
+                } else {
+                    log::warn!(
+                        "stage texture {:?} could not be decoded; tried {}. Using white compatibility texture",
                         texture_path,
                         errors.join("; ")
-                    )
-                })?;
-                let image = image.to_rgba8();
-                let (width, height) = image.dimensions();
-                log::info!(
-                    "loaded stage texture {:?}: {}x{} RGBA",
-                    loaded_path,
-                    width,
-                    height
-                );
-                (image.into_raw(), width, height)
+                    );
+                    (vec![255, 255, 255, 255], 1, 1)
+                }
             } else {
                 log::warn!("stage OBJ {:?} has no diffuse texture; using white", path);
                 (vec![255, 255, 255, 255], 1, 1)
