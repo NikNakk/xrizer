@@ -791,11 +791,15 @@ impl<C: openxr_data::Compositor> vr::IVRInput011_Interface for Input<C> {
         vr::EVRInputError::None
     }
     fn SetDominantHand(&self, _: vr::ETrackedControllerRole) -> vr::EVRInputError {
-        crate::warn_unimplemented!("SetDominantHand");
+        // xrizer does not currently persist a user preference; accepting the call is
+        // sufficient for OpenVR clients that only use it as advisory metadata.
         vr::EVRInputError::None
     }
-    fn GetDominantHand(&self, _: *mut vr::ETrackedControllerRole) -> vr::EVRInputError {
-        crate::warn_unimplemented!("GetDominantHand");
+    fn GetDominantHand(&self, role: *mut vr::ETrackedControllerRole) -> vr::EVRInputError {
+        let Some(role) = (unsafe { role.as_mut() }) else {
+            return vr::EVRInputError::InvalidParam;
+        };
+        *role = vr::ETrackedControllerRole::RightHand;
         vr::EVRInputError::None
     }
     fn GetSkeletalActionData(
