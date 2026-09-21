@@ -193,6 +193,21 @@ impl System {
         views.get_views(&session, self.openxr.display_time.get(), ty)
     }
 
+    pub fn recommended_render_target_size(&self) -> (u32, u32) {
+        let views = self
+            .openxr
+            .instance
+            .enumerate_view_configuration_views(
+                self.openxr.system_id,
+                xr::ViewConfigurationType::PRIMARY_STEREO,
+            )
+            .expect("Couldn't enumerate stereo view configuration");
+        (
+            views[0].recommended_image_rect_width,
+            views[0].recommended_image_rect_height,
+        )
+    }
+
     #[cfg(target_os = "windows")]
     fn d3d_adapter_luid(&self) -> Option<u64> {
         let requirements = self
@@ -207,21 +222,14 @@ impl System {
 
 impl vr::IVRSystem026_Interface for System {
     fn GetRecommendedRenderTargetSize(&self, width: *mut u32, height: *mut u32) {
-        let views = self
-            .openxr
-            .instance
-            .enumerate_view_configuration_views(
-                self.openxr.system_id,
-                xr::ViewConfigurationType::PRIMARY_STEREO,
-            )
-            .unwrap();
+        let (recommended_width, recommended_height) = self.recommended_render_target_size();
 
         if !width.is_null() {
-            unsafe { *width = views[0].recommended_image_rect_width };
+            unsafe { *width = recommended_width };
         }
 
         if !height.is_null() {
-            unsafe { *height = views[0].recommended_image_rect_height };
+            unsafe { *height = recommended_height };
         }
     }
     fn GetProjectionMatrix(&self, eye: vr::EVREye, near_z: f32, far_z: f32) -> vr::HmdMatrix44_t {
