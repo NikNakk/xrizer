@@ -1,4 +1,6 @@
 mod d3d11;
+#[cfg(target_os = "windows")]
+mod d3d11_stage;
 #[cfg(target_os = "linux")]
 mod gl;
 #[cfg(target_os = "windows")]
@@ -56,6 +58,18 @@ pub trait GraphicsBackend: Into<SupportedBackend> {
         bounds: vr::VRTextureBounds_t,
         image_index: usize,
     ) -> xr::Extent2Di;
+
+    fn render_stage(
+        &mut self,
+        _stage: &crate::stage::StageAsset,
+        _views: &[xr::View; 2],
+        _image_index: usize,
+        _extent: xr::Extent2Di,
+    ) -> Result<(), String> {
+        Err("stage overrides are unsupported by this graphics backend".into())
+    }
+
+    fn clear_stage(&mut self) {}
 }
 
 #[derive(macros::Backends, TryInto, From)]
