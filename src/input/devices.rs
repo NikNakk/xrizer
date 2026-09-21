@@ -566,6 +566,35 @@ impl<C: openxr_data::Compositor> Input<C> {
         devices.get_controller_index(hand)
     }
 
+    pub fn connected_device_indices_of_class(
+        &self,
+        class: vr::ETrackedDeviceClass,
+    ) -> Vec<vr::TrackedDeviceIndex_t> {
+        let session_data = self.openxr.session_data.get();
+        let devices = session_data.input_data.devices.read().unwrap();
+
+        devices
+            .iter()
+            .enumerate()
+            .filter_map(|(index, device)| {
+                if !device.connected {
+                    return None;
+                }
+
+                let device_class = match device.get_type() {
+                    TrackedDeviceType::Hmd => vr::ETrackedDeviceClass::HMD,
+                    TrackedDeviceType::Controller { .. } => vr::ETrackedDeviceClass::Controller,
+                    #[cfg(feature = "monado")]
+                    TrackedDeviceType::GenericTracker { .. } => {
+                        vr::ETrackedDeviceClass::GenericTracker
+                    }
+                };
+
+                (device_class == class).then_some(index as vr::TrackedDeviceIndex_t)
+            })
+            .collect()
+    }
+
     pub fn get_device_string_tracked_property(
         &self,
         index: vr::TrackedDeviceIndex_t,
