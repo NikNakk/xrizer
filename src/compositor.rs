@@ -331,12 +331,31 @@ impl vr::IVRCompositor029_Interface for Compositor {
     fn ClearStageOverride(&self) {}
     fn SetStageOverride_Async(
         &self,
-        _pchRenderModelPath: *const std::ffi::c_char,
+        pchRenderModelPath: *const std::ffi::c_char,
         _pTransform: *const vr::HmdMatrix34_t,
         _pRenderSettings: *const vr::Compositor_StageRenderSettings,
         _nSizeOfRenderSettings: u32,
     ) -> vr::EVRCompositorError {
-        crate::warn_unimplemented!("SetStageOverride_Async");
+        let path = if pchRenderModelPath.is_null() {
+            "<null>".into()
+        } else {
+            unsafe { std::ffi::CStr::from_ptr(pchRenderModelPath) }
+                .to_string_lossy()
+                .into_owned()
+        };
+        info!(
+            "SetStageOverride_Async({path:?}): stage rendering is not implemented; reporting ready for compatibility"
+        );
+
+        // SteamVR's async stage override contract completes by emitting
+        // VREvent_Compositor_StageOverrideReady. Alyx uses this around map
+        // transitions before suspending scene rendering. We do not render the
+        // requested stage model yet, but reporting completion lets the
+        // application continue instead of waiting indefinitely.
+        self.input
+            .force(|_| Input::new(self.openxr.clone()))
+            .queue_global_event(vr::EVREventType::Compositor_StageOverrideReady);
+
         vr::EVRCompositorError::None
     }
     fn IsCurrentSceneFocusAppLoading(&self) -> bool {
