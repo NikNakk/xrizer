@@ -5,6 +5,7 @@ use openxr as xr;
 #[cfg(target_os = "windows")]
 mod platform {
     use super::*;
+    use super::d3d11_stage::StageRenderer;
     use std::ffi::c_void;
     use std::mem::ManuallyDrop;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -32,6 +33,7 @@ mod platform {
         device: ID3D11Device,
         context: ID3D11DeviceContext,
         images: Vec<usize>,
+        stage_renderer: Option<StageRenderer>,
     }
 
     impl D3D11Data {
@@ -50,6 +52,7 @@ mod platform {
                     device,
                     context,
                     images: Vec::new(),
+                    stage_renderer: None,
                 })
             }
         }
@@ -78,6 +81,7 @@ mod platform {
                     device: device?,
                     context: context?,
                     images: Vec::new(),
+                    stage_renderer: None,
                 })
             }
         }
@@ -518,6 +522,44 @@ mod platform {
             }
 
             extent
+        }
+
+        fn render_stage(
+            &mut self,
+            stage: &crate::stage::StageAsset,
+            views: &[xr::View; 2],
+            image_index: usize,
+            extent: xr::Extent2Di,
+        ) -> Result<(), String> {
+            let Some(&dst) = self.images.get(image_index) else {
+                return Err(format!("stage swapchain image index {image_index} is unavailable"));
+            };
+            let dst = Self::borrow_texture(dst as *mut c_void);
+
+            if self
+                .stage_renderer
+                .as_ref()
+                .is_none_or(|renderer| renderer.stage_id() != stage.id)
+            {
+                log::info!(
+                    "creating D3D11 stage renderer for {:?}: {} vertices, {} indices, texture {}x{}",
+                    stage.source_path,
+                    stage.vertices.len(),
+                    stage.indices.len(),
+                    stage.texture_width,
+                    stage.texture_height,
+                );
+                self.stage_renderer = Some(StageRenderer::new(&self.device, stage)?);
+            }
+
+            self.stage_renderer
+                .as_mut()
+                .expect("stage renderer was just initialized")
+                .render(&self.device, &self.context, stage, views, &dst, extent)
+        }
+
+        fn clear_stage(&mut self) {
+            self.stage_renderer = None;
         }
     }
 }
