@@ -1539,6 +1539,15 @@ impl<G: GraphicsBackend> FrameController<G> {
             }
         }
 
+        // A suspended application may continue calling Submit with black placeholders.
+        // If no stage could be rendered, do not leave the runtime swapchain image acquired.
+        if self.app_suspend_render && !stage_rendered && self.image_acquired {
+            if let Some(data) = self.swapchain_data.as_mut() {
+                data.swapchain.release_image().unwrap();
+            }
+            self.image_acquired = false;
+        }
+
         if !stage_rendered
             && self.should_render
             && !self.app_suspend_render
@@ -1593,15 +1602,6 @@ impl<G: GraphicsBackend> FrameController<G> {
                         .sub_image(sub_image)
                 })
                 .collect()
-        }
-
-        // A suspended application may continue calling Submit with black placeholders.
-        // If no stage could be rendered, do not leave the runtime swapchain image acquired.
-        if self.app_suspend_render && !stage_rendered && self.image_acquired {
-            if let Some(data) = self.swapchain_data.as_mut() {
-                data.swapchain.release_image().unwrap();
-            }
-            self.image_acquired = false;
         }
 
         let mut proj_layer = None;
