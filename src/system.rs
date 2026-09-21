@@ -535,7 +535,14 @@ impl vr::IVRSystem026_Interface for System {
         if got_event && !pose.is_null() {
             unsafe {
                 let index = (&raw const (*event).trackedDeviceIndex).read();
-                pose.write(input.get_device_pose(index, Some(origin)).unwrap());
+                // Global/system events use an invalid tracked-device index and
+                // therefore have no corresponding device pose. PollNextEventWithPose
+                // must still deliver those events rather than panicking.
+                pose.write(
+                    input
+                        .get_device_pose(index, Some(origin))
+                        .unwrap_or_default(),
+                );
             }
         }
         got_event
