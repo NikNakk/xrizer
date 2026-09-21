@@ -16,7 +16,7 @@ use skeletal::FingerState;
 use skeletal::SkeletalInputActionData;
 
 use crate::input::devices::ProfileData;
-use crate::input::profiles::RunWithProfile;
+use crate::input::profiles::{RunWithProfile, knuckles::Knuckles};
 use crate::{
     AtomicF32,
     openxr_data::{self, Hand, OpenXrData, SessionData},
@@ -117,7 +117,7 @@ impl<C: openxr_data::Compositor> Input<C> {
             .set(pose_data)
             .unwrap_or_else(|_| panic!("PoseData already setup"));
 
-        Self {
+        let input = Self {
             openxr,
             vtables: Default::default(),
             input_source_map: RwLock::new(map),
@@ -135,13 +135,84 @@ impl<C: openxr_data::Compositor> Input<C> {
             subaction_paths,
             events: Mutex::default(),
             loading_actions: false.into(),
+        };
+
+        if input.fake_controllers_enabled() {
+            let data = input.openxr.session_data.get();
+            input.ensure_fake_controllers(&data);
         }
+
+        input
     }
 
     fn get_subaction_path(&self, hand: Hand) -> xr::Path {
         match hand {
             Hand::Left => self.subaction_paths.left,
             Hand::Right => self.subaction_paths.right,
+        }
+    }
+
+    fn fake_controllers_enabled(&self) -> bool {
+        std::env::var("XRIZER_FAKE_CONTROLLERS")
+            .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+    }
+
+    fn fake_controller_profile_path(&self) -> xr::Path {
+        self.openxr
+            .instance
+            .string_to_path(Knuckles::profile_path())
+            .expect("failed to create fake Knuckles interaction profile path")
+    }
+
+    fn ensure_fake_controllers(&self, session_data: &SessionData) {
+        if !self.fake_controllers_enabled() {
+            return;
+        }
+
+        let profile_path = self.fake_controller_profile_path();
+        let mut devices = session_data.input_data.devices.write().unwrap();
+
+        for hand in [Hand::Left, Hand::Right] {
+            if let Some(controller) = devices.get_controller_mut(hand) {
+                controller.profile_path = profile_path;
+                controller.profile_data = Some(ProfileData::new::<Knuckles>());
+                controller.connected = true;
+                continue;
+            }
+
+            let mut device = TrackedDevice::new(
+                TrackedDeviceType::Controller {
+                    hand,
+                    hand_tracker: None,
+                    skeleton_cache: Mutex::new(Default::default()),
+                },
+                Some(profile_path),
+                Some(ProfileData::new::<Knuckles>()),
+            );
+            device.connected = true;
+            let index = devices.push_device(device).unwrap_or_else(|error| {
+                panic!("failed to create fake {hand:?} controller: {error:?}")
+            });
+            info!(
+                "created fake OpenVR {hand:?} controller at tracked-device index {index} using {}",
+                Knuckles::profile_path()
+            );
+        }
+    }
+
+    fn effective_interaction_profile(
+        &self,
+        session_data: &SessionData,
+        subaction: xr::Path,
+    ) -> Option<xr::Path> {
+        let profile = session_data
+            .session
+            .current_interaction_profile(subaction)
+            .ok()?;
+        if profile == xr::Path::NULL && self.fake_controllers_enabled() {
+            Some(self.fake_controller_profile_path())
+        } else {
+            Some(profile)
         }
     }
 
@@ -203,10 +274,8 @@ impl<C: openxr_data::Compositor> Input<C> {
             return None;
         };
 
-        let interaction_profile = session
-            .session
-            .current_interaction_profile(subaction)
-            .ok()?;
+        let interaction_profile =
+            self.effective_interaction_profile(&session, subaction)?;
         let bindings = loaded_actions
             .try_get_bindings(action, interaction_profile)
             .ok()?;
@@ -430,16 +499,23 @@ impl<C: openxr_data::Compositor> vr::IVRInput011_Interface for Input<C> {
             return vr::EVRInputError::InvalidHandle;
         }
 
-        // Superhot needs this device index to render controllers.
-        let index = match key {
-            x if x == self.left_hand_key => Hand::Left as u32,
-            x if x == self.right_hand_key => Hand::Right as u32,
+        // Superhot and Alyx use this to associate an action origin with
+        // a tracked controller device.
+        let hand = match key {
+            x if x == self.left_hand_key => Hand::Left,
+            x if x == self.right_hand_key => Hand::Right,
             _ => {
                 unsafe {
                     info.write(Default::default());
                 }
                 return vr::EVRInputError::InvalidDevice;
             }
+        };
+        let Some(index) = self.get_controller_device_index(hand) else {
+            unsafe {
+                info.write(Default::default());
+            }
+            return vr::EVRInputError::InvalidDevice;
         };
 
         unsafe {
@@ -453,22 +529,62 @@ impl<C: openxr_data::Compositor> vr::IVRInput011_Interface for Input<C> {
     }
     fn GetOriginLocalizedName(
         &self,
-        _: vr::VRInputValueHandle_t,
-        _: *mut c_char,
-        _: u32,
+        origin: vr::VRInputValueHandle_t,
+        name: *mut c_char,
+        name_size: u32,
         _: i32,
     ) -> vr::EVRInputError {
-        crate::warn_unimplemented!("GetOriginLocalizedName");
+        let key = InputSourceKey::from(KeyData::from_ffi(origin));
+        let label = match key {
+            x if x == self.left_hand_key => c"Left Hand",
+            x if x == self.right_hand_key => c"Right Hand",
+            _ => return vr::EVRInputError::InvalidHandle,
+        };
+
+        let bytes = label.to_bytes_with_nul();
+        if name.is_null() || name_size as usize < bytes.len() {
+            return vr::EVRInputError::BufferTooSmall;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr().cast::<c_char>(), name, bytes.len());
+        }
         vr::EVRInputError::None
     }
     fn GetActionOrigins(
         &self,
         _: vr::VRActionSetHandle_t,
         _: vr::VRActionHandle_t,
-        _: *mut vr::VRInputValueHandle_t,
-        _: u32,
+        origins: *mut vr::VRInputValueHandle_t,
+        origin_count: u32,
     ) -> vr::EVRInputError {
-        crate::warn_unimplemented!("GetActionOrigins");
+        if origins.is_null() && origin_count != 0 {
+            return vr::EVRInputError::InvalidParam;
+        }
+
+        let output = unsafe {
+            std::slice::from_raw_parts_mut(origins, origin_count as usize)
+        };
+        output.fill(vr::k_ulInvalidInputValueHandle);
+
+        let session_data = self.openxr.session_data.get();
+        let devices = session_data.input_data.devices.read().unwrap();
+        let mut next = 0usize;
+        for (hand, key) in [
+            (Hand::Left, self.left_hand_key),
+            (Hand::Right, self.right_hand_key),
+        ] {
+            if next >= output.len() {
+                break;
+            }
+            if devices
+                .get_controller(hand)
+                .is_some_and(|controller| controller.connected)
+            {
+                output[next] = key.0.as_ffi();
+                next += 1;
+            }
+        }
+
         vr::EVRInputError::None
     }
     fn TriggerHapticVibrationAction(
@@ -1356,10 +1472,17 @@ impl<C: openxr_data::Compositor> Input<C> {
             let mut controller = devices.get_controller_mut(hand);
             let subaction_path = self.get_subaction_path(hand);
 
-            let profile_path = session_data
+            let runtime_profile_path = session_data
                 .session
                 .current_interaction_profile(subaction_path)
                 .unwrap();
+            let profile_path = if runtime_profile_path == xr::Path::NULL
+                && self.fake_controllers_enabled()
+            {
+                self.fake_controller_profile_path()
+            } else {
+                runtime_profile_path
+            };
 
             if let Some(controller) = controller.as_mut() {
                 controller.profile_path = profile_path;
@@ -1541,6 +1664,7 @@ impl<C: openxr_data::Compositor> Input<C> {
                 self.subaction_paths.right,
             ))
             .unwrap_or_else(|_| panic!("PoseData already setup"));
+        self.ensure_fake_controllers(data);
         if let Some(path) = self.loaded_actions_path.get() {
             let _ = self.load_action_manifest(data, path);
         }
