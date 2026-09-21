@@ -755,11 +755,13 @@ impl vr::IVRCompositor029_Interface for Compositor {
             system: &System,
             display_time: xr::Time,
             overlays: Option<&OverlayMan>,
+            stage: Option<&crate::stage::StageAsset>,
         ) where
             for<'b> &'b crate::overlay::AnySwapchainMap:
                 TryInto<&'b crate::overlay::SwapchainMap<G::Api>, Error: std::fmt::Display>,
+            <G::Api as xr::Graphics>::Format: PartialEq + std::fmt::Debug,
         {
-            ctrl.end_frame(session_data, system, display_time, overlays)
+            ctrl.end_frame(session_data, system, display_time, overlays, stage)
         }
 
         let session_data = self.openxr.session_data.get();
@@ -777,12 +779,14 @@ impl vr::IVRCompositor029_Interface for Compositor {
         let system = self.system.force(|i| System::new(self.openxr.clone(), i));
         let display_time = self.openxr.display_time.get();
         let overlays = self.overlays.get();
+        let stage = self.stage_override.lock().unwrap().clone();
 
         ctrl.with_any_graphics_mut::<end_frame>((
             &session_data,
             &system,
             display_time,
             overlays.as_deref(),
+            stage.as_deref(),
         ));
 
         self.frame_state
@@ -1280,7 +1284,9 @@ impl<G: GraphicsBackend> FrameController<G> {
             tracy_span!("wait frame");
             self.waiter.wait().unwrap()
         };
-        self.should_render = frame_state.should_render && !self.app_suspend_render;
+        // SuspendRendering stops application projection submissions, but the compositor
+        // still has work to do: stage overrides and loading environments must remain head-tracked.
+        self.should_render = frame_state.should_render;
         (
             frame_state.predicted_display_time,
             frame_state.predicted_display_period.as_nanos(),
@@ -1331,7 +1337,7 @@ impl<G: GraphicsBackend> FrameController<G> {
             return Err(vr::EVRCompositorError::AlreadySubmitted);
         }
 
-        self.eyes_submitted[eye as usize] = if self.should_render {
+        self.eyes_submitted[eye as usize] = if self.should_render && !self.app_suspend_render {
             // Make sure our image dimensions haven't changed.
             let new_info = self
                 .backend
@@ -1373,7 +1379,7 @@ impl<G: GraphicsBackend> FrameController<G> {
         };
 
         trace!("submitted {eye:?}");
-        if self.eyes_submitted.iter().all(|eye| eye.is_some()) {
+        if self.eyes_submitted.iter().all(|eye| eye.is_some()) && !self.app_suspend_render {
             let mut swapchain_data = self.swapchain_data.as_mut();
             if let Some(data) = &mut swapchain_data {
                 trace!("releasing image");
