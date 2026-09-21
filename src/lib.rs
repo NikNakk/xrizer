@@ -13,6 +13,7 @@ mod overlayview;
 mod rendermodels;
 mod screenshots;
 mod settings;
+mod stage;
 mod system;
 
 #[cfg(not(test))]
