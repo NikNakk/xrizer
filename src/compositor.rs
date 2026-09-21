@@ -1397,13 +1397,141 @@ impl<G: GraphicsBackend> FrameController<G> {
         system: &System,
         display_time: xr::Time,
         overlays: Option<&OverlayMan>,
+        stage: Option<&crate::stage::StageAsset>,
     ) where
         for<'b> &'b crate::overlay::AnySwapchainMap:
             TryInto<&'b crate::overlay::SwapchainMap<G::Api>, Error: std::fmt::Display>,
+        <G::Api as xr::Graphics>::Format: PartialEq + std::fmt::Debug,
     {
         let mut proj_layer_views = Vec::new();
+        let stage_requested = self.should_render
+            && stage.is_some()
+            && (self.app_suspend_render || self.app_fade_grid);
+        let mut stage_rendered = false;
 
-        if self.should_render
+        if stage_requested {
+            let stage = stage.expect("stage_requested requires a stage asset");
+            if self.swapchain_data.is_none() {
+                warn!("stage override is active but no compositor swapchain exists yet");
+            } else {
+                let (recommended_width, recommended_height) =
+                    system.recommended_render_target_size();
+                let needs_recreate = self.swapchain_data.as_ref().is_some_and(|data| {
+                    data.info.width != recommended_width
+                        || data.info.height != recommended_height
+                        || data.info.array_size != 2
+                        || data.info.sample_count != 1
+                });
+
+                if needs_recreate {
+                    if self.image_acquired {
+                        self.swapchain_data
+                            .as_mut()
+                            .expect("acquired stage image without a swapchain")
+                            .swapchain
+                            .release_image()
+                            .unwrap();
+                        self.image_acquired = false;
+                    }
+
+                    let mut stage_info = self
+                        .swapchain_data
+                        .as_ref()
+                        .expect("stage swapchain disappeared")
+                        .info
+                        .clone();
+                    stage_info.width = recommended_width;
+                    stage_info.height = recommended_height;
+                    stage_info.array_size = 2;
+                    stage_info.sample_count = 1;
+                    stage_info.usage_flags |= xr::SwapchainUsageFlags::COLOR_ATTACHMENT
+                        | xr::SwapchainUsageFlags::TRANSFER_DST;
+
+                    info!(
+                        "recreating swapchain for stage override: {}x{}",
+                        recommended_width, recommended_height
+                    );
+                    self.recreate_swapchain(session_data, stage_info);
+                } else if !self.image_acquired {
+                    self.acquire_swapchain_image();
+                }
+
+                let crate::system::ViewData { flags, views } =
+                    system.get_views(session_data.current_origin_as_reference_space());
+                let extent = xr::Extent2Di {
+                    width: recommended_width as i32,
+                    height: recommended_height as i32,
+                };
+
+                match self.backend.render_stage(
+                    stage,
+                    &views,
+                    self.image_index,
+                    extent,
+                ) {
+                    Ok(()) => {
+                        if self.image_acquired {
+                            self.swapchain_data
+                                .as_mut()
+                                .expect("rendered stage without a swapchain")
+                                .swapchain
+                                .release_image()
+                                .unwrap();
+                            self.image_acquired = false;
+                        }
+
+                        let swapchain_data = self
+                            .swapchain_data
+                            .as_ref()
+                            .expect("stage swapchain disappeared after render");
+                        proj_layer_views = views
+                            .into_iter()
+                            .enumerate()
+                            .map(|(eye_index, view)| {
+                                let pose = xr::Posef {
+                                    orientation: if flags
+                                        .contains(xr::ViewStateFlags::ORIENTATION_VALID)
+                                    {
+                                        view.pose.orientation
+                                    } else {
+                                        xr::Quaternionf::IDENTITY
+                                    },
+                                    position: if flags
+                                        .contains(xr::ViewStateFlags::POSITION_VALID)
+                                    {
+                                        view.pose.position
+                                    } else {
+                                        xr::Vector3f::default()
+                                    },
+                                };
+
+                                let sub_image = xr::SwapchainSubImage::new()
+                                    .swapchain(&swapchain_data.swapchain)
+                                    .image_array_index(eye_index as u32)
+                                    .image_rect(xr::Rect2Di {
+                                        extent,
+                                        offset: xr::Offset2Di::default(),
+                                    });
+
+                                xr::CompositionLayerProjectionView::new()
+                                    .fov(view.fov)
+                                    .pose(pose)
+                                    .sub_image(sub_image)
+                            })
+                            .collect();
+                        stage_rendered = true;
+                        trace!("stage override projection rendered");
+                    }
+                    Err(error) => {
+                        warn!("failed to render stage override: {error}");
+                    }
+                }
+            }
+        }
+
+        if !stage_rendered
+            && self.should_render
+            && !self.app_suspend_render
             && !self.submitting_null
             && self.eyes_submitted.iter().all(|eye| eye.is_some())
         {
@@ -1457,9 +1585,21 @@ impl<G: GraphicsBackend> FrameController<G> {
                 .collect()
         }
 
+        // A suspended application may continue calling Submit with black placeholders.
+        // If no stage could be rendered, do not leave the runtime swapchain image acquired.
+        if self.app_suspend_render && !stage_rendered && self.image_acquired {
+            if let Some(data) = self.swapchain_data.as_mut() {
+                data.swapchain.release_image().unwrap();
+            }
+            self.image_acquired = false;
+        }
+
         let mut proj_layer = None;
         if !proj_layer_views.is_empty() {
-            trace!("projection layer present");
+            trace!(
+                "{} projection layer present",
+                if stage_rendered { "stage" } else { "application" }
+            );
             proj_layer = Some(
                 xr::CompositionLayerProjection::new()
                     .space(session_data.tracking_space())
@@ -1468,22 +1608,20 @@ impl<G: GraphicsBackend> FrameController<G> {
         }
 
         let mut layers: Vec<&xr::CompositionLayerBase<_>> = Vec::new();
-        if let Some(l) = proj_layer.as_ref() {
-            layers.push(l);
+        if let Some(layer) = proj_layer.as_ref() {
+            layers.push(layer);
         }
+
         let overlay_layers;
         if let Some(overlay_man) = overlays {
             let hide_skybox_with_projection =
                 std::env::var("XRIZER_HIDE_SKYBOX_WITH_PROJECTION")
                     .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"));
+            // A stage override replaces SteamVR's grid/environment. Do not put the
+            // equirect loading skybox in front of the stage projection.
             let render_skybox = self.app_fade_grid
+                && !stage_rendered
                 && !(hide_skybox_with_projection && proj_layer.is_some());
-
-            if self.app_fade_grid && !render_skybox {
-                trace!(
-                    "suppressing skybox while projection layer is present by XRIZER_HIDE_SKYBOX_WITH_PROJECTION"
-                );
-            }
 
             overlay_layers = overlay_man.get_layers(session_data, render_skybox);
             layers.extend(overlay_layers.iter().map(Deref::deref));
