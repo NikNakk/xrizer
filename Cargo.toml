@@ -65,6 +65,8 @@ miniquad = "0.4.8"
 webbrowser = "1.0.5"
 derive_more = { workspace = true }
 obj = "0.10.2"
+tobj = "4.0.5"
+image = { version = "0.24.9", default-features = false, features = ["png", "tga"] }
 lz4_flex = { version = "0.12.0", default-features = false, features = ["frame"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -76,6 +78,7 @@ gl = "0.14.0"
 windows = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D_Fxc",
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
