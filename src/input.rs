@@ -823,12 +823,12 @@ impl<C: openxr_data::Compositor> vr::IVRInput011_Interface for Input<C> {
         };
         let pose_data = data.input_data.pose_data.get().unwrap();
         unsafe {
-            std::ptr::addr_of_mut!((*action_data).bActive).write(
-                pose_data
-                    .grip
-                    .is_active(&data.session, xr::Path::NULL)
-                    .unwrap(),
-            );
+            let active = pose_data
+                .grip
+                .is_active(&data.session, xr::Path::NULL)
+                .unwrap();
+            std::ptr::addr_of_mut!((*action_data).bActive)
+                .write(active || self.fake_controllers_enabled());
             std::ptr::addr_of_mut!((*action_data).activeOrigin).write(origin);
         }
         vr::EVRInputError::None
@@ -1011,7 +1011,7 @@ impl<C: openxr_data::Compositor> vr::IVRInput011_Interface for Input<C> {
         let subaction_path = get_subaction_path!(self, restrict_to_device, action_data);
 
         let mut active_hand = restrict_to_device;
-        let (state, delta) = match action {
+        let (mut state, delta) = match action {
             ActionData::Vector1 { action, last_value } => {
                 let mut state = action.state(&session_data.session, subaction_path).unwrap();
 
@@ -1064,6 +1064,13 @@ impl<C: openxr_data::Compositor> vr::IVRInput011_Interface for Input<C> {
             _ => return vr::EVRInputError::WrongType,
         };
 
+        if self.fake_controllers_enabled() && !state.is_active {
+            state.is_active = true;
+            if active_hand == vr::k_ulInvalidInputValueHandle {
+                active_hand = self.left_hand_key.0.as_ffi();
+            }
+        }
+
         *out.value = vr::InputAnalogActionData_t {
             bActive: state.is_active,
             activeOrigin: active_hand,
@@ -1107,6 +1114,15 @@ impl<C: openxr_data::Compositor> vr::IVRInput011_Interface for Input<C> {
         {
             state = binding_state;
             active_hand = binding_source;
+        }
+
+        if self.fake_controllers_enabled() && !state.is_active {
+            state.is_active = true;
+            state.current_state = false;
+            state.changed_since_last_sync = false;
+            if active_hand == vr::k_ulInvalidInputValueHandle {
+                active_hand = self.left_hand_key.0.as_ffi();
+            }
         }
 
         *out.value = vr::InputDigitalActionData_t {
