@@ -5,7 +5,7 @@ use openxr as xr;
 #[cfg(target_os = "windows")]
 mod platform {
     use super::*;
-    use super::d3d11_stage::StageRenderer;
+    use super::super::d3d11_stage::StageRenderer;
     use std::ffi::c_void;
     use std::mem::ManuallyDrop;
     use std::sync::atomic::{AtomicU32, Ordering};
