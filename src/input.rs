@@ -557,7 +557,10 @@ impl<C: openxr_data::Compositor> vr::IVRInput011_Interface for Input<C> {
         origins: *mut vr::VRInputValueHandle_t,
         origin_count: u32,
     ) -> vr::EVRInputError {
-        if origins.is_null() && origin_count != 0 {
+        if origin_count == 0 {
+            return vr::EVRInputError::None;
+        }
+        if origins.is_null() {
             return vr::EVRInputError::InvalidParam;
         }
 
