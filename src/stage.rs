@@ -126,10 +126,52 @@ impl StageAsset {
                     .parent()
                     .unwrap_or_else(|| Path::new("."))
                     .join(texture_name);
-                let image = image::open(&texture_path)
-                    .map_err(|e| format!("stage texture {:?} failed to load: {e}", texture_path))?
-                    .to_rgba8();
+
+                // Alyx's diorama MTLs name PNG textures, while current game depots
+                // ship the corresponding baked textures as DDS files. SteamVR accepts
+                // those stage assets transparently, so mirror that behaviour here.
+                let mut candidates = vec![texture_path.clone()];
+                for extension in ["dds", "png", "tga"] {
+                    let candidate = texture_path.with_extension(extension);
+                    if !candidates.contains(&candidate) {
+                        candidates.push(candidate);
+                    }
+                }
+
+                let mut errors = Vec::new();
+                let mut loaded = None;
+                for candidate in candidates {
+                    match image::open(&candidate) {
+                        Ok(image) => {
+                            if candidate != texture_path {
+                                log::info!(
+                                    "stage texture {:?} is unavailable; using {:?}",
+                                    texture_path,
+                                    candidate
+                                );
+                            }
+                            loaded = Some((candidate, image));
+                            break;
+                        }
+                        Err(error) => errors.push(format!("{candidate:?}: {error}")),
+                    }
+                }
+
+                let (loaded_path, image) = loaded.ok_or_else(|| {
+                    format!(
+                        "stage texture {:?} failed to load; tried {}",
+                        texture_path,
+                        errors.join("; ")
+                    )
+                })?;
+                let image = image.to_rgba8();
                 let (width, height) = image.dimensions();
+                log::info!(
+                    "loaded stage texture {:?}: {}x{} RGBA",
+                    loaded_path,
+                    width,
+                    height
+                );
                 (image.into_raw(), width, height)
             } else {
                 log::warn!("stage OBJ {:?} has no diffuse texture; using white", path);
