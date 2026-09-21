@@ -118,6 +118,7 @@ mod platform {
                     height: bottom.saturating_sub(top) as i32,
                 },
             )
+        }
 
         fn cpu_copy_region(
             &self,
@@ -201,8 +202,6 @@ mod platform {
             }
 
             Ok(())
-        }
-
         }
     }
 
