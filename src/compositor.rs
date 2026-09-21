@@ -430,7 +430,7 @@ impl vr::IVRCompositor029_Interface for Compositor {
         vr::EVRCompositorError::None
     }
     fn IsCurrentSceneFocusAppLoading(&self) -> bool {
-        false
+        self.stage_override.lock().unwrap().is_some()
     }
     fn IsMotionSmoothingSupported(&self) -> bool {
         todo!()
