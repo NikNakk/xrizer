@@ -1153,6 +1153,7 @@ struct FrameController<G: GraphicsBackend> {
     should_render: bool,
     app_suspend_render: bool,
     app_fade_grid: bool,
+    application_projection_override_logged: bool,
     eyes_submitted: [Option<SubmittedEye>; 2],
     submitting_null: bool,
     backend: G,
@@ -1242,6 +1243,7 @@ impl<G: GraphicsBackend> FrameController<G> {
             should_render: false,
             app_suspend_render: false,
             app_fade_grid: false,
+            application_projection_override_logged: false,
             eyes_submitted: Default::default(),
             submitting_null: false,
             backend,
@@ -1432,9 +1434,28 @@ impl<G: GraphicsBackend> FrameController<G> {
             self.image_acquired = false;
         }
 
+        let application_projection_ready = self.should_render
+            && !self.app_suspend_render
+            && !self.submitting_null
+            && self.eyes_submitted.iter().all(|eye| eye.is_some());
+        let prefer_application_projection =
+            std::env::var("XRIZER_PREFER_APPLICATION_PROJECTION")
+                .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"));
+        let bypass_stage = prefer_application_projection
+            && application_projection_ready
+            && stage.is_some()
+            && self.app_fade_grid;
+        if bypass_stage && !self.application_projection_override_logged {
+            info!(
+                "application stereo projection is ready; bypassing active stage override by request"
+            );
+            self.application_projection_override_logged = true;
+        }
+
         let stage_requested = self.should_render
             && stage.is_some()
-            && (self.app_suspend_render || self.app_fade_grid);
+            && (self.app_suspend_render || self.app_fade_grid)
+            && !bypass_stage;
         let mut stage_rendered = false;
 
         if stage_requested {
@@ -1572,12 +1593,7 @@ impl<G: GraphicsBackend> FrameController<G> {
             }
         }
 
-        if !stage_rendered
-            && self.should_render
-            && !self.app_suspend_render
-            && !self.submitting_null
-            && self.eyes_submitted.iter().all(|eye| eye.is_some())
-        {
+        if !stage_rendered && application_projection_ready {
             let swapchain_data = self
                 .swapchain_data
                 .as_ref()
