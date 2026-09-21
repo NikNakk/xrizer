@@ -108,27 +108,91 @@ fn get_controller_pose(
     controller: &TrackedDevice,
     origin: vr::ETrackingUniverseOrigin,
 ) -> Option<vr::TrackedDevicePose_t> {
+    let hand = controller.get_controller_hand().unwrap();
     let pose_data = session_data.input_data.pose_data.get()?;
 
-    let spaces = match controller.get_controller_hand().unwrap() {
+    let spaces = match hand {
         Hand::Left => &pose_data.left_space,
         Hand::Right => &pose_data.right_space,
     };
 
-    let (location, velocity) = if let Some(raw) =
+    let pose = if let Some(raw) =
         spaces.try_get_or_init_raw(&controller.profile_data, session_data, pose_data)
     {
-        raw.relate(
+        let (location, velocity) = raw
+            .relate(
+                session_data.get_space_for_origin(origin),
+                xr_data.display_time.get(),
+            )
+            .ok()?;
+        vr::space_relation_to_openvr_pose(location, velocity)
+    } else {
+        trace!("Failed to get raw controller space");
+        vr::TrackedDevicePose_t::default()
+    };
+
+    if pose.bPoseIsValid {
+        return Some(pose);
+    }
+
+    let fake_controllers = std::env::var("XRIZER_FAKE_CONTROLLERS")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"));
+    if !fake_controllers {
+        return Some(pose);
+    }
+
+    // Compatibility fallback for runtimes which expose no controller interaction
+    // profile at all. Keep the two fake hands in stable head-relative positions so
+    // OpenVR clients see connected, valid, tracked controller poses without
+    // inventing any button state.
+    let (head_location, _) = session_data
+        .view_space
+        .relate(
             session_data.get_space_for_origin(origin),
             xr_data.display_time.get(),
         )
-        .ok()?
-    } else {
-        trace!("Failed to get raw space, returning empty pose");
-        (xr::SpaceLocation::default(), xr::SpaceVelocity::default())
+        .ok()?;
+
+    if !head_location.location_flags.contains(
+        xr::SpaceLocationFlags::POSITION_VALID | xr::SpaceLocationFlags::ORIENTATION_VALID,
+    ) {
+        return Some(pose);
+    }
+
+    let head_pose = head_location.pose;
+    let head_orientation = glam::Quat::from_xyzw(
+        head_pose.orientation.x,
+        head_pose.orientation.y,
+        head_pose.orientation.z,
+        head_pose.orientation.w,
+    );
+    let head_position = glam::Vec3::new(
+        head_pose.position.x,
+        head_pose.position.y,
+        head_pose.position.z,
+    );
+    let hand_offset = match hand {
+        Hand::Left => glam::Vec3::new(-0.25, -0.30, -0.45),
+        Hand::Right => glam::Vec3::new(0.25, -0.30, -0.45),
+    };
+    let position = head_position + head_orientation * hand_offset;
+    let fake_pose = xr::Posef {
+        orientation: head_pose.orientation,
+        position: xr::Vector3f {
+            x: position.x,
+            y: position.y,
+            z: position.z,
+        },
     };
 
-    Some(vr::space_relation_to_openvr_pose(location, velocity))
+    Some(vr::TrackedDevicePose_t {
+        mDeviceToAbsoluteTracking: fake_pose.into(),
+        vVelocity: Default::default(),
+        vAngularVelocity: Default::default(),
+        eTrackingResult: vr::ETrackingResult::Running_OK,
+        bPoseIsValid: true,
+        bDeviceIsConnected: true,
+    })
 }
 
 #[cfg(feature = "monado")]
