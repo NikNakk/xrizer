@@ -1408,6 +1408,20 @@ impl<G: GraphicsBackend> FrameController<G> {
         <G::Api as xr::Graphics>::Format: PartialEq + std::fmt::Debug,
     {
         let mut proj_layer_views = Vec::new();
+
+        // If the application is suspended and there is no stage we can draw this
+        // frame, release the image before creating any projection views that borrow
+        // the swapchain.
+        if self.app_suspend_render
+            && (!self.should_render || stage.is_none())
+            && self.image_acquired
+        {
+            if let Some(data) = self.swapchain_data.as_mut() {
+                data.swapchain.release_image().unwrap();
+            }
+            self.image_acquired = false;
+        }
+
         let stage_requested = self.should_render
             && stage.is_some()
             && (self.app_suspend_render || self.app_fade_grid);
@@ -1534,18 +1548,18 @@ impl<G: GraphicsBackend> FrameController<G> {
                     }
                     Err(error) => {
                         warn!("failed to render stage override: {error}");
+                        if self.image_acquired {
+                            self.swapchain_data
+                                .as_mut()
+                                .expect("failed stage render without a swapchain")
+                                .swapchain
+                                .release_image()
+                                .unwrap();
+                            self.image_acquired = false;
+                        }
                     }
                 }
             }
-        }
-
-        // A suspended application may continue calling Submit with black placeholders.
-        // If no stage could be rendered, do not leave the runtime swapchain image acquired.
-        if self.app_suspend_render && !stage_rendered && self.image_acquired {
-            if let Some(data) = self.swapchain_data.as_mut() {
-                data.swapchain.release_image().unwrap();
-            }
-            self.image_acquired = false;
         }
 
         if !stage_rendered
