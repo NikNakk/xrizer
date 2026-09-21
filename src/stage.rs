@@ -141,8 +141,8 @@ impl StageAsset {
                 let mut errors = Vec::new();
                 let mut loaded = None;
                 for candidate in candidates {
-                    match image::open(&candidate) {
-                        Ok(image) => {
+                    match load_stage_texture(&candidate) {
+                        Ok((rgba, width, height)) => {
                             if candidate != texture_path {
                                 log::info!(
                                     "stage texture {:?} is unavailable; using {:?}",
@@ -150,23 +150,21 @@ impl StageAsset {
                                     candidate
                                 );
                             }
-                            loaded = Some((candidate, image));
+                            loaded = Some((candidate, rgba, width, height));
                             break;
                         }
                         Err(error) => errors.push(format!("{candidate:?}: {error}")),
                     }
                 }
 
-                if let Some((loaded_path, image)) = loaded {
-                    let image = image.to_rgba8();
-                    let (width, height) = image.dimensions();
+                if let Some((loaded_path, rgba, width, height)) = loaded {
                     log::info!(
                         "loaded stage texture {:?}: {}x{} RGBA",
                         loaded_path,
                         width,
                         height
                     );
-                    (image.into_raw(), width, height)
+                    (rgba, width, height)
                 } else {
                     log::warn!(
                         "stage texture {:?} could not be decoded; tried {}. Using white compatibility texture",
@@ -193,6 +191,60 @@ impl StageAsset {
         })
     }
 }
+
+fn load_stage_texture(path: &Path) -> Result<(Vec<u8>, u32, u32), String> {
+    if path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("dds"))
+    {
+        return load_dds_texture(path);
+    }
+
+    let image = image::open(path)
+        .map_err(|error| error.to_string())?
+        .to_rgba8();
+    let (width, height) = image.dimensions();
+    Ok((image.into_raw(), width, height))
+}
+
+fn load_dds_texture(path: &Path) -> Result<(Vec<u8>, u32, u32), String> {
+    let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+    let mut decoder = dds::Decoder::new(file).map_err(|error| error.to_string())?;
+    if !decoder.layout().is_texture() {
+        return Err("DDS stage texture is not a single 2D texture".into());
+    }
+
+    let format = decoder.format();
+    let size = decoder.main_size();
+    let mut rgba = vec![0u8; size.pixels() as usize * 4];
+    let view = dds::ImageViewMut::new(&mut rgba, size, dds::ColorFormat::RGBA_U8)
+        .ok_or("failed to create RGBA8 view for DDS stage texture")?;
+    decoder
+        .read_surface(view)
+        .map_err(|error| error.to_string())?;
+
+    // BC4 is a single-channel format. Alyx's startup stage uses BC4U as a
+    // greyscale/luminance texture, so replicate that channel into RGB rather
+    // than exposing GPU-style (R,0,0,1) data to our ordinary RGBA shader.
+    if format == dds::Format::BC4_UNORM {
+        for pixel in rgba.chunks_exact_mut(4) {
+            let value = pixel[0];
+            pixel[1] = value;
+            pixel[2] = value;
+            pixel[3] = 255;
+        }
+    }
+
+    log::info!(
+        "decoded DDS stage texture {:?}: format={format:?}, {}x{}",
+        path,
+        size.width,
+        size.height
+    );
+    Ok((rgba, size.width, size.height))
+}
+
 
 pub fn mat4_from_hmd34(matrix: &openvr::HmdMatrix34_t) -> Mat4 {
     Mat4::from_cols(
