@@ -404,7 +404,17 @@ impl vr::IVRCompositor029_Interface for Compositor {
             crate::stage::StageSettings::default()
         };
 
-        info!("loading compositor stage override {path:?}");
+        info!(
+            "loading compositor stage override {path:?}; settings: primary={:?} secondary={:?} vignette=({:.3},{:.3}) fresnel={:.3} cull={} greyscale={} wireframe={}",
+            settings.primary_color,
+            settings.secondary_color,
+            settings.vignette_inner_radius,
+            settings.vignette_outer_radius,
+            settings.fresnel_strength,
+            settings.backface_culling,
+            settings.greyscale,
+            settings.wireframe,
+        );
         let stage = match crate::stage::StageAsset::load(&path, transform, settings) {
             Ok(stage) => Arc::new(stage),
             Err(error) => {
