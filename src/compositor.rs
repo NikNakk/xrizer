@@ -12,7 +12,7 @@ use crate::{
 use log::{debug, info, trace, warn};
 use openvr as vr;
 use openxr as xr;
-use std::mem::offset_of;
+use std::mem::{offset_of, size_of};
 use std::sync::{
     Arc, Mutex, Once,
     atomic::{AtomicU32, Ordering},
@@ -40,6 +40,7 @@ pub struct Compositor {
     timing_mode: Mutex<vr::EVRCompositorTimingMode>,
     frame_state: Mutex<FrameState>,
     focused: Once,
+    stage_override: Mutex<Option<Arc<crate::stage::StageAsset>>>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -96,6 +97,7 @@ impl Compositor {
             timing_mode: vr::EVRCompositorTimingMode::Implicit.into(),
             frame_state: FrameState::Submitted.into(),
             focused: Once::new(),
+            stage_override: Mutex::default(),
         }
     }
 
@@ -328,30 +330,99 @@ impl vr::IVRCompositor029_Interface for Compositor {
         crate::warn_unimplemented!("GetCompositorBenchmarkResults");
         false
     }
-    fn ClearStageOverride(&self) {}
+    fn ClearStageOverride(&self) {
+        let previous = self.stage_override.lock().unwrap().take();
+        if previous.is_none() {
+            return;
+        }
+
+        let session_data = self.openxr.session_data.get();
+        #[macros::any_graphics(DynFrameController)]
+        fn clear_stage<G: GraphicsBackend + 'static>(ctrl: &mut FrameController<G>) {
+            ctrl.backend.clear_stage();
+        }
+        session_data
+            .comp_data
+            .0
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .for_each(|ctrl| ctrl.with_any_graphics_mut::<clear_stage>(()));
+
+        info!("cleared compositor stage override");
+    }
+
     fn SetStageOverride_Async(
         &self,
         pchRenderModelPath: *const std::ffi::c_char,
-        _pTransform: *const vr::HmdMatrix34_t,
-        _pRenderSettings: *const vr::Compositor_StageRenderSettings,
-        _nSizeOfRenderSettings: u32,
+        pTransform: *const vr::HmdMatrix34_t,
+        pRenderSettings: *const vr::Compositor_StageRenderSettings,
+        nSizeOfRenderSettings: u32,
     ) -> vr::EVRCompositorError {
-        let path = if pchRenderModelPath.is_null() {
-            "<null>".into()
-        } else {
-            unsafe { std::ffi::CStr::from_ptr(pchRenderModelPath) }
-                .to_string_lossy()
-                .into_owned()
-        };
-        info!(
-            "SetStageOverride_Async({path:?}): stage rendering is not implemented; reporting ready for compatibility"
-        );
+        if pchRenderModelPath.is_null() {
+            warn!("SetStageOverride_Async called with a null model path");
+            return vr::EVRCompositorError::RequestFailed;
+        }
 
-        // SteamVR's async stage override contract completes by emitting
-        // VREvent_Compositor_StageOverrideReady. Alyx uses this around map
-        // transitions before suspending scene rendering. We do not render the
-        // requested stage model yet, but reporting completion lets the
-        // application continue instead of waiting indefinitely.
+        if self.stage_override.lock().unwrap().is_some() {
+            warn!("SetStageOverride_Async called while another stage override is active");
+            return vr::EVRCompositorError::RequestFailed;
+        }
+
+        let path = unsafe { std::ffi::CStr::from_ptr(pchRenderModelPath) }
+            .to_string_lossy()
+            .into_owned();
+        let transform = unsafe { pTransform.as_ref() }
+            .map(crate::stage::mat4_from_hmd34)
+            .unwrap_or(glam::Mat4::IDENTITY);
+
+        let settings = if !pRenderSettings.is_null()
+            && nSizeOfRenderSettings as usize >= size_of::<vr::Compositor_StageRenderSettings>()
+        {
+            let settings = unsafe { &*pRenderSettings };
+            crate::stage::StageSettings {
+                primary_color: [
+                    settings.m_PrimaryColor.r,
+                    settings.m_PrimaryColor.g,
+                    settings.m_PrimaryColor.b,
+                    settings.m_PrimaryColor.a,
+                ],
+                secondary_color: [
+                    settings.m_SecondaryColor.r,
+                    settings.m_SecondaryColor.g,
+                    settings.m_SecondaryColor.b,
+                    settings.m_SecondaryColor.a,
+                ],
+                vignette_inner_radius: settings.m_flVignetteInnerRadius,
+                vignette_outer_radius: settings.m_flVignetteOuterRadius,
+                fresnel_strength: settings.m_flFresnelStrength,
+                backface_culling: settings.m_bBackfaceCulling,
+                greyscale: settings.m_bGreyscale,
+                wireframe: settings.m_bWireframe,
+            }
+        } else {
+            crate::stage::StageSettings::default()
+        };
+
+        info!("loading compositor stage override {path:?}");
+        let stage = match crate::stage::StageAsset::load(&path, transform, settings) {
+            Ok(stage) => Arc::new(stage),
+            Err(error) => {
+                warn!("failed to load compositor stage override {path:?}: {error}");
+                return vr::EVRCompositorError::RequestFailed;
+            }
+        };
+
+        info!(
+            "stage override ready: {:?}, {} vertices, {} triangles, texture={}x{}",
+            stage.source_path,
+            stage.vertices.len(),
+            stage.indices.len() / 3,
+            stage.texture_width,
+            stage.texture_height,
+        );
+        *self.stage_override.lock().unwrap() = Some(stage);
+
         self.input
             .force(|_| Input::new(self.openxr.clone()))
             .queue_global_event(vr::EVREventType::Compositor_StageOverrideReady);
