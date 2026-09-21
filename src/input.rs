@@ -1546,6 +1546,15 @@ impl<C: openxr_data::Compositor> Input<C> {
         }
     }
 
+    pub fn queue_global_event(&self, ty: vr::EVREventType) {
+        debug!("queueing global OpenVR event: {ty:?}");
+        self.events.lock().unwrap().push_back(InputEvent {
+            ty,
+            index: vr::TrackedDeviceIndex_t::MAX,
+            data: Default::default(),
+        });
+    }
+
     pub fn get_next_event(&self, size: u32, out: *mut vr::VREvent_t) -> bool {
         const FUNC: &str = "get_next_event";
         if out.is_null() {
