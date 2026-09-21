@@ -176,15 +176,56 @@ mod platform {
             }
 
             if env_enabled("XRIZER_D3D11_DIAGNOSTICS") {
-                let x = (staging_desc.Width / 2) as usize;
-                let y = (staging_desc.Height / 2) as usize;
-                let offset = y * mapped.RowPitch as usize + x * 4;
-                let pixel = unsafe {
-                    let ptr = (mapped.pData as *const u8).add(offset);
-                    [*ptr, *ptr.add(1), *ptr.add(2), *ptr.add(3)]
+                let read_pixel = |x: usize, y: usize| {
+                    let offset = y * mapped.RowPitch as usize + x * 4;
+                    unsafe {
+                        let ptr = (mapped.pData as *const u8).add(offset);
+                        [*ptr, *ptr.add(1), *ptr.add(2), *ptr.add(3)]
+                    }
                 };
+
+                let center = read_pixel(
+                    (staging_desc.Width / 2) as usize,
+                    (staging_desc.Height / 2) as usize,
+                );
+
+                let xs = [
+                    staging_desc.Width / 8,
+                    staging_desc.Width / 4,
+                    staging_desc.Width / 2,
+                    staging_desc.Width * 3 / 4,
+                    staging_desc.Width * 7 / 8,
+                ];
+                let ys = [
+                    staging_desc.Height / 8,
+                    staging_desc.Height / 4,
+                    staging_desc.Height / 2,
+                    staging_desc.Height * 3 / 4,
+                    staging_desc.Height * 7 / 8,
+                ];
+
+                let mut sampled = 0u32;
+                let mut non_black = 0u32;
+                let mut min_rgb = [u8::MAX; 3];
+                let mut max_rgb = [0u8; 3];
+                for y in ys {
+                    for x in xs {
+                        let p = read_pixel(x as usize, y as usize);
+                        sampled += 1;
+                        if p[0] != 0 || p[1] != 0 || p[2] != 0 {
+                            non_black += 1;
+                        }
+                        for channel in 0..3 {
+                            min_rgb[channel] = min_rgb[channel].min(p[channel]);
+                            max_rgb[channel] = max_rgb[channel].max(p[channel]);
+                        }
+                    }
+                }
+
                 log::info!(
-                    "D3D11 CPU-copy sample: dst_subresource={dst_subresource} row_pitch={} center_rgba={pixel:?}",
+                    "D3D11 CPU-copy sample: dst_subresource={dst_subresource} row_pitch={} \
+                     center_rgba={center:?} grid_non_black={non_black}/{sampled} \
+                     grid_rgb_min={min_rgb:?} grid_rgb_max={max_rgb:?}",
                     mapped.RowPitch
                 );
             }
@@ -339,6 +380,10 @@ mod platform {
                         );
                     }
                 }
+            }
+
+            if env_enabled("XRIZER_D3D11_PREFLUSH") {
+                unsafe { self.context.Flush() };
             }
 
             if env_enabled("XRIZER_D3D11_CPU_COPY") {
