@@ -838,12 +838,25 @@ impl vr::IVRSystem026_Interface for System {
     }
     fn GetSortedTrackedDeviceIndicesOfClass(
         &self,
-        _: vr::ETrackedDeviceClass,
-        _: *mut vr::TrackedDeviceIndex_t,
-        _: u32,
-        _: vr::TrackedDeviceIndex_t,
+        class: vr::ETrackedDeviceClass,
+        indices: *mut vr::TrackedDeviceIndex_t,
+        index_count: u32,
+        _relative_to: vr::TrackedDeviceIndex_t,
     ) -> u32 {
-        0
+        let Some(input) = self.input.get() else {
+            return 0;
+        };
+
+        let devices = input.connected_device_indices_of_class(class);
+        if index_count != 0 && !indices.is_null() {
+            let output =
+                unsafe { std::slice::from_raw_parts_mut(indices, index_count as usize) };
+            for (dst, src) in output.iter_mut().zip(devices.iter().copied()) {
+                *dst = src;
+            }
+        }
+
+        devices.len() as u32
     }
     fn GetRawZeroPoseToStandingAbsoluteTrackingPose(&self) -> vr::HmdMatrix34_t {
         xr::Posef::IDENTITY.into()
