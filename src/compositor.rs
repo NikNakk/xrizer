@@ -757,6 +757,8 @@ impl vr::IVRCompositor029_Interface for Compositor {
             overlays: Option<&OverlayMan>,
             stage: Option<&crate::stage::StageAsset>,
         ) where
+            for<'a> &'a openxr_data::GraphicalSession:
+                TryInto<&'a openxr_data::Session<G::Api>, Error: std::fmt::Display>,
             for<'b> &'b crate::overlay::AnySwapchainMap:
                 TryInto<&'b crate::overlay::SwapchainMap<G::Api>, Error: std::fmt::Display>,
             <G::Api as xr::Graphics>::Format: PartialEq + std::fmt::Debug,
@@ -1399,6 +1401,8 @@ impl<G: GraphicsBackend> FrameController<G> {
         overlays: Option<&OverlayMan>,
         stage: Option<&crate::stage::StageAsset>,
     ) where
+        for<'a> &'a openxr_data::GraphicalSession:
+            TryInto<&'a openxr_data::Session<G::Api>, Error: std::fmt::Display>,
         for<'b> &'b crate::overlay::AnySwapchainMap:
             TryInto<&'b crate::overlay::SwapchainMap<G::Api>, Error: std::fmt::Display>,
         <G::Api as xr::Graphics>::Format: PartialEq + std::fmt::Debug,
@@ -1434,18 +1438,24 @@ impl<G: GraphicsBackend> FrameController<G> {
                         self.image_acquired = false;
                     }
 
-                    let mut stage_info = self
+                    let current_info = &self
                         .swapchain_data
                         .as_ref()
                         .expect("stage swapchain disappeared")
-                        .info
-                        .clone();
-                    stage_info.width = recommended_width;
-                    stage_info.height = recommended_height;
-                    stage_info.array_size = 2;
-                    stage_info.sample_count = 1;
-                    stage_info.usage_flags |= xr::SwapchainUsageFlags::COLOR_ATTACHMENT
-                        | xr::SwapchainUsageFlags::TRANSFER_DST;
+                        .info;
+                    let stage_info = xr::SwapchainCreateInfo {
+                        create_flags: current_info.create_flags,
+                        usage_flags: current_info.usage_flags
+                            | xr::SwapchainUsageFlags::COLOR_ATTACHMENT
+                            | xr::SwapchainUsageFlags::TRANSFER_DST,
+                        format: current_info.format,
+                        sample_count: 1,
+                        width: recommended_width,
+                        height: recommended_height,
+                        face_count: current_info.face_count,
+                        array_size: 2,
+                        mip_count: current_info.mip_count,
+                    };
 
                     info!(
                         "recreating swapchain for stage override: {}x{}",
