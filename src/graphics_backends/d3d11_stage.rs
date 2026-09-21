@@ -10,7 +10,7 @@ use windows::Win32::Graphics::Direct3D::Fxc::{
 };
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
-use windows::core::{Interface, s};
+use windows::core::s;
 
 const STAGE_HLSL: &str = r#"
 cbuffer StageConstants : register(b0)
