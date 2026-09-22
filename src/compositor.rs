@@ -440,7 +440,9 @@ impl vr::IVRCompositor029_Interface for Compositor {
         vr::EVRCompositorError::None
     }
     fn IsCurrentSceneFocusAppLoading(&self) -> bool {
-        self.stage_override.lock().unwrap().is_some()
+        let loading = self.stage_override.lock().unwrap().is_some();
+        trace!("[alyx-comp] IsCurrentSceneFocusAppLoading -> {loading}");
+        loading
     }
     fn IsMotionSmoothingSupported(&self) -> bool {
         todo!()
@@ -651,7 +653,8 @@ impl vr::IVRCompositor029_Interface for Compositor {
     fn GetCurrentGridAlpha(&self) -> f32 {
         0.0
     }
-    fn FadeGrid(&self, _fSeconds: f32, bFadeGridIn: bool) {
+    fn FadeGrid(&self, f_seconds: f32, bFadeGridIn: bool) {
+        info!("[alyx-comp] FadeGrid seconds={f_seconds:.3} fade_in={bFadeGridIn}");
         #[macros::any_graphics(DynFrameController)]
         fn set_fade_grid<G: GraphicsBackend + 'static>(
             ctrl: &mut FrameController<G>,
@@ -864,10 +867,23 @@ impl vr::IVRCompositor029_Interface for Compositor {
         }
 
         let Some(texture) = (unsafe { texture.as_ref() }) else {
+            trace!("[alyx-comp] Submit eye={eye:?} -> InvalidTexture (null texture)");
             return vr::EVRCompositorError::InvalidTexture;
         };
 
+        trace!(
+            "[alyx-comp] Submit eye={eye:?} type={:?} colorspace={:?} flags={submit_flags:?} bounds=({:.4},{:.4})-({:.4},{:.4}) focused={}",
+            texture.eType,
+            texture.eColorSpace,
+            bounds.uMin,
+            bounds.vMin,
+            bounds.uMax,
+            bounds.vMax,
+            self.focused.is_completed()
+        );
+
         if !self.focused.is_completed() {
+            trace!("[alyx-comp] Submit eye={eye:?} -> DoNotHaveFocus");
             return vr::EVRCompositorError::DoNotHaveFocus;
         }
 
@@ -924,8 +940,10 @@ impl vr::IVRCompositor029_Interface for Compositor {
             bounds,
             submit_flags,
         )) {
+            trace!("[alyx-comp] Submit eye={eye:?} -> {e:?}");
             return e;
         }
+        trace!("[alyx-comp] Submit eye={eye:?} -> None");
         vr::EVRCompositorError::None
     }
 
@@ -994,6 +1012,14 @@ impl vr::IVRCompositor029_Interface for Compositor {
         game_pose_count: u32,
     ) -> vr::EVRCompositorError {
         tracy_span!("WaitGetPoses impl");
+        trace!(
+            "[alyx-comp] WaitGetPoses render_poses={} game_poses={} frame_state={:?} timing={:?} stage_active={}",
+            render_pose_count,
+            game_pose_count,
+            *self.frame_state.lock().unwrap(),
+            *self.timing_mode.lock().unwrap(),
+            self.stage_override.lock().unwrap().is_some()
+        );
         // This should be called every frame - we must regularly poll events
         self.openxr.poll_events();
         self.focused.call_once(|| {});
@@ -1301,6 +1327,12 @@ impl<G: GraphicsBackend> FrameController<G> {
         // SuspendRendering stops application projection submissions, but the compositor
         // still has work to do: stage overrides and loading environments must remain head-tracked.
         self.should_render = frame_state.should_render;
+        trace!(
+            "[alyx-comp] xrWaitFrame should_render={} predicted_time={} predicted_period_ns={}",
+            frame_state.should_render,
+            frame_state.predicted_display_time.as_nanos(),
+            frame_state.predicted_display_period.as_nanos()
+        );
         (
             frame_state.predicted_display_time,
             frame_state.predicted_display_period.as_nanos(),
@@ -1346,6 +1378,15 @@ impl<G: GraphicsBackend> FrameController<G> {
             TryInto<&'b openxr_data::Session<G::Api>, Error: std::fmt::Display>,
         <G::Api as xr::Graphics>::Format: PartialEq + std::fmt::Debug,
     {
+        trace!(
+            "[alyx-comp] submit_impl eye={eye:?} should_render={} suspended={} fade_grid={} image_acquired={} eye_ready={:?}",
+            self.should_render,
+            self.app_suspend_render,
+            self.app_fade_grid,
+            self.image_acquired,
+            self.eyes_submitted.iter().map(Option::is_some).collect::<Vec<_>>()
+        );
+
         // No Man's Sky does this.
         if self.eyes_submitted[eye as usize].is_some() {
             return Err(vr::EVRCompositorError::AlreadySubmitted);
@@ -1392,7 +1433,11 @@ impl<G: GraphicsBackend> FrameController<G> {
             Some(Default::default())
         };
 
-        trace!("submitted {eye:?}");
+        trace!(
+            "[alyx-comp] submitted eye={eye:?} eye_ready={:?} projection_copy_enabled={}",
+            self.eyes_submitted.iter().map(Option::is_some).collect::<Vec<_>>(),
+            self.should_render && !self.app_suspend_render
+        );
         if self.eyes_submitted.iter().all(|eye| eye.is_some()) && !self.app_suspend_render {
             let mut swapchain_data = self.swapchain_data.as_mut();
             if let Some(data) = &mut swapchain_data {
@@ -1420,6 +1465,16 @@ impl<G: GraphicsBackend> FrameController<G> {
         <G::Api as xr::Graphics>::Format: PartialEq + std::fmt::Debug,
     {
         let mut proj_layer_views = Vec::new();
+        trace!(
+            "[alyx-comp] end_frame begin should_render={} suspended={} fade_grid={} stage_active={} eye_ready={:?} submitting_null={} image_acquired={}",
+            self.should_render,
+            self.app_suspend_render,
+            self.app_fade_grid,
+            stage.is_some(),
+            self.eyes_submitted.iter().map(Option::is_some).collect::<Vec<_>>(),
+            self.submitting_null,
+            self.image_acquired
+        );
 
         // If the application is suspended and there is no stage we can draw this
         // frame, release the image before creating any projection views that borrow
@@ -1676,6 +1731,18 @@ impl<G: GraphicsBackend> FrameController<G> {
             overlay_layers = overlay_man.get_layers(session_data, render_skybox);
             layers.extend(overlay_layers.iter().map(Deref::deref));
         }
+
+        trace!(
+            "[alyx-comp] xrEndFrame layers={} projection={} projection_source={} app_projection_ready={} stage_requested={} stage_rendered={} suspended={} fade_grid={}",
+            layers.len(),
+            proj_layer.is_some(),
+            if stage_rendered { "stage" } else if proj_layer.is_some() { "application" } else { "none" },
+            application_projection_ready,
+            stage_requested,
+            stage_rendered,
+            self.app_suspend_render,
+            self.app_fade_grid
+        );
 
         self.stream
             .end(display_time, xr::EnvironmentBlendMode::OPAQUE, &layers)
