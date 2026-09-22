@@ -1952,6 +1952,12 @@ impl<C: openxr_data::Compositor> Input<C> {
         }
 
         if let Some(event) = self.events.lock().unwrap().pop_front() {
+            trace!(
+                "[alyx-event] delivering event={:?} device={} size={}",
+                event.ty,
+                event.index,
+                size
+            );
             const MIN_CONTROLLER_EVENT_SIZE: usize = std::mem::offset_of!(vr::VREvent_t, data)
                 + std::mem::size_of::<vr::VREvent_Controller_t>();
             if size < MIN_CONTROLLER_EVENT_SIZE as u32 {
