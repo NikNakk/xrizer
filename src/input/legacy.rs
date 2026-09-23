@@ -198,6 +198,23 @@ impl<C: openxr_data::Compositor> Input<C> {
 
         let data = self.openxr.session_data.get();
         if data.input_data.get_loaded_actions().is_some() {
+            // Some OpenVR applications (notably Alyx) continue to probe
+            // IVRSystem::GetControllerState even while using the action API. Returning
+            // false here makes our opt-in fake tracked controllers look absent despite
+            // having a valid class, role, properties and pose. For fake controllers,
+            // return a neutral but valid legacy state; all actual input remains on the
+            // action API.
+            if self.fake_controllers_enabled()
+                && self.device_index_to_hand(device_index).is_some()
+                && self.is_device_connected(device_index)
+            {
+                state.unPacketNum = self.legacy_state.packet_num.load(Ordering::Relaxed);
+                trace!(
+                    "returning neutral legacy controller state for fake tracked device {device_index}"
+                );
+                return true;
+            }
+
             debug!("not returning legacy controller state due to loaded actions");
             return false;
         }
@@ -447,6 +464,12 @@ mod tests {
     #[repr(C)]
     union EventData {
         controller: vr::VREvent_Controller_t,
+        // OpenVR deliberately packs VREvent_t to 4 bytes on Linux/macOS,
+        // but uses natural alignment on Windows. The real VREvent_Data_t
+        // union contains 64-bit members, so keep this intentionally small
+        // test union 8-byte aligned on Windows as well.
+        #[cfg(target_os = "windows")]
+        _windows_alignment: u64,
     }
 
     impl Default for EventData {

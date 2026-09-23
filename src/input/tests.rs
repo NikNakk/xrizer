@@ -451,6 +451,72 @@ fn input_state_flow() {
 }
 
 #[test]
+fn restricted_action_set_activates_secondary_set_for_other_hand() {
+    let mut f = Fixture::new();
+
+    let set1 = f.get_action_set_handle(c"/actions/set1");
+    let set2 = f.get_action_set_handle(c"/actions/set2");
+    let boolact1 = f.get_action_handle(c"/actions/set1/in/boolact");
+    let boolact2 = f.get_action_handle(c"/actions/set2/in/boolact");
+    let left = f.get_input_source_handle(c"/user/hand/left");
+
+    f.load_actions(c"actions.json");
+    fakexr::set_action_state(
+        f.get_action::<bool>(boolact1),
+        fakexr::ActionState::Bool(true),
+        LeftHand,
+    );
+    fakexr::set_action_state(
+        f.get_action::<bool>(boolact2),
+        fakexr::ActionState::Bool(true),
+        RightHand,
+    );
+
+    f.sync(vr::VRActiveActionSet_t {
+        ulActionSet: set1,
+        ulRestrictedToDevice: left,
+        ulSecondaryActionSet: set2,
+        ..Default::default()
+    });
+
+    assert!(f.get_bool_state(boolact1).unwrap().bActive);
+    assert!(f.get_bool_state(boolact2).unwrap().bActive);
+}
+
+#[test]
+fn non_hand_restriction_activates_only_secondary_set_for_hands() {
+    let mut f = Fixture::new();
+
+    let set1 = f.get_action_set_handle(c"/actions/set1");
+    let set2 = f.get_action_set_handle(c"/actions/set2");
+    let boolact1 = f.get_action_handle(c"/actions/set1/in/boolact");
+    let boolact2 = f.get_action_handle(c"/actions/set2/in/boolact");
+    let gamepad = f.get_input_source_handle(c"/user/gamepad");
+
+    f.load_actions(c"actions.json");
+    fakexr::set_action_state(
+        f.get_action::<bool>(boolact1),
+        fakexr::ActionState::Bool(true),
+        LeftHand,
+    );
+    fakexr::set_action_state(
+        f.get_action::<bool>(boolact2),
+        fakexr::ActionState::Bool(true),
+        RightHand,
+    );
+
+    f.sync(vr::VRActiveActionSet_t {
+        ulActionSet: set1,
+        ulRestrictedToDevice: gamepad,
+        ulSecondaryActionSet: set2,
+        ..Default::default()
+    });
+
+    assert!(!f.get_bool_state(boolact1).unwrap().bActive);
+    assert!(f.get_bool_state(boolact2).unwrap().bActive);
+}
+
+#[test]
 fn reload_manifest_on_session_restart() {
     let mut f = Fixture::new();
 
@@ -736,6 +802,45 @@ fn pose_action_no_restrict() {
         assert!(p.bPoseIsValid);
         compare_pose(expected, p.mDeviceToAbsoluteTracking.into());
     }
+}
+
+#[test]
+fn action_origins_match_pose_and_skeleton_hands() {
+    let mut f = Fixture::new();
+    let set = f.get_action_set_handle(c"/actions/set1");
+    let posel = f.get_action_handle(c"/actions/set1/in/posel");
+    let poser = f.get_action_handle(c"/actions/set1/in/poser");
+    let skellyl = f.get_action_handle(c"/actions/set1/in/skellyl");
+    let skellyr = f.get_action_handle(c"/actions/set1/in/skellyr");
+    let left = f.get_input_source_handle(c"/user/hand/left");
+    let right = f.get_input_source_handle(c"/user/hand/right");
+
+    f.load_actions(c"actions.json");
+    f.set_interaction_profile::<Knuckles>(LeftHand);
+    f.set_interaction_profile::<Knuckles>(RightHand);
+    f.input.openxr.poll_events();
+    f.input.openxr.poll_events();
+
+    let get_origins = |action| {
+        let mut origins = [vr::k_ulInvalidInputValueHandle; 2];
+        assert_eq!(
+            f.input
+                .GetActionOrigins(set, action, origins.as_mut_ptr(), origins.len() as u32),
+            vr::EVRInputError::None
+        );
+        origins
+    };
+
+    assert_eq!(get_origins(posel), [left, vr::k_ulInvalidInputValueHandle]);
+    assert_eq!(get_origins(poser), [right, vr::k_ulInvalidInputValueHandle]);
+    assert_eq!(
+        get_origins(skellyl),
+        [left, vr::k_ulInvalidInputValueHandle]
+    );
+    assert_eq!(
+        get_origins(skellyr),
+        [right, vr::k_ulInvalidInputValueHandle]
+    );
 }
 
 #[test]

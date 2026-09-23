@@ -12,7 +12,7 @@ use crate::{
 use log::{debug, info, trace, warn};
 use openvr as vr;
 use openxr as xr;
-use std::mem::offset_of;
+use std::mem::{offset_of, size_of};
 use std::sync::{
     Arc, Mutex, Once,
     atomic::{AtomicU32, Ordering},
@@ -40,6 +40,7 @@ pub struct Compositor {
     timing_mode: Mutex<vr::EVRCompositorTimingMode>,
     frame_state: Mutex<FrameState>,
     focused: Once,
+    stage_override: Mutex<Option<Arc<crate::stage::StageAsset>>>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -96,6 +97,7 @@ impl Compositor {
             timing_mode: vr::EVRCompositorTimingMode::Implicit.into(),
             frame_state: FrameState::Submitted.into(),
             focused: Once::new(),
+            stage_override: Mutex::default(),
         }
     }
 
@@ -328,19 +330,128 @@ impl vr::IVRCompositor029_Interface for Compositor {
         crate::warn_unimplemented!("GetCompositorBenchmarkResults");
         false
     }
-    fn ClearStageOverride(&self) {}
+    fn ClearStageOverride(&self) {
+        let previous = self.stage_override.lock().unwrap().take();
+        if previous.is_none() {
+            return;
+        }
+
+        let session_data = self.openxr.session_data.get();
+        #[macros::any_graphics(DynFrameController)]
+        fn clear_stage<G: GraphicsBackend + 'static>(ctrl: &mut FrameController<G>) {
+            ctrl.backend.clear_stage();
+        }
+        session_data
+            .comp_data
+            .0
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .for_each(|ctrl| ctrl.with_any_graphics_mut::<clear_stage>(()));
+
+        info!("cleared compositor stage override");
+    }
+
     fn SetStageOverride_Async(
         &self,
-        _pchRenderModelPath: *const std::ffi::c_char,
-        _pTransform: *const vr::HmdMatrix34_t,
-        _pRenderSettings: *const vr::Compositor_StageRenderSettings,
-        _nSizeOfRenderSettings: u32,
+        pchRenderModelPath: *const std::ffi::c_char,
+        pTransform: *const vr::HmdMatrix34_t,
+        pRenderSettings: *const vr::Compositor_StageRenderSettings,
+        nSizeOfRenderSettings: u32,
     ) -> vr::EVRCompositorError {
-        crate::warn_unimplemented!("SetStageOverride_Async");
+        let ignore_stage = std::env::var("XRIZER_IGNORE_STAGE_OVERRIDE")
+            .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"));
+        if ignore_stage {
+            info!(
+                "SetStageOverride_Async ignored by XRIZER_IGNORE_STAGE_OVERRIDE (OpenComposite compatibility; returning success without ready event)"
+            );
+            return vr::EVRCompositorError::None;
+        }
+
+        if pchRenderModelPath.is_null() {
+            warn!("SetStageOverride_Async called with a null model path");
+            return vr::EVRCompositorError::RequestFailed;
+        }
+
+        if self.stage_override.lock().unwrap().is_some() {
+            warn!("SetStageOverride_Async called while another stage override is active");
+            return vr::EVRCompositorError::RequestFailed;
+        }
+
+        let path = unsafe { std::ffi::CStr::from_ptr(pchRenderModelPath) }
+            .to_string_lossy()
+            .into_owned();
+        let transform = unsafe { pTransform.as_ref() }
+            .map(crate::stage::mat4_from_hmd34)
+            .unwrap_or(glam::Mat4::IDENTITY);
+
+        let settings = if !pRenderSettings.is_null()
+            && nSizeOfRenderSettings as usize >= size_of::<vr::Compositor_StageRenderSettings>()
+        {
+            let settings = unsafe { &*pRenderSettings };
+            crate::stage::StageSettings {
+                primary_color: [
+                    settings.m_PrimaryColor.r,
+                    settings.m_PrimaryColor.g,
+                    settings.m_PrimaryColor.b,
+                    settings.m_PrimaryColor.a,
+                ],
+                secondary_color: [
+                    settings.m_SecondaryColor.r,
+                    settings.m_SecondaryColor.g,
+                    settings.m_SecondaryColor.b,
+                    settings.m_SecondaryColor.a,
+                ],
+                vignette_inner_radius: settings.m_flVignetteInnerRadius,
+                vignette_outer_radius: settings.m_flVignetteOuterRadius,
+                fresnel_strength: settings.m_flFresnelStrength,
+                backface_culling: settings.m_bBackfaceCulling,
+                greyscale: settings.m_bGreyscale,
+                wireframe: settings.m_bWireframe,
+            }
+        } else {
+            crate::stage::StageSettings::default()
+        };
+
+        info!(
+            "loading compositor stage override {path:?}; settings: primary={:?} secondary={:?} vignette=({:.3},{:.3}) fresnel={:.3} cull={} greyscale={} wireframe={}",
+            settings.primary_color,
+            settings.secondary_color,
+            settings.vignette_inner_radius,
+            settings.vignette_outer_radius,
+            settings.fresnel_strength,
+            settings.backface_culling,
+            settings.greyscale,
+            settings.wireframe,
+        );
+        let stage = match crate::stage::StageAsset::load(&path, transform, settings) {
+            Ok(stage) => Arc::new(stage),
+            Err(error) => {
+                warn!("failed to load compositor stage override {path:?}: {error}");
+                return vr::EVRCompositorError::RequestFailed;
+            }
+        };
+
+        info!(
+            "stage override ready: {:?}, {} vertices, {} triangles, texture={}x{}",
+            stage.source_path,
+            stage.vertices.len(),
+            stage.indices.len() / 3,
+            stage.texture_width,
+            stage.texture_height,
+        );
+        *self.stage_override.lock().unwrap() = Some(stage);
+
+        self.input
+            .force(|_| Input::new(self.openxr.clone()))
+            .queue_global_event(vr::EVREventType::Compositor_StageOverrideReady);
+
         vr::EVRCompositorError::None
     }
     fn IsCurrentSceneFocusAppLoading(&self) -> bool {
-        false
+        let loading = self.stage_override.lock().unwrap().is_some();
+        trace!("[alyx-comp] IsCurrentSceneFocusAppLoading -> {loading}");
+        loading
     }
     fn IsMotionSmoothingSupported(&self) -> bool {
         todo!()
@@ -430,6 +541,18 @@ impl vr::IVRCompositor029_Interface for Compositor {
         vr::EVRCompositorError::IncompatibleVersion
     }
     fn SuspendRendering(&self, bSuspend: bool) {
+        let ignore_suspend = std::env::var("XRIZER_IGNORE_SUSPEND_RENDERING")
+            .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"));
+
+        info!(
+            "SuspendRendering({bSuspend}){}",
+            if ignore_suspend {
+                " ignored by XRIZER_IGNORE_SUSPEND_RENDERING"
+            } else {
+                ""
+            }
+        );
+
         #[macros::any_graphics(DynFrameController)]
         fn set_suspend_render<G: GraphicsBackend + 'static>(
             ctrl: &mut FrameController<G>,
@@ -438,6 +561,7 @@ impl vr::IVRCompositor029_Interface for Compositor {
             ctrl.app_suspend_render = app_suspend_render;
         }
 
+        let effective_suspend = bSuspend && !ignore_suspend;
         self.openxr
             .session_data
             .get()
@@ -446,7 +570,7 @@ impl vr::IVRCompositor029_Interface for Compositor {
             .lock()
             .unwrap()
             .iter_mut()
-            .for_each(|ctrl| ctrl.with_any_graphics_mut::<set_suspend_render>(bSuspend));
+            .for_each(|ctrl| ctrl.with_any_graphics_mut::<set_suspend_render>(effective_suspend));
     }
     fn ForceReconnectProcess(&self) {
         todo!()
@@ -538,7 +662,8 @@ impl vr::IVRCompositor029_Interface for Compositor {
     fn GetCurrentGridAlpha(&self) -> f32 {
         0.0
     }
-    fn FadeGrid(&self, _fSeconds: f32, bFadeGridIn: bool) {
+    fn FadeGrid(&self, f_seconds: f32, bFadeGridIn: bool) {
+        info!("[alyx-comp] FadeGrid seconds={f_seconds:.3} fade_in={bFadeGridIn}");
         #[macros::any_graphics(DynFrameController)]
         fn set_fade_grid<G: GraphicsBackend + 'static>(
             ctrl: &mut FrameController<G>,
@@ -652,11 +777,15 @@ impl vr::IVRCompositor029_Interface for Compositor {
             system: &System,
             display_time: xr::Time,
             overlays: Option<&OverlayMan>,
+            stage: Option<&crate::stage::StageAsset>,
         ) where
+            for<'a> &'a openxr_data::GraphicalSession:
+                TryInto<&'a openxr_data::Session<G::Api>, Error: std::fmt::Display>,
             for<'b> &'b crate::overlay::AnySwapchainMap:
                 TryInto<&'b crate::overlay::SwapchainMap<G::Api>, Error: std::fmt::Display>,
+            <G::Api as xr::Graphics>::Format: PartialEq + std::fmt::Debug,
         {
-            ctrl.end_frame(session_data, system, display_time, overlays)
+            ctrl.end_frame(session_data, system, display_time, overlays, stage)
         }
 
         let session_data = self.openxr.session_data.get();
@@ -674,12 +803,14 @@ impl vr::IVRCompositor029_Interface for Compositor {
         let system = self.system.force(|i| System::new(self.openxr.clone(), i));
         let display_time = self.openxr.display_time.get();
         let overlays = self.overlays.get();
+        let stage = self.stage_override.lock().unwrap().clone();
 
         ctrl.with_any_graphics_mut::<end_frame>((
             &session_data,
             &system,
             display_time,
             overlays.as_deref(),
+            stage.as_deref(),
         ));
 
         self.frame_state
@@ -745,10 +876,23 @@ impl vr::IVRCompositor029_Interface for Compositor {
         }
 
         let Some(texture) = (unsafe { texture.as_ref() }) else {
+            trace!("[alyx-comp] Submit eye={eye:?} -> InvalidTexture (null texture)");
             return vr::EVRCompositorError::InvalidTexture;
         };
 
+        trace!(
+            "[alyx-comp] Submit eye={eye:?} type={:?} colorspace={:?} flags={submit_flags:?} bounds=({:.4},{:.4})-({:.4},{:.4}) focused={}",
+            texture.eType,
+            texture.eColorSpace,
+            bounds.uMin,
+            bounds.vMin,
+            bounds.uMax,
+            bounds.vMax,
+            self.focused.is_completed()
+        );
+
         if !self.focused.is_completed() {
+            trace!("[alyx-comp] Submit eye={eye:?} -> DoNotHaveFocus");
             return vr::EVRCompositorError::DoNotHaveFocus;
         }
 
@@ -805,8 +949,10 @@ impl vr::IVRCompositor029_Interface for Compositor {
             bounds,
             submit_flags,
         )) {
+            trace!("[alyx-comp] Submit eye={eye:?} -> {e:?}");
             return e;
         }
+        trace!("[alyx-comp] Submit eye={eye:?} -> None");
         vr::EVRCompositorError::None
     }
 
@@ -875,6 +1021,14 @@ impl vr::IVRCompositor029_Interface for Compositor {
         game_pose_count: u32,
     ) -> vr::EVRCompositorError {
         tracy_span!("WaitGetPoses impl");
+        trace!(
+            "[alyx-comp] WaitGetPoses render_poses={} game_poses={} frame_state={:?} timing={:?} stage_active={}",
+            render_pose_count,
+            game_pose_count,
+            *self.frame_state.lock().unwrap(),
+            *self.timing_mode.lock().unwrap(),
+            self.stage_override.lock().unwrap().is_some()
+        );
         // This should be called every frame - we must regularly poll events
         self.openxr.poll_events();
         self.focused.call_once(|| {});
@@ -1034,6 +1188,7 @@ struct FrameController<G: GraphicsBackend> {
     should_render: bool,
     app_suspend_render: bool,
     app_fade_grid: bool,
+    application_projection_override_logged: bool,
     eyes_submitted: [Option<SubmittedEye>; 2],
     submitting_null: bool,
     backend: G,
@@ -1123,6 +1278,7 @@ impl<G: GraphicsBackend> FrameController<G> {
             should_render: false,
             app_suspend_render: false,
             app_fade_grid: false,
+            application_projection_override_logged: false,
             eyes_submitted: Default::default(),
             submitting_null: false,
             backend,
@@ -1177,7 +1333,15 @@ impl<G: GraphicsBackend> FrameController<G> {
             tracy_span!("wait frame");
             self.waiter.wait().unwrap()
         };
-        self.should_render = frame_state.should_render && !self.app_suspend_render;
+        // SuspendRendering stops application projection submissions, but the compositor
+        // still has work to do: stage overrides and loading environments must remain head-tracked.
+        self.should_render = frame_state.should_render;
+        trace!(
+            "[alyx-comp] xrWaitFrame should_render={} predicted_time={} predicted_period_ns={}",
+            frame_state.should_render,
+            frame_state.predicted_display_time.as_nanos(),
+            frame_state.predicted_display_period.as_nanos()
+        );
         (
             frame_state.predicted_display_time,
             frame_state.predicted_display_period.as_nanos(),
@@ -1223,12 +1387,21 @@ impl<G: GraphicsBackend> FrameController<G> {
             TryInto<&'b openxr_data::Session<G::Api>, Error: std::fmt::Display>,
         <G::Api as xr::Graphics>::Format: PartialEq + std::fmt::Debug,
     {
+        trace!(
+            "[alyx-comp] submit_impl eye={eye:?} should_render={} suspended={} fade_grid={} image_acquired={} eye_ready={:?}",
+            self.should_render,
+            self.app_suspend_render,
+            self.app_fade_grid,
+            self.image_acquired,
+            self.eyes_submitted.iter().map(Option::is_some).collect::<Vec<_>>()
+        );
+
         // No Man's Sky does this.
         if self.eyes_submitted[eye as usize].is_some() {
             return Err(vr::EVRCompositorError::AlreadySubmitted);
         }
 
-        self.eyes_submitted[eye as usize] = if self.should_render {
+        self.eyes_submitted[eye as usize] = if self.should_render && !self.app_suspend_render {
             // Make sure our image dimensions haven't changed.
             let new_info = self
                 .backend
@@ -1269,8 +1442,12 @@ impl<G: GraphicsBackend> FrameController<G> {
             Some(Default::default())
         };
 
-        trace!("submitted {eye:?}");
-        if self.eyes_submitted.iter().all(|eye| eye.is_some()) {
+        trace!(
+            "[alyx-comp] submitted eye={eye:?} eye_ready={:?} projection_copy_enabled={}",
+            self.eyes_submitted.iter().map(Option::is_some).collect::<Vec<_>>(),
+            self.should_render && !self.app_suspend_render
+        );
+        if self.eyes_submitted.iter().all(|eye| eye.is_some()) && !self.app_suspend_render {
             let mut swapchain_data = self.swapchain_data.as_mut();
             if let Some(data) = &mut swapchain_data {
                 trace!("releasing image");
@@ -1288,16 +1465,199 @@ impl<G: GraphicsBackend> FrameController<G> {
         system: &System,
         display_time: xr::Time,
         overlays: Option<&OverlayMan>,
+        stage: Option<&crate::stage::StageAsset>,
     ) where
+        for<'a> &'a openxr_data::GraphicalSession:
+            TryInto<&'a openxr_data::Session<G::Api>, Error: std::fmt::Display>,
         for<'b> &'b crate::overlay::AnySwapchainMap:
             TryInto<&'b crate::overlay::SwapchainMap<G::Api>, Error: std::fmt::Display>,
+        <G::Api as xr::Graphics>::Format: PartialEq + std::fmt::Debug,
     {
         let mut proj_layer_views = Vec::new();
+        trace!(
+            "[alyx-comp] end_frame begin should_render={} suspended={} fade_grid={} stage_active={} eye_ready={:?} submitting_null={} image_acquired={}",
+            self.should_render,
+            self.app_suspend_render,
+            self.app_fade_grid,
+            stage.is_some(),
+            self.eyes_submitted.iter().map(Option::is_some).collect::<Vec<_>>(),
+            self.submitting_null,
+            self.image_acquired
+        );
 
-        if self.should_render
-            && !self.submitting_null
-            && self.eyes_submitted.iter().all(|eye| eye.is_some())
+        // If the application is suspended and there is no stage we can draw this
+        // frame, release the image before creating any projection views that borrow
+        // the swapchain.
+        if self.app_suspend_render
+            && (!self.should_render || stage.is_none())
+            && self.image_acquired
         {
+            if let Some(data) = self.swapchain_data.as_mut() {
+                data.swapchain.release_image().unwrap();
+            }
+            self.image_acquired = false;
+        }
+
+        let application_projection_ready = self.should_render
+            && !self.app_suspend_render
+            && !self.submitting_null
+            && self.eyes_submitted.iter().all(|eye| eye.is_some());
+        let prefer_application_projection =
+            std::env::var("XRIZER_PREFER_APPLICATION_PROJECTION")
+                .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"));
+        let bypass_stage = prefer_application_projection
+            && application_projection_ready
+            && stage.is_some()
+            && self.app_fade_grid;
+        if bypass_stage && !self.application_projection_override_logged {
+            info!(
+                "application stereo projection is ready; bypassing active stage override by request"
+            );
+            self.application_projection_override_logged = true;
+        }
+
+        let stage_requested = self.should_render
+            && stage.is_some()
+            && (self.app_suspend_render || self.app_fade_grid)
+            && !bypass_stage;
+        let mut stage_rendered = false;
+
+        if stage_requested {
+            let stage = stage.expect("stage_requested requires a stage asset");
+            if self.swapchain_data.is_none() {
+                warn!("stage override is active but no compositor swapchain exists yet");
+            } else {
+                let (recommended_width, recommended_height) =
+                    system.recommended_render_target_size();
+                let needs_recreate = self.swapchain_data.as_ref().is_some_and(|data| {
+                    data.info.width != recommended_width
+                        || data.info.height != recommended_height
+                        || data.info.array_size != 2
+                        || data.info.sample_count != 1
+                });
+
+                if needs_recreate {
+                    if self.image_acquired {
+                        self.swapchain_data
+                            .as_mut()
+                            .expect("acquired stage image without a swapchain")
+                            .swapchain
+                            .release_image()
+                            .unwrap();
+                        self.image_acquired = false;
+                    }
+
+                    let current_info = &self
+                        .swapchain_data
+                        .as_ref()
+                        .expect("stage swapchain disappeared")
+                        .info;
+                    let stage_info = xr::SwapchainCreateInfo {
+                        create_flags: current_info.create_flags,
+                        usage_flags: current_info.usage_flags
+                            | xr::SwapchainUsageFlags::COLOR_ATTACHMENT
+                            | xr::SwapchainUsageFlags::TRANSFER_DST,
+                        format: current_info.format,
+                        sample_count: 1,
+                        width: recommended_width,
+                        height: recommended_height,
+                        face_count: current_info.face_count,
+                        array_size: 2,
+                        mip_count: current_info.mip_count,
+                    };
+
+                    info!(
+                        "recreating swapchain for stage override: {}x{}",
+                        recommended_width, recommended_height
+                    );
+                    self.recreate_swapchain(session_data, stage_info);
+                } else if !self.image_acquired {
+                    self.acquire_swapchain_image();
+                }
+
+                let crate::system::ViewData { flags, views } =
+                    system.get_views(session_data.current_origin_as_reference_space());
+                let extent = xr::Extent2Di {
+                    width: recommended_width as i32,
+                    height: recommended_height as i32,
+                };
+
+                match self.backend.render_stage(
+                    stage,
+                    &views,
+                    self.image_index,
+                    extent,
+                ) {
+                    Ok(()) => {
+                        if self.image_acquired {
+                            self.swapchain_data
+                                .as_mut()
+                                .expect("rendered stage without a swapchain")
+                                .swapchain
+                                .release_image()
+                                .unwrap();
+                            self.image_acquired = false;
+                        }
+
+                        let swapchain_data = self
+                            .swapchain_data
+                            .as_ref()
+                            .expect("stage swapchain disappeared after render");
+                        proj_layer_views = views
+                            .into_iter()
+                            .enumerate()
+                            .map(|(eye_index, view)| {
+                                let pose = xr::Posef {
+                                    orientation: if flags
+                                        .contains(xr::ViewStateFlags::ORIENTATION_VALID)
+                                    {
+                                        view.pose.orientation
+                                    } else {
+                                        xr::Quaternionf::IDENTITY
+                                    },
+                                    position: if flags
+                                        .contains(xr::ViewStateFlags::POSITION_VALID)
+                                    {
+                                        view.pose.position
+                                    } else {
+                                        xr::Vector3f::default()
+                                    },
+                                };
+
+                                let sub_image = xr::SwapchainSubImage::new()
+                                    .swapchain(&swapchain_data.swapchain)
+                                    .image_array_index(eye_index as u32)
+                                    .image_rect(xr::Rect2Di {
+                                        extent,
+                                        offset: xr::Offset2Di::default(),
+                                    });
+
+                                xr::CompositionLayerProjectionView::new()
+                                    .fov(view.fov)
+                                    .pose(pose)
+                                    .sub_image(sub_image)
+                            })
+                            .collect();
+                        stage_rendered = true;
+                        trace!("stage override projection rendered");
+                    }
+                    Err(error) => {
+                        warn!("failed to render stage override: {error}");
+                        if self.image_acquired {
+                            self.swapchain_data
+                                .as_mut()
+                                .expect("failed stage render without a swapchain")
+                                .swapchain
+                                .release_image()
+                                .unwrap();
+                            self.image_acquired = false;
+                        }
+                    }
+                }
+            }
+        }
+
+        if !stage_rendered && application_projection_ready {
             let swapchain_data = self
                 .swapchain_data
                 .as_ref()
@@ -1350,7 +1710,10 @@ impl<G: GraphicsBackend> FrameController<G> {
 
         let mut proj_layer = None;
         if !proj_layer_views.is_empty() {
-            trace!("projection layer present");
+            trace!(
+                "{} projection layer present",
+                if stage_rendered { "stage" } else { "application" }
+            );
             proj_layer = Some(
                 xr::CompositionLayerProjection::new()
                     .space(session_data.tracking_space())
@@ -1359,14 +1722,36 @@ impl<G: GraphicsBackend> FrameController<G> {
         }
 
         let mut layers: Vec<&xr::CompositionLayerBase<_>> = Vec::new();
-        if let Some(l) = proj_layer.as_ref() {
-            layers.push(l);
+        if let Some(layer) = proj_layer.as_ref() {
+            layers.push(layer);
         }
+
         let overlay_layers;
         if let Some(overlay_man) = overlays {
-            overlay_layers = overlay_man.get_layers(session_data, self.app_fade_grid);
+            let hide_skybox_with_projection =
+                std::env::var("XRIZER_HIDE_SKYBOX_WITH_PROJECTION")
+                    .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"));
+            // A stage override replaces SteamVR's grid/environment. Do not put the
+            // equirect loading skybox in front of the stage projection.
+            let render_skybox = self.app_fade_grid
+                && !stage_rendered
+                && !(hide_skybox_with_projection && proj_layer.is_some());
+
+            overlay_layers = overlay_man.get_layers(session_data, render_skybox);
             layers.extend(overlay_layers.iter().map(Deref::deref));
         }
+
+        trace!(
+            "[alyx-comp] xrEndFrame layers={} projection={} projection_source={} app_projection_ready={} stage_requested={} stage_rendered={} suspended={} fade_grid={}",
+            layers.len(),
+            proj_layer.is_some(),
+            if stage_rendered { "stage" } else if proj_layer.is_some() { "application" } else { "none" },
+            application_projection_ready,
+            stage_requested,
+            stage_rendered,
+            self.app_suspend_render,
+            self.app_fade_grid
+        );
 
         self.stream
             .end(display_time, xr::EnvironmentBlendMode::OPAQUE, &layers)

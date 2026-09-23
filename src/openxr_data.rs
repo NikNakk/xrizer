@@ -1,6 +1,6 @@
 use crate::{
     clientcore::{Injected, Injector},
-    graphics_backends::{GraphicsBackend, VulkanData, supported_apis_enum},
+    graphics_backends::{D3D11Data, GraphicsBackend, VulkanData, supported_apis_enum},
 };
 use derive_more::Deref;
 use glam::f32::{Quat, Vec3};
@@ -73,30 +73,43 @@ impl From<SessionCreationError> for InitError {
 }
 
 fn get_app_name() -> Option<String> {
-    let exe = std::fs::read_link("/proc/self/exe")
-        .inspect_err(|e| warn!("Couldn't get app name from /proc/self/exe: {e}"))
-        .ok()?;
-
-    let basename = exe.file_name().unwrap();
-    if basename == "wine64-preloader" || basename == "wine-preloader" {
-        fn extract_wine_exe_name() -> Option<String> {
-            let exe_path = std::env::args().next()?;
-            // The Windows path separator is \ (instead of /) so we can't use Path.
-            // We just want the basename anyway, so we'll just grab the last piece.
-            let exe_name = exe_path.rsplit_once('\\')?.1;
-            Some(
-                exe_name
-                    .strip_suffix(".exe")
-                    .unwrap_or(exe_name)
-                    .to_string(),
-            )
-        }
-        if let Some(name) = extract_wine_exe_name() {
-            return Some(name);
-        }
+    #[cfg(target_os = "windows")]
+    {
+        let exe = std::env::current_exe()
+            .inspect_err(|e| warn!("Couldn't get Windows executable path: {e}"))
+            .ok()?;
+        return exe
+            .file_stem()
+            .map(|name| name.to_string_lossy().into_owned());
     }
 
-    Some(basename.to_string_lossy().into_owned())
+    #[cfg(not(target_os = "windows"))]
+    {
+        let exe = std::fs::read_link("/proc/self/exe")
+            .inspect_err(|e| warn!("Couldn't get app name from /proc/self/exe: {e}"))
+            .ok()?;
+
+        let basename = exe.file_name().unwrap();
+        if basename == "wine64-preloader" || basename == "wine-preloader" {
+            fn extract_wine_exe_name() -> Option<String> {
+                let exe_path = std::env::args().next()?;
+                // The Windows path separator is \\ (instead of /) so we can't use Path.
+                // We just want the basename anyway, so we'll just grab the last piece.
+                let exe_name = exe_path.rsplit_once('\\')?.1;
+                Some(
+                    exe_name
+                        .strip_suffix(".exe")
+                        .unwrap_or(exe_name)
+                        .to_string(),
+                )
+            }
+            if let Some(name) = extract_wine_exe_name() {
+                return Some(name);
+            }
+        }
+
+        Some(basename.to_string_lossy().into_owned())
+    }
 }
 
 fn make_version() -> u32 {
@@ -125,6 +138,10 @@ impl<C: Compositor> OpenXrData<C> {
         let mut exts = xr::ExtensionSet::default();
         exts.khr_vulkan_enable = supported_exts.khr_vulkan_enable;
         exts.khr_opengl_enable = supported_exts.khr_opengl_enable;
+        #[cfg(target_os = "windows")]
+        {
+            exts.khr_d3d11_enable = supported_exts.khr_d3d11_enable;
+        }
         exts.khr_convert_timespec_time = supported_exts.khr_convert_timespec_time;
         exts.ext_hand_tracking = supported_exts.ext_hand_tracking;
         exts.khr_visibility_mask = supported_exts.khr_visibility_mask;
@@ -397,6 +414,7 @@ supported_apis_enum!(pub enum GraphicalSession: Session);
 impl std::fmt::Display for GraphicalSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            GraphicalSession::D3D11(_) => f.write_str("GraphicalSession::D3D11"),
             GraphicalSession::Vulkan(_) => f.write_str("GraphicalSession::Vulkan"),
             GraphicalSession::OpenGL(_) => f.write_str("GraphicalSession::OpenGL"),
             #[cfg(test)]
@@ -449,6 +467,7 @@ pub struct SessionData {
     /// \- structs are dropped in declaration order, and if we drop our temporary Vulkan data
     /// before the session, the runtime will likely be very unhappy.
     temp_vulkan: Option<VulkanData>,
+    temp_d3d11: Option<D3D11Data>,
 }
 
 #[derive(Debug)]
@@ -467,19 +486,42 @@ impl SessionData {
         current_origin: vr::ETrackingUniverseOrigin,
         create_info: Option<&SessionCreateInfo>,
     ) -> Result<(Self, xr::FrameWaiter, FrameStream), SessionCreationError> {
-        let info;
-        let (temp_vulkan, info) = if let Some(info) = create_info {
+        let temporary_info;
+        #[cfg(target_os = "windows")]
+        let temp_vulkan = None;
+        #[cfg(not(target_os = "windows"))]
+        let mut temp_vulkan = None;
+        #[cfg(target_os = "windows")]
+        let mut temp_d3d11 = None;
+        #[cfg(not(target_os = "windows"))]
+        let temp_d3d11 = None;
+        let info = if let Some(info) = create_info {
             if let SessionCreateInfo::Vulkan(info) = info {
                 // Monado seems to (incorrectly) give validation errors unless we call this.
                 let pd =
                     unsafe { instance.vulkan_graphics_device(system_id, info.instance) }.unwrap();
                 assert_eq!(pd, info.physical_device);
             }
-            (None, info)
+            info
         } else {
-            let vk = VulkanData::new_temporary(instance, system_id);
-            info = SessionCreateInfo::from_info::<xr::Vulkan>(vk.session_create_info());
-            (Some(vk), &info)
+            #[cfg(target_os = "windows")]
+            {
+                let d3d11 = D3D11Data::new_temporary()
+                    .expect("Failed to create temporary D3D11 device");
+                temporary_info =
+                    SessionCreateInfo::from_info::<xr::D3D11>(d3d11.session_create_info());
+                temp_d3d11 = Some(d3d11);
+            }
+
+            #[cfg(not(target_os = "windows"))]
+            {
+                let vk = VulkanData::new_temporary(instance, system_id);
+                temporary_info =
+                    SessionCreateInfo::from_info::<xr::Vulkan>(vk.session_create_info());
+                temp_vulkan = Some(vk);
+            }
+
+            &temporary_info
         };
 
         #[macros::any_graphics(SessionCreateInfo)]
@@ -563,6 +605,7 @@ impl SessionData {
         Ok((
             SessionData {
                 temp_vulkan,
+                temp_d3d11,
                 session,
                 session_graphics,
                 state: xr::SessionState::READY,
@@ -668,7 +711,7 @@ impl SessionData {
     /// Returns true if this session is not using a temporary graphics setup.
     #[inline]
     pub fn is_real_session(&self) -> bool {
-        self.temp_vulkan.is_none()
+        self.temp_vulkan.is_none() && self.temp_d3d11.is_none()
     }
 }
 

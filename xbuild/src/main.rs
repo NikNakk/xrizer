@@ -65,8 +65,8 @@ fn main() {
                 lib_path = Some(
                     a.filenames
                         .into_iter()
-                        .find(|p| p.ends_with(".so"))
-                        .unwrap(),
+                        .find(|p| p.ends_with(".so") || p.ends_with(".dll"))
+                        .expect("xrizer cdylib artifact missing"),
                 )
             }
             Message::BuildScriptExecuted(b) => {
@@ -103,16 +103,43 @@ fn main() {
         }
     }
 
-    let vrclient_path = platform_path.join(vrclient_name).with_extension(
-        lib_path
-            .extension()
-            .expect("build shared library should have an extension"),
-    );
-    match std::os::unix::fs::symlink(&lib_path, vrclient_path) {
-        Ok(_) => (),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (),
-        err => {
-            eprintln!("Failed to create vrclient symlink: {err:?}");
+    let extension = lib_path
+        .extension()
+        .expect("build shared library should have an extension");
+    let vrclient_path = platform_path.join(vrclient_name).with_extension(extension);
+
+    // Linux installs traditionally use a symlink. Windows builds are commonly
+    // cross-compiled on Unix, and the produced runtime must be a real DLL rather
+    // than a host-side symlink.
+    if extension == "dll" {
+        if let Err(e) = std::fs::copy(&lib_path, &vrclient_path) {
+            eprintln!("Failed to copy Windows vrclient DLL to '{vrclient_path:?}': {e:?}");
+            std::process::exit(1);
+        }
+
+        // Also emit a drop-in client DLL. This is the form used by games when
+        // xrizer replaces the application's bundled openvr_api.dll directly.
+        let openvr_api_path = parent.join("openvr_api.dll");
+        if let Err(e) = std::fs::copy(&lib_path, &openvr_api_path) {
+            eprintln!("Failed to copy drop-in OpenVR DLL to '{openvr_api_path:?}': {e:?}");
+            std::process::exit(1);
+        }
+    } else {
+        #[cfg(unix)]
+        {
+            match std::os::unix::fs::symlink(&lib_path, &vrclient_path) {
+                Ok(_) => (),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (),
+                err => {
+                    eprintln!("Failed to create vrclient symlink: {err:?}");
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        #[cfg(not(unix))]
+        if let Err(e) = std::fs::copy(&lib_path, &vrclient_path) {
+            eprintln!("Failed to copy vrclient library to '{vrclient_path:?}': {e:?}");
             std::process::exit(1);
         }
     }
