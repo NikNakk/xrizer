@@ -1053,11 +1053,22 @@ impl<C: openxr_data::Compositor> vr::IVRInput011_Interface for Input<C> {
         let action_path = self.action_path(action);
         if self.alyx_diagnostic_once(format!("pose:{action_path}:{restrict_to_device}:{hand:?}")) {
             let index = self.get_controller_device_index(hand);
-            let profile = self
-                .openxr
-                .instance
-                .path_to_string(self.fake_controller_profile_path())
-                .unwrap_or_else(|_| "<unknown>".into());
+            let profile = {
+                let session_data = self.openxr.session_data.get();
+                let subaction = self.get_subaction_path(hand);
+                session_data
+                    .session
+                    .current_interaction_profile(subaction)
+                    .ok()
+                    .and_then(|path| {
+                        if path == xr::Path::NULL {
+                            None
+                        } else {
+                            self.openxr.instance.path_to_string(path).ok()
+                        }
+                    })
+                    .unwrap_or_else(|| "<none>".into())
+            };
             let controller_type = index.and_then(|index| {
                 self.get_device_string_tracked_property(
                     index,
@@ -1257,6 +1268,15 @@ impl<C: openxr_data::Compositor> vr::IVRInput011_Interface for Input<C> {
             bChanged: state.changed_since_last_sync,
             fUpdateTime: 0.0, // TODO
         };
+
+        if self.alyx_input_diagnostics_enabled() && state.changed_since_last_sync {
+            let action_path = self.action_path(handle);
+            info!(
+                "[alyx-input] digital-edge action={action_path} restrict={restrict_to_device} active={} state={} origin={active_hand}",
+                state.is_active,
+                state.current_state,
+            );
+        }
 
         vr::EVRInputError::None
     }
