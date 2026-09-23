@@ -1,7 +1,7 @@
 // The interfaces in this file are missing in openvr.h and any other form of OpenVR documentation,
 // but are used by games (typically Half Life Alyx.)
 
-use log::debug;
+use log::{debug, info, trace};
 use openvr::InterfaceImpl;
 use seq_macro::seq;
 use std::ffi::{CStr, c_char, c_int, c_void};
@@ -105,6 +105,7 @@ gen_vtable! {
         }
         fn undoc2(handle: MailboxHandle) -> c_int {
             debug!(target: UNKNOWN_TAG, "Entered IVRMailbox::undoc2 with arugments handle: {handle:?}");
+            info!("[alyx-mailbox] UnregisterMailbox handle={handle:?}");
             0
         }
         fn undoc3(
@@ -123,6 +124,7 @@ gen_vtable! {
                 Some(unsafe { CStr::from_ptr(b) })
             };
             debug!(target: UNKNOWN_TAG, "Entered IVRMailbox::undoc3 with arguments handle: {handle:?}, a: {a:?}, b: {b:?}");
+            info!("[alyx-mailbox] SendMessage handle={handle:?} type={a:?} message={b:?}");
             0
         }
         // Borrowed from OpenComposite
@@ -138,24 +140,37 @@ gen_vtable! {
             if !RECEIVED_MESSAGE.load(Ordering::Relaxed) {
                 RECEIVED_MESSAGE.store(true, Ordering::Relaxed);
 
-                let msg = cr#"{"type": "ready"}"#;
-                let msg_len = msg.count_bytes() as u32 + 1;
+                // Match OpenComposite's Alyx compatibility behaviour exactly:
+                // report the JSON payload length excluding the terminating NUL,
+                // but require/copy one additional byte for the NUL terminator.
+                // Alyx uses the reported length when consuming the mailbox payload.
+                let msg = c"{ \"type\": \"ready\", }";
+                let payload_len = msg.to_bytes().len() as u32;
                 unsafe {
-                    *len.as_mut().unwrap() = msg_len;
+                    *len.as_mut().unwrap() = payload_len;
                 }
 
-                if out_len < msg_len {
+                if out_len < payload_len + 1 {
+                    info!(
+                        "[alyx-mailbox] ReadMessage ready buffer-too-short handle={handle:?} out_len={out_len} payload_len={payload_len}"
+                    );
                     return 2;
                 }
 
                 unsafe {
-                    out_buf.copy_from(msg.as_ptr(), msg_len as usize);
+                    std::ptr::copy_nonoverlapping(
+                        msg.as_ptr(),
+                        out_buf,
+                        payload_len as usize + 1,
+                    );
                 }
 
-                debug!(target: UNKNOWN_TAG, "Sent ready message: {msg:?}");
-
+                info!(
+                    "[alyx-mailbox] ReadMessage -> ready handle={handle:?} payload_len={payload_len} text={msg:?}"
+                );
                 0
             } else {
+                trace!("[alyx-mailbox] ReadMessage -> no-message handle={handle:?}");
                 1
             }
         }
