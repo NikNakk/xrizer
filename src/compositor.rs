@@ -359,6 +359,15 @@ impl vr::IVRCompositor029_Interface for Compositor {
         pRenderSettings: *const vr::Compositor_StageRenderSettings,
         nSizeOfRenderSettings: u32,
     ) -> vr::EVRCompositorError {
+        let ignore_stage = std::env::var("XRIZER_IGNORE_STAGE_OVERRIDE")
+            .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"));
+        if ignore_stage {
+            info!(
+                "SetStageOverride_Async ignored by XRIZER_IGNORE_STAGE_OVERRIDE (OpenComposite compatibility; returning success without ready event)"
+            );
+            return vr::EVRCompositorError::None;
+        }
+
         if pchRenderModelPath.is_null() {
             warn!("SetStageOverride_Async called with a null model path");
             return vr::EVRCompositorError::RequestFailed;
