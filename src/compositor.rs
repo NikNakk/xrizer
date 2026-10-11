@@ -682,7 +682,7 @@ impl vr::IVRCompositor029_Interface for Compositor {
         true
     }
     fn GetLastFrameRenderer(&self) -> u32 {
-        todo!()
+        0
     }
     fn GetCurrentSceneFocusProcess(&self) -> u32 {
         todo!()
