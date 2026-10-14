@@ -807,6 +807,10 @@ struct ActionStateData {
 
 struct Swapchain {
     image_acquired: AtomicBool,
+    wait_result: AtomicCell<xr::Result>,
+    release_result: AtomicCell<xr::Result>,
+    acquire_count: AtomicU64,
+    release_count: AtomicU64,
 }
 
 impl_handle!(Instance, xr::Instance);
@@ -1621,6 +1625,10 @@ extern "system" fn create_swapchain(
     }
     let swap = Arc::new(Swapchain {
         image_acquired: false.into(),
+        wait_result: xr::Result::SUCCESS.into(),
+        release_result: xr::Result::SUCCESS.into(),
+        acquire_count: 0.into(),
+        release_count: 0.into(),
     });
     unsafe {
         swapchain.write(swap.to_xr());
@@ -1661,12 +1669,27 @@ extern "system" fn enumerate_swapchain_images(
     xr::Result::SUCCESS
 }
 
+pub fn set_swapchain_results(handle: xr::Swapchain, wait: xr::Result, release: xr::Result) {
+    let swapchain = handle.to_handle().unwrap();
+    swapchain.wait_result.store(wait);
+    swapchain.release_result.store(release);
+}
+pub fn swapchain_ownership(handle: xr::Swapchain) -> (bool, u64, u64) {
+    let swapchain = handle.to_handle().unwrap();
+    (
+        swapchain.image_acquired.load(Ordering::Relaxed),
+        swapchain.acquire_count.load(Ordering::Relaxed),
+        swapchain.release_count.load(Ordering::Relaxed),
+    )
+}
+
 extern "system" fn acquire_swapchain_image(
     swapchain: xr::Swapchain,
     _info: *const xr::SwapchainImageAcquireInfo,
     _index: *mut u32,
 ) -> xr::Result {
     let swapchain = get_handle!(swapchain);
+    swapchain.acquire_count.fetch_add(1, Ordering::Relaxed);
     swapchain.image_acquired.store(true, Ordering::Relaxed);
     xr::Result::SUCCESS
 }
@@ -1679,7 +1702,7 @@ extern "system" fn wait_swapchain_image(
     if !swapchain.image_acquired.load(Ordering::Relaxed) {
         return xr::Result::ERROR_CALL_ORDER_INVALID;
     }
-    xr::Result::SUCCESS
+    swapchain.wait_result.load()
 }
 
 extern "system" fn release_swapchain_image(
@@ -1689,6 +1712,11 @@ extern "system" fn release_swapchain_image(
     let swapchain = get_handle!(swapchain);
     if !swapchain.image_acquired.load(Ordering::Relaxed) {
         return xr::Result::ERROR_CALL_ORDER_INVALID;
+    }
+    swapchain.release_count.fetch_add(1, Ordering::Relaxed);
+    let result = swapchain.release_result.load();
+    if result != xr::Result::SUCCESS {
+        return result;
     }
     swapchain.image_acquired.store(false, Ordering::Relaxed);
     xr::Result::SUCCESS
