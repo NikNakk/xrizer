@@ -15,6 +15,7 @@ mod screenshots;
 mod settings;
 mod stage;
 mod system;
+mod timing;
 
 #[cfg(not(test))]
 mod error_dialog;
