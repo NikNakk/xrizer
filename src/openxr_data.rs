@@ -350,8 +350,9 @@ impl<C: Compositor> OpenXrData<C> {
     }
 
     pub fn get_refresh_rate(&self) -> f32 {
+        // The last xrWaitFrame period, which is a guess until the first frame.
         let get_fallback_rate = || {
-            Duration::from_nanos(
+            1.0 / Duration::from_nanos(
                 self.display_period_nanos
                     .load(Ordering::Relaxed)
                     .try_into()
