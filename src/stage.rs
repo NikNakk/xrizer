@@ -1,4 +1,6 @@
-use glam::{Mat4, Vec3, Vec4};
+#[cfg(target_os = "windows")]
+use glam::Vec3;
+use glam::{Mat4, Vec4};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -57,6 +59,12 @@ impl StageAsset {
         settings: StageSettings,
     ) -> Result<Self, String> {
         let path = path.as_ref();
+        let model_bytes = std::fs::metadata(path)
+            .map_err(|error| error.to_string())?
+            .len();
+        if model_bytes > 32 * 1024 * 1024 {
+            return Err("stage OBJ exceeds 32 MiB limit".into());
+        }
         let load_options = tobj::LoadOptions {
             triangulate: true,
             single_index: true,
@@ -120,63 +128,63 @@ impl StageAsset {
                     .find_map(|material| material.diffuse_texture.clone())
             });
 
-        let (texture_rgba, texture_width, texture_height) =
-            if let Some(texture_name) = texture_name {
-                let texture_path = path
-                    .parent()
-                    .unwrap_or_else(|| Path::new("."))
-                    .join(texture_name);
+        let (texture_rgba, texture_width, texture_height) = if let Some(texture_name) = texture_name
+        {
+            let texture_path = path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(texture_name);
 
-                // Alyx's diorama MTLs name PNG textures, while current game depots
-                // ship the corresponding baked textures as DDS files. SteamVR accepts
-                // those stage assets transparently, so mirror that behaviour here.
-                let mut candidates = vec![texture_path.clone()];
-                for extension in ["dds", "png", "tga"] {
-                    let candidate = texture_path.with_extension(extension);
-                    if !candidates.contains(&candidate) {
-                        candidates.push(candidate);
-                    }
+            // Alyx's diorama MTLs name PNG textures, while current game depots
+            // ship the corresponding baked textures as DDS files. SteamVR accepts
+            // those stage assets transparently, so mirror that behaviour here.
+            let mut candidates = vec![texture_path.clone()];
+            for extension in ["dds", "png", "tga"] {
+                let candidate = texture_path.with_extension(extension);
+                if !candidates.contains(&candidate) {
+                    candidates.push(candidate);
                 }
+            }
 
-                let mut errors = Vec::new();
-                let mut loaded = None;
-                for candidate in candidates {
-                    match load_stage_texture(&candidate) {
-                        Ok((rgba, width, height)) => {
-                            if candidate != texture_path {
-                                log::info!(
-                                    "stage texture {:?} is unavailable; using {:?}",
-                                    texture_path,
-                                    candidate
-                                );
-                            }
-                            loaded = Some((candidate, rgba, width, height));
-                            break;
+            let mut errors = Vec::new();
+            let mut loaded = None;
+            for candidate in candidates {
+                match load_stage_texture(&candidate) {
+                    Ok((rgba, width, height)) => {
+                        if candidate != texture_path {
+                            log::info!(
+                                "stage texture {:?} is unavailable; using {:?}",
+                                texture_path,
+                                candidate
+                            );
                         }
-                        Err(error) => errors.push(format!("{candidate:?}: {error}")),
+                        loaded = Some((candidate, rgba, width, height));
+                        break;
                     }
+                    Err(error) => errors.push(format!("{candidate:?}: {error}")),
                 }
+            }
 
-                if let Some((loaded_path, rgba, width, height)) = loaded {
-                    log::info!(
-                        "loaded stage texture {:?}: {}x{} RGBA",
-                        loaded_path,
-                        width,
-                        height
-                    );
-                    (rgba, width, height)
-                } else {
-                    log::warn!(
-                        "stage texture {:?} could not be decoded; tried {}. Using white compatibility texture",
-                        texture_path,
-                        errors.join("; ")
-                    );
-                    (vec![255, 255, 255, 255], 1, 1)
-                }
+            if let Some((loaded_path, rgba, width, height)) = loaded {
+                log::info!(
+                    "loaded stage texture {:?}: {}x{} RGBA",
+                    loaded_path,
+                    width,
+                    height
+                );
+                (rgba, width, height)
             } else {
-                log::warn!("stage OBJ {:?} has no diffuse texture; using white", path);
+                log::warn!(
+                    "stage texture {:?} could not be decoded; tried {}. Using white compatibility texture",
+                    texture_path,
+                    errors.join("; ")
+                );
                 (vec![255, 255, 255, 255], 1, 1)
-            };
+            }
+        } else {
+            log::warn!("stage OBJ {:?} has no diffuse texture; using white", path);
+            (vec![255, 255, 255, 255], 1, 1)
+        };
 
         Ok(Self {
             id: NEXT_STAGE_ID.fetch_add(1, Ordering::Relaxed),
@@ -201,6 +209,8 @@ fn load_stage_texture(path: &Path) -> Result<(Vec<u8>, u32, u32), String> {
         return load_dds_texture(path);
     }
 
+    let (width, height) = image::image_dimensions(path).map_err(|error| error.to_string())?;
+    texture_byte_count(width, height)?;
     let image = image::open(path)
         .map_err(|error| error.to_string())?
         .to_rgba8();
@@ -217,7 +227,7 @@ fn load_dds_texture(path: &Path) -> Result<(Vec<u8>, u32, u32), String> {
 
     let format = decoder.format();
     let size = decoder.main_size();
-    let mut rgba = vec![0u8; size.pixels() as usize * 4];
+    let mut rgba = vec![0u8; texture_byte_count(size.width, size.height)?];
     let view = dds::ImageViewMut::new(&mut rgba, size, dds::ColorFormat::RGBA_U8)
         .ok_or("failed to create RGBA8 view for DDS stage texture")?;
     decoder
@@ -228,7 +238,7 @@ fn load_dds_texture(path: &Path) -> Result<(Vec<u8>, u32, u32), String> {
     // greyscale/luminance texture, so replicate that channel into RGB rather
     // than exposing GPU-style (R,0,0,1) data to our ordinary RGBA shader.
     if format == dds::Format::BC4_UNORM {
-        for pixel in rgba.chunks_exact_mut(4) {
+        for pixel in rgba.as_chunks_mut::<4>().0 {
             let value = pixel[0];
             pixel[1] = value;
             pixel[2] = value;
@@ -245,7 +255,6 @@ fn load_dds_texture(path: &Path) -> Result<(Vec<u8>, u32, u32), String> {
     Ok((rgba, size.width, size.height))
 }
 
-
 pub fn mat4_from_hmd34(matrix: &openvr::HmdMatrix34_t) -> Mat4 {
     Mat4::from_cols(
         Vec4::new(matrix.m[0][0], matrix.m[1][0], matrix.m[2][0], 0.0),
@@ -255,6 +264,7 @@ pub fn mat4_from_hmd34(matrix: &openvr::HmdMatrix34_t) -> Mat4 {
     )
 }
 
+#[cfg(target_os = "windows")]
 pub fn view_matrix(view: &openxr::View) -> Mat4 {
     let q = view.pose.orientation;
     let p = view.pose.position;
@@ -265,6 +275,7 @@ pub fn view_matrix(view: &openxr::View) -> Mat4 {
     .inverse()
 }
 
+#[cfg(target_os = "windows")]
 pub fn projection_matrix(fov: openxr::Fovf, near: f32, far: f32) -> Mat4 {
     let tan_left = fov.angle_left.tan();
     let tan_right = fov.angle_right.tan();
@@ -287,4 +298,27 @@ pub fn projection_matrix(fov: openxr::Fovf, near: f32, far: f32) -> Mat4 {
         Vec4::new(m20, m21, m22, -1.0),
         Vec4::new(0.0, 0.0, m32, 0.0),
     )
+}
+
+fn texture_byte_count(width: u32, height: u32) -> Result<usize, String> {
+    let bytes = u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or("stage texture size overflow")?;
+    if width == 0 || height == 0 || width > 8192 || height > 8192 || bytes > 256 * 1024 * 1024 {
+        return Err("stage texture exceeds 8192x8192 / 256 MiB limit".into());
+    }
+    usize::try_from(bytes).map_err(|_| "stage texture cannot fit in address space".into())
+}
+
+#[cfg(test)]
+mod allocation_tests {
+    use super::*;
+    #[test]
+    fn texture_budget_accepts_alyx_bc4_extent_and_rejects_excess() {
+        assert_eq!(texture_byte_count(8192, 8192).unwrap(), 256 * 1024 * 1024);
+        assert!(texture_byte_count(8193, 1).is_err());
+        assert!(texture_byte_count(u32::MAX, u32::MAX).is_err());
+        assert!(texture_byte_count(0, 1).is_err());
+    }
 }
