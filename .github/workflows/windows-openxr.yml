@@ -38,6 +38,7 @@ jobs:
       - name: Build Windows OpenVR runtime
         run: |
           cargo xbuild \
+            --locked \
             --release \
             --target "${WINDOWS_TARGET}" \
             --no-default-features \
@@ -46,6 +47,7 @@ jobs:
       - name: Cross-compile Windows tests
         run: |
           cargo test \
+            --locked \
             -p xrizer \
             --target "${WINDOWS_TARGET}" \
             --no-default-features \
