@@ -291,8 +291,8 @@ pub unsafe extern "system" fn get_instance_proc_addr(
                     RequestExitSession,
                     (ResultToString),
                     (StructureTypeToString),
-                    (GetInstanceProperties),
-                    (GetSystemProperties),
+                    GetInstanceProperties,
+                    GetSystemProperties,
                     CreateSwapchain,
                     DestroySwapchain,
                     EnumerateSwapchainImages,
@@ -1089,6 +1089,34 @@ extern "system" fn create_action_space(
     unsafe {
         *space = session.add_space(s);
     }
+    xr::Result::SUCCESS
+}
+
+fn write_name<const N: usize>(dest: &mut [c_char; N], name: &str) {
+    dest.fill(0);
+    for (d, s) in dest.iter_mut().zip(&name.as_bytes()[..name.len().min(N - 1)]) {
+        *d = *s as c_char;
+    }
+}
+
+extern "system" fn get_instance_properties(
+    _: xr::Instance,
+    properties: *mut xr::InstanceProperties,
+) -> xr::Result {
+    let properties = unsafe { &mut *properties };
+    properties.runtime_version = xr::Version::new(0, 1, 0);
+    write_name(&mut properties.runtime_name, "fakexr");
+    xr::Result::SUCCESS
+}
+
+extern "system" fn get_system_properties(
+    _: xr::Instance,
+    _: xr::SystemId,
+    properties: *mut xr::SystemProperties,
+) -> xr::Result {
+    let properties = unsafe { &mut *properties };
+    properties.vendor_id = 0;
+    write_name(&mut properties.system_name, "fakexr HMD");
     xr::Result::SUCCESS
 }
 
