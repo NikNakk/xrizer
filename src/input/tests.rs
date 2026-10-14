@@ -818,8 +818,10 @@ fn action_origins_match_pose_and_skeleton_hands() {
     f.load_actions(c"actions.json");
     f.set_interaction_profile::<Knuckles>(LeftHand);
     f.set_interaction_profile::<Knuckles>(RightHand);
-    f.input.openxr.poll_events();
-    f.input.openxr.poll_events();
+    f.sync(vr::VRActiveActionSet_t {
+        ulActionSet: set,
+        ..Default::default()
+    });
 
     let get_origins = |action| {
         let mut origins = [vr::k_ulInvalidInputValueHandle; 2];
@@ -1208,8 +1210,10 @@ fn binding_query_with_session_restart_pending() {
         // A second read would wait behind that writer, which needs our guard.
         std::thread::sleep(std::time::Duration::from_millis(50));
         f.input.state_from_bindings(&session, handle, 0);
-        f.input.state_from_bindings(&session, handle, f.input.left_hand_key.0.as_ffi());
-        f.input.state_from_bindings(&session, handle, f.input.right_hand_key.0.as_ffi());
+        f.input
+            .state_from_bindings(&session, handle, f.input.left_hand_key.0.as_ffi());
+        f.input
+            .state_from_bindings(&session, handle, f.input.right_hand_key.0.as_ffi());
         drop(session);
         writer.join().unwrap();
     });
