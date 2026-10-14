@@ -1190,3 +1190,27 @@ fn load_actions_race() {
     let res = f.get_bool_state(boolact);
     assert!(res.is_ok(), "{res:?}");
 }
+
+#[test]
+fn binding_query_with_session_restart_pending() {
+    let f = Fixture::new();
+    f.load_actions(c"actions.json");
+    let handle = f.get_action_handle(c"/actions/set1/in/boolact");
+    let session = f.input.openxr.session_data.get();
+    let barrier = Barrier::new(2);
+    std::thread::scope(|scope| {
+        let writer = scope.spawn(|| {
+            barrier.wait();
+            f.input.openxr.restart_session();
+        });
+        barrier.wait();
+        // Keep our read guard while the restart queues its exclusive guard.
+        // A second read would wait behind that writer, which needs our guard.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        f.input.state_from_bindings(&session, handle, 0);
+        f.input.state_from_bindings(&session, handle, f.input.left_hand_key.0.as_ffi());
+        f.input.state_from_bindings(&session, handle, f.input.right_hand_key.0.as_ffi());
+        drop(session);
+        writer.join().unwrap();
+    });
+}
