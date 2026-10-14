@@ -1,14 +1,16 @@
 mod d3d11;
 #[cfg(target_os = "windows")]
 mod d3d11_stage;
+#[cfg(target_os = "windows")]
+mod d3d11_timing;
 #[cfg(target_os = "linux")]
 mod gl;
 #[cfg(target_os = "windows")]
 mod gl_stub;
 mod vulkan;
 
-use derive_more::{From, TryInto};
 pub use d3d11::D3D11Data;
+use derive_more::{From, TryInto};
 #[cfg(target_os = "linux")]
 pub use gl::GlData;
 #[cfg(target_os = "windows")]
@@ -17,7 +19,24 @@ use openvr as vr;
 use openxr as xr;
 pub use vulkan::VulkanData;
 
+#[derive(Clone, Copy, Debug)]
+pub struct GpuTiming {
+    pub frame: u32,
+    pub milliseconds: f64,
+}
+
 pub trait GraphicsBackend: Into<SupportedBackend> {
+    fn supports_format_conversion() -> bool {
+        true
+    }
+    fn requires_gpu_timing() -> bool {
+        false
+    }
+    fn begin_gpu_timing(&mut self, _frame: u32) {}
+    fn finish_gpu_timing(&mut self) {}
+    fn poll_gpu_timings(&mut self) -> Vec<GpuTiming> {
+        Vec::new()
+    }
     type Api: xr::Graphics + 'static;
     type OpenVrTexture: Copy;
     type NiceFormat: std::fmt::Debug;
@@ -58,6 +77,14 @@ pub trait GraphicsBackend: Into<SupportedBackend> {
         bounds: vr::VRTextureBounds_t,
         image_index: usize,
     ) -> xr::Extent2Di;
+
+    fn stage_swapchain_info(
+        &self,
+        _width: u32,
+        _height: u32,
+    ) -> Option<xr::SwapchainCreateInfo<Self::Api>> {
+        None
+    }
 
     fn render_stage(
         &mut self,
