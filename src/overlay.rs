@@ -555,44 +555,75 @@ impl Overlay {
             };
             let tex_swapchain_info =
                 backend.swapchain_info_for_texture(b_texture, texture_bounds, texture.eColorSpace);
-            let mut create_swapchain = || {
-                let mut info = backend.swapchain_info_for_texture(
-                    b_texture,
-                    texture_bounds,
-                    texture.eColorSpace,
-                );
-                let initial_format = info.format;
-                session_data.check_format::<G>(&mut info);
-                let swapchain = session_data.create_swapchain(&info).unwrap();
-                let images = swapchain
-                    .enumerate_images()
-                    .expect("Couldn't enumerate swapchain images");
-                backend.store_swapchain_images(images, info.format);
-                SwapchainData {
-                    swapchain,
-                    info,
-                    initial_format,
+            let result = (|| {
+                let mut create_swapchain =
+                    || -> Result<SwapchainData<G::Api>, vr::EVROverlayError> {
+                        let mut info = backend.swapchain_info_for_texture(
+                            b_texture,
+                            texture_bounds,
+                            texture.eColorSpace,
+                        );
+                        let initial_format = info.format;
+                        session_data
+                            .check_format::<G>(&mut info)
+                            .map_err(|_| vr::EVROverlayError::InvalidTexture)?;
+                        let swapchain = session_data
+                            .create_swapchain(&info)
+                            .map_err(|_| vr::EVROverlayError::RequestFailed)?;
+                        let images = swapchain
+                            .enumerate_images()
+                            .map_err(|_| vr::EVROverlayError::RequestFailed)?;
+                        backend.store_swapchain_images(images, info.format);
+                        Ok(SwapchainData {
+                            swapchain,
+                            info,
+                            initial_format,
+                        })
+                    };
+                if map.get(key).is_none() {
+                    map.insert(key, create_swapchain()?);
                 }
-            };
-            let swapchain = {
-                let data = map
-                    .entry(key)
-                    .unwrap()
-                    .or_insert_with(&mut create_swapchain);
+                let data = map.get_mut(key).unwrap();
                 if !is_usable_swapchain(&data.info, data.initial_format, &tex_swapchain_info) {
-                    *data = create_swapchain();
+                    *data = create_swapchain()?;
                 }
-                &mut data.swapchain
-            };
-            let idx = swapchain.acquire_image().unwrap();
-            swapchain.wait_image(xr::Duration::INFINITE).unwrap();
-
-            let extent = backend.copy_overlay_to_swapchain(b_texture, texture_bounds, idx as usize);
-            swapchain.release_image().unwrap();
-
-            Ok(extent)
+                let swapchain = &mut data.swapchain;
+                let idx = swapchain
+                    .acquire_image()
+                    .map_err(|_| vr::EVROverlayError::RequestFailed)?;
+                let wait = xr::sys::SwapchainImageWaitInfo {
+                    ty: xr::sys::SwapchainImageWaitInfo::TYPE,
+                    next: std::ptr::null(),
+                    timeout: xr::Duration::from_nanos(500_000_000),
+                };
+                let status = unsafe {
+                    (swapchain.instance().fp().wait_swapchain_image)(swapchain.as_raw(), &wait)
+                };
+                if status != xr::sys::Result::SUCCESS {
+                    return Err(vr::EVROverlayError::RequestFailed);
+                }
+                let extent =
+                    backend.copy_overlay_to_swapchain(b_texture, texture_bounds, idx as usize);
+                let status = unsafe {
+                    (swapchain.instance().fp().release_swapchain_image)(
+                        swapchain.as_raw(),
+                        std::ptr::null(),
+                    )
+                };
+                if status != xr::sys::Result::SUCCESS {
+                    return Err(vr::EVROverlayError::RequestFailed);
+                }
+                Ok(extent)
+            })();
+            if result.is_err() {
+                map.remove(key);
+            }
+            result
         }
 
+        // A failed replacement must not leave a visible rectangle referring to
+        // the retired swapchain entry.
+        self.rect = None;
         let backend = self.compositor.as_mut().unwrap();
         let extent = backend.with_any_graphics_mut::<set_swapchain_texture>((
             &session_data,
