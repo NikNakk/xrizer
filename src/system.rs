@@ -749,6 +749,9 @@ impl vr::IVRSystem026_Interface for System {
             return 0.0;
         }
 
+        if let Some(error) = unsafe { error.as_mut() } {
+            *error = vr::ETrackedPropertyError::Success;
+        }
         match prop {
             vr::ETrackedDeviceProperty::UserIpdMeters_Float => {
                 let views = self.get_views(xr::ReferenceSpaceType::VIEW).views;
@@ -1130,7 +1133,8 @@ mod tests {
         let system = System::new(xr.clone(), &Injector::default());
         xr.display_period_nanos.store(8_333_333, Ordering::Relaxed);
 
-        let mut err = vr::ETrackedPropertyError::Success;
+        // Callers such as Half-Life: Alyx treat an untouched error as a failure.
+        let mut err = vr::ETrackedPropertyError::UnknownProperty;
         let rate = system.GetFloatTrackedDeviceProperty(
             vr::k_unTrackedDeviceIndex_Hmd,
             vr::ETrackedDeviceProperty::DisplayFrequency_Float,
