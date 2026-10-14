@@ -20,10 +20,7 @@ impl GraphicsBackend for GlData {
     }
 
     fn session_create_info(&self) -> <Self::Api as xr::Graphics>::SessionCreateInfo {
-        xr::opengl::SessionCreateInfo::Windows {
-            h_dc: 0,
-            h_glrc: 0,
-        }
+        xr::opengl::SessionCreateInfo::Windows { h_dc: 0, h_glrc: 0 }
     }
 
     fn get_texture(_texture: &vr::Texture_t) -> Option<Self::OpenVrTexture> {

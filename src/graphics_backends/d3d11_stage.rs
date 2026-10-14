@@ -1,16 +1,18 @@
 use crate::stage::{StageAsset, StageVertex, projection_matrix, view_matrix};
 use openxr as xr;
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::mem::size_of;
+use std::sync::OnceLock;
+use windows::Win32::Graphics::Direct3D::Fxc::{D3DCOMPILE_ENABLE_STRICTNESS, D3DCompile};
 use windows::Win32::Graphics::Direct3D::{
     D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, ID3DBlob, ID3DInclude,
 };
-use windows::Win32::Graphics::Direct3D::Fxc::{
-    D3DCOMPILE_ENABLE_STRICTNESS, D3DCompile,
-};
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
-use windows::core::s;
+use windows::core::{Interface, s};
+
+type ShaderBytecode = (Vec<u8>, Vec<u8>);
 
 const STAGE_HLSL: &str = r#"
 cbuffer StageConstants : register(b0)
@@ -83,6 +85,8 @@ struct StageConstants {
 }
 
 pub struct StageRenderer {
+    context: ID3D11DeviceContext,
+    target_views: HashMap<usize, [ID3D11RenderTargetView; 2]>,
     stage_id: u64,
     vertex_buffer: ID3D11Buffer,
     index_buffer: ID3D11Buffer,
@@ -101,19 +105,39 @@ pub struct StageRenderer {
 
 impl StageRenderer {
     pub fn new(device: &ID3D11Device, stage: &StageAsset) -> Result<Self, String> {
-        let vs_blob = compile_shader(STAGE_HLSL, "VSMain", "vs_5_0")?;
-        let ps_blob = compile_shader(STAGE_HLSL, "PSMain", "ps_5_0")?;
-        let vs_bytes = blob_bytes(&vs_blob);
-        let ps_bytes = blob_bytes(&ps_blob);
+        static SHADERS: OnceLock<Result<ShaderBytecode, String>> = OnceLock::new();
+        let (vs_bytes, ps_bytes) = SHADERS
+            .get_or_init(|| {
+                Ok((
+                    blob_bytes(&compile_shader(STAGE_HLSL, "VSMain", "vs_5_0")?).to_vec(),
+                    blob_bytes(&compile_shader(STAGE_HLSL, "PSMain", "ps_5_0")?).to_vec(),
+                ))
+            })
+            .as_ref()
+            .map_err(Clone::clone)?;
+        let vs_bytes = vs_bytes.as_slice();
+        let ps_bytes = ps_bytes.as_slice();
+        let mut context = None;
+        unsafe { device.CreateDeferredContext(0, Some(&mut context)) }
+            .map_err(|error| format!("CreateDeferredContext(stage) failed: {error}"))?;
+        let context = context.ok_or("no stage deferred context returned")?;
 
         let mut vertex_shader = None;
         let mut pixel_shader = None;
         unsafe {
             device
-                .CreateVertexShader(vs_bytes, None::<&ID3D11ClassLinkage>, Some(&mut vertex_shader))
+                .CreateVertexShader(
+                    vs_bytes,
+                    None::<&ID3D11ClassLinkage>,
+                    Some(&mut vertex_shader),
+                )
                 .map_err(|e| format!("CreateVertexShader failed: {e}"))?;
             device
-                .CreatePixelShader(ps_bytes, None::<&ID3D11ClassLinkage>, Some(&mut pixel_shader))
+                .CreatePixelShader(
+                    ps_bytes,
+                    None::<&ID3D11ClassLinkage>,
+                    Some(&mut pixel_shader),
+                )
                 .map_err(|e| format!("CreatePixelShader failed: {e}"))?;
         }
 
@@ -176,7 +200,10 @@ impl StageRenderer {
             MipLevels: 1,
             ArraySize: 1,
             Format: DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
             Usage: D3D11_USAGE_IMMUTABLE,
             BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
             ..Default::default()
@@ -247,6 +274,8 @@ impl StageRenderer {
         }
 
         Ok(Self {
+            context,
+            target_views: HashMap::new(),
             stage_id: stage.id,
             vertex_buffer: vertex_buffer.ok_or("CreateBuffer(vertices) returned no buffer")?,
             index_buffer: index_buffer.ok_or("CreateBuffer(indices) returned no buffer")?,
@@ -292,6 +321,35 @@ impl StageRenderer {
             ));
         }
 
+        let key = destination.as_raw() as usize;
+        if let std::collections::hash_map::Entry::Vacant(entry) = self.target_views.entry(key) {
+            let mut targets = Vec::with_capacity(2);
+            for eye in 0..2 {
+                let desc = D3D11_RENDER_TARGET_VIEW_DESC {
+                    Format: destination_desc.Format,
+                    ViewDimension: D3D11_RTV_DIMENSION_TEXTURE2DARRAY,
+                    Anonymous: D3D11_RENDER_TARGET_VIEW_DESC_0 {
+                        Texture2DArray: D3D11_TEX2D_ARRAY_RTV {
+                            MipSlice: 0,
+                            FirstArraySlice: eye,
+                            ArraySize: 1,
+                        },
+                    },
+                };
+                let mut target = None;
+                unsafe {
+                    device.CreateRenderTargetView(destination, Some(&desc), Some(&mut target))
+                }
+                .map_err(|error| format!("CreateRenderTargetView(stage eye {eye}): {error}"))?;
+                targets.push(target.ok_or("no stage RTV returned")?);
+            }
+            entry.insert(targets.try_into().map_err(|_| "invalid stage RTV count")?);
+        }
+        let immediate = context;
+        let context = &self.context;
+        // All stage commands are recorded on a private context. The immediate
+        // context is touched only by ExecuteCommandList with state restoration.
+        context_clear(context);
         let viewport = D3D11_VIEWPORT {
             TopLeftX: 0.0,
             TopLeftY: 0.0,
@@ -319,7 +377,6 @@ impl StageRenderer {
             context.IASetIndexBuffer(&self.index_buffer, DXGI_FORMAT_R32_UINT, 0);
             context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             context.VSSetShader(&self.vertex_shader, None);
-            context.VSSetConstantBuffers(0, Some(&constant_buffers));
             context.PSSetShader(&self.pixel_shader, None);
             context.PSSetShaderResources(0, Some(&shader_resources));
             context.PSSetSamplers(0, Some(&samplers));
@@ -328,24 +385,7 @@ impl StageRenderer {
         }
 
         for (eye, view) in views.iter().enumerate() {
-            let rtv_desc = D3D11_RENDER_TARGET_VIEW_DESC {
-                Format: destination_desc.Format,
-                ViewDimension: D3D11_RTV_DIMENSION_TEXTURE2DARRAY,
-                Anonymous: D3D11_RENDER_TARGET_VIEW_DESC_0 {
-                    Texture2DArray: D3D11_TEX2D_ARRAY_RTV {
-                        MipSlice: 0,
-                        FirstArraySlice: eye as u32,
-                        ArraySize: 1,
-                    },
-                },
-            };
-            let mut rtv = None;
-            unsafe {
-                device
-                    .CreateRenderTargetView(destination, Some(&rtv_desc), Some(&mut rtv))
-                    .map_err(|e| format!("CreateRenderTargetView(stage eye {eye}) failed: {e}"))?;
-            }
-            let rtv = rtv.ok_or_else(|| format!("no RTV returned for stage eye {eye}"))?;
+            let rtv = &self.target_views[&(destination.as_raw() as usize)][eye];
 
             let view_projection = projection_matrix(view.fov, 0.05, 1000.0) * view_matrix(view);
             let constants = StageConstants {
@@ -370,28 +410,32 @@ impl StageRenderer {
                     0,
                     0,
                 );
+                // Update before binding: deferred drivers may capture the backing
+                // allocation when binding the buffer, rather than at DrawIndexed.
+                context.VSSetConstantBuffers(0, Some(&constant_buffers));
+                context.PSSetConstantBuffers(0, Some(&constant_buffers));
                 context.OMSetRenderTargets(Some(&[Some(rtv.clone())]), self.depth_view.as_ref());
-                context.ClearRenderTargetView(&rtv, &stage.settings.secondary_color);
+                context.ClearRenderTargetView(rtv, &stage.settings.secondary_color);
                 if let Some(depth_view) = self.depth_view.as_ref() {
-                    context.ClearDepthStencilView(
-                        depth_view,
-                        D3D11_CLEAR_DEPTH.0 as u32,
-                        1.0,
-                        0,
-                    );
+                    context.ClearDepthStencilView(depth_view, D3D11_CLEAR_DEPTH.0, 1.0, 0);
                 }
                 context.DrawIndexed(self.index_count, 0, 0);
             }
         }
 
+        let mut commands = None;
+        unsafe { context.FinishCommandList(false, Some(&mut commands)) }
+            .map_err(|error| format!("FinishCommandList(stage): {error}"))?;
+        let commands = commands.ok_or("no stage command list returned")?;
         unsafe {
-            // Do not leave our stage resources bound when the application resumes rendering.
-            context.PSSetShaderResources(0, Some(&[None]));
-            context.ClearState();
-            context.Flush();
+            immediate.ExecuteCommandList(&commands, true);
         }
 
         Ok(())
+    }
+
+    pub fn reset_images(&mut self) {
+        self.target_views.clear();
     }
 
     fn ensure_depth(
@@ -410,7 +454,10 @@ impl StageRenderer {
             MipLevels: 1,
             ArraySize: 1,
             Format: DXGI_FORMAT_D32_FLOAT,
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
             Usage: D3D11_USAGE_DEFAULT,
             BindFlags: D3D11_BIND_DEPTH_STENCIL.0 as u32,
             ..Default::default()
@@ -515,10 +562,272 @@ fn blob_string(blob: &ID3DBlob) -> String {
 }
 
 fn bytes_of_slice<T>(slice: &[T]) -> &[u8] {
+    unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u8, std::mem::size_of_val(slice)) }
+}
+
+fn context_clear(context: &ID3D11DeviceContext) {
     unsafe {
-        std::slice::from_raw_parts(
-            slice.as_ptr() as *const u8,
-            std::mem::size_of_val(slice),
-        )
+        context.ClearState();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::Foundation::HMODULE;
+    use windows::Win32::Graphics::Direct3D::{
+        D3D_DRIVER_TYPE_HARDWARE, D3D_PRIMITIVE_TOPOLOGY_LINESTRIP,
+    };
+
+    #[test]
+    fn stage_draw_restores_application_state_and_reuses_views() {
+        unsafe {
+            let mut device = None;
+            let mut context = None;
+            D3D11CreateDevice(
+                None,
+                D3D_DRIVER_TYPE_HARDWARE,
+                HMODULE::default(),
+                D3D11_CREATE_DEVICE_FLAG(0),
+                None,
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                Some(&mut context),
+            )
+            .unwrap();
+            let device = device.unwrap();
+            let context = context.unwrap();
+            let stage = StageAsset {
+                id: 1,
+                source_path: "fixture".into(),
+                vertices: vec![
+                    StageVertex {
+                        position: [-0.5, -0.5, -1.0],
+                        tex_coord: [0.0, 0.0],
+                    },
+                    StageVertex {
+                        position: [0.5, -0.5, -1.0],
+                        tex_coord: [1.0, 0.0],
+                    },
+                    StageVertex {
+                        position: [0.0, 0.5, -1.0],
+                        tex_coord: [0.5, 1.0],
+                    },
+                ],
+                indices: vec![0, 1, 2],
+                texture_rgba: vec![255; 4],
+                texture_width: 1,
+                texture_height: 1,
+                model_transform: glam::Mat4::IDENTITY,
+                settings: crate::stage::StageSettings {
+                    secondary_color: [0.0, 0.0, 0.0, 1.0],
+                    ..Default::default()
+                },
+            };
+            let mut renderer = StageRenderer::new(&device, &stage).unwrap();
+            let desc = D3D11_TEXTURE2D_DESC {
+                Width: 32,
+                Height: 32,
+                MipLevels: 1,
+                ArraySize: 2,
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
+                ..Default::default()
+            };
+            let mut target = None;
+            device
+                .CreateTexture2D(&desc, None, Some(&mut target))
+                .unwrap();
+            let target = target.unwrap();
+            let viewport = D3D11_VIEWPORT {
+                Width: 17.0,
+                Height: 19.0,
+                MaxDepth: 1.0,
+                ..Default::default()
+            };
+            context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_LINESTRIP);
+            context.RSSetViewports(Some(&[viewport]));
+            context.VSSetShader(&renderer.vertex_shader, None);
+            let view = xr::View {
+                pose: xr::Posef::IDENTITY,
+                fov: xr::Fovf {
+                    angle_left: -0.7,
+                    angle_right: 0.7,
+                    angle_up: 0.7,
+                    angle_down: -0.7,
+                },
+            };
+            let mut timer = super::super::d3d11_timing::GpuTimer::new(&device, &context);
+            timer.begin(7);
+            assert!(timer.poll().is_empty());
+            let mut stereo = [view; 2];
+            stereo[1].pose.position.x = 0.75;
+            for _ in 0..2 {
+                renderer
+                    .render(
+                        &device,
+                        &context,
+                        &stage,
+                        &stereo,
+                        &target,
+                        xr::Extent2Di {
+                            width: 32,
+                            height: 32,
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(
+                    context.IAGetPrimitiveTopology(),
+                    D3D_PRIMITIVE_TOPOLOGY_LINESTRIP
+                );
+                let mut count = 1;
+                let mut actual = D3D11_VIEWPORT::default();
+                context.RSGetViewports(&mut count, Some(&mut actual));
+                assert_eq!(count, 1);
+                assert_eq!(actual.Width, 17.0);
+                assert_eq!(actual.Height, 19.0);
+            }
+            timer.finish();
+            // The fixture has no OpenXR release barrier: explicitly complete
+            // submitted GPU work before dropping the device and private context.
+            let mut done = None;
+            device
+                .CreateQuery(
+                    &D3D11_QUERY_DESC {
+                        Query: D3D11_QUERY_EVENT,
+                        MiscFlags: 0,
+                    },
+                    Some(&mut done),
+                )
+                .unwrap();
+            let done = done.unwrap();
+            context.End(&done);
+            context.Flush();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let mut completed = 0i32;
+                context
+                    .GetData(
+                        &done,
+                        Some((&mut completed as *mut i32).cast()),
+                        4,
+                        D3D11_ASYNC_GETDATA_DONOTFLUSH.0 as u32,
+                    )
+                    .unwrap();
+                if completed != 0 {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "stage GPU did not complete"
+                );
+                std::thread::yield_now();
+            }
+            let measured = loop {
+                let samples = timer.poll();
+                if !samples.is_empty() {
+                    break samples;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "GPU timestamps did not resolve"
+                );
+                std::thread::yield_now();
+            };
+            assert_eq!(measured.len(), 1);
+            assert_eq!(measured[0].frame, 7);
+            assert!(
+                measured[0].milliseconds > 0.0,
+                "GPU timestamp interval was empty"
+            );
+            let resource = renderer.texture_view.GetResource().unwrap();
+            let texture: ID3D11Texture2D = resource.cast().unwrap();
+            let texture_read_desc = D3D11_TEXTURE2D_DESC {
+                Width: 1,
+                Height: 1,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Usage: D3D11_USAGE_STAGING,
+                CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+                ..Default::default()
+            };
+            let mut texture_read = None;
+            device
+                .CreateTexture2D(&texture_read_desc, None, Some(&mut texture_read))
+                .unwrap();
+            let texture_read = texture_read.unwrap();
+            context.CopyResource(&texture_read, &texture);
+            let mut read = D3D11_MAPPED_SUBRESOURCE::default();
+            context
+                .Map(&texture_read, 0, D3D11_MAP_READ, 0, Some(&mut read))
+                .unwrap();
+            assert_eq!(
+                std::slice::from_raw_parts(read.pData as *const u8, 4),
+                &[255, 255, 255, 255]
+            );
+            context.Unmap(&texture_read, 0);
+            let buffer_desc = D3D11_BUFFER_DESC {
+                ByteWidth: size_of::<StageConstants>() as u32,
+                Usage: D3D11_USAGE_STAGING,
+                CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+                ..Default::default()
+            };
+            let mut buffer_read = None;
+            device
+                .CreateBuffer(&buffer_desc, None, Some(&mut buffer_read))
+                .unwrap();
+            let buffer_read = buffer_read.unwrap();
+            context.CopyResource(&buffer_read, &renderer.constant_buffer);
+            context
+                .Map(&buffer_read, 0, D3D11_MAP_READ, 0, Some(&mut read))
+                .unwrap();
+            assert_eq!(
+                std::slice::from_raw_parts((read.pData as *const f32).add(32), 4),
+                &[1.0, 1.0, 1.0, 1.0]
+            );
+            context.Unmap(&buffer_read, 0);
+            let staging_desc = D3D11_TEXTURE2D_DESC {
+                Usage: D3D11_USAGE_STAGING,
+                BindFlags: 0,
+                CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+                ..desc
+            };
+            let mut staging = None;
+            device
+                .CreateTexture2D(&staging_desc, None, Some(&mut staging))
+                .unwrap();
+            let staging = staging.unwrap();
+            context.CopyResource(&staging, &target);
+            for eye in 0..2 {
+                let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+                context
+                    .Map(&staging, eye, D3D11_MAP_READ, 0, Some(&mut mapped))
+                    .unwrap();
+                let corner = mapped.pData as *const u8;
+                let center = corner.add(16 * mapped.RowPitch as usize + 16 * 4);
+                assert_eq!(std::slice::from_raw_parts(corner, 4), &[0, 0, 0, 255]);
+                let expected = if eye == 0 {
+                    [255, 255, 255, 255]
+                } else {
+                    [0, 0, 0, 255]
+                };
+                assert_eq!(std::slice::from_raw_parts(center, 4), &expected);
+                context.Unmap(&staging, eye);
+            }
+            assert_eq!(renderer.target_views.len(), 1);
+            renderer.reset_images();
+            assert!(renderer.target_views.is_empty());
+            context.ClearState();
+        }
     }
 }

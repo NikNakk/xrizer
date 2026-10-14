@@ -849,8 +849,7 @@ impl vr::IVRSystem026_Interface for System {
 
         let devices = input.connected_device_indices_of_class(class);
         if index_count != 0 && !indices.is_null() {
-            let output =
-                unsafe { std::slice::from_raw_parts_mut(indices, index_count as usize) };
+            let output = unsafe { std::slice::from_raw_parts_mut(indices, index_count as usize) };
             for (dst, src) in output.iter_mut().zip(devices.iter().copied()) {
                 *dst = src;
             }
