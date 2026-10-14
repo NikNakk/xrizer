@@ -1,14 +1,11 @@
 // The interfaces in this file are missing in openvr.h and any other form of OpenVR documentation,
 // but are used by games (typically Half Life Alyx.)
 
-use log::{debug, info, trace};
+use log::{debug, trace};
 use openvr::InterfaceImpl;
 use seq_macro::seq;
 use std::ffi::{CStr, c_char, c_int, c_void};
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::{Arc, Mutex};
 
 #[derive(Default)]
 pub struct UnknownInterfaces {
@@ -91,6 +88,43 @@ macro_rules! gen_vtable {
 #[derive(Debug)]
 struct MailboxHandle(u64);
 
+#[derive(Default)]
+struct MailboxState {
+    ready_delivered: bool,
+}
+
+impl MailboxState {
+    // Size queries and failed copies must not consume the pending message.
+    unsafe fn read(&mut self, out: *mut c_char, capacity: u32, length: *mut u32) -> c_int {
+        if length.is_null() {
+            return 2;
+        }
+        unsafe {
+            *length = 0;
+        }
+        if self.ready_delivered {
+            return 1;
+        }
+        let message = c"{ \"type\": \"ready\", }";
+        let payload = message.to_bytes().len() as u32;
+        unsafe {
+            *length = payload;
+        }
+        if out.is_null() || capacity <= payload {
+            return 2;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(message.as_ptr(), out, payload as usize + 1);
+        }
+        self.ready_delivered = true;
+        0
+    }
+}
+
+static MAILBOX: Mutex<MailboxState> = Mutex::new(MailboxState {
+    ready_delivered: false,
+});
+
 // IVRMailbox - used by Alyx, only seems to be documnted here:
 // https://github.com/ValveSoftware/Proton/blob/proton_9.0/vrclient_x64/openvr_v1.10.30/openvr.h#L5108
 // This implementation is adapted from OpenComposite:
@@ -100,12 +134,15 @@ gen_vtable! {
         fn undoc1(a: *const c_char, b: *mut MailboxHandle) -> c_int {
             let a = unsafe { CStr::from_ptr(a) };
             debug!(target: UNKNOWN_TAG, "Entered IVRMailbox::undoc1 with arguments a: {a:?}, b: {b:?}");
+            if b.is_null() { return 2; }
+            *MAILBOX.lock().unwrap() = MailboxState::default();
             unsafe { *b = MailboxHandle(24) };
             0
         }
         fn undoc2(handle: MailboxHandle) -> c_int {
             debug!(target: UNKNOWN_TAG, "Entered IVRMailbox::undoc2 with arugments handle: {handle:?}");
-            info!("[alyx-mailbox] UnregisterMailbox handle={handle:?}");
+            trace!("[alyx-mailbox] UnregisterMailbox handle={handle:?}");
+            *MAILBOX.lock().unwrap() = MailboxState::default();
             0
         }
         fn undoc3(
@@ -124,7 +161,7 @@ gen_vtable! {
                 Some(unsafe { CStr::from_ptr(b) })
             };
             debug!(target: UNKNOWN_TAG, "Entered IVRMailbox::undoc3 with arguments handle: {handle:?}, a: {a:?}, b: {b:?}");
-            info!("[alyx-mailbox] SendMessage handle={handle:?} type={a:?} message={b:?}");
+            trace!("[alyx-mailbox] SendMessage handle={handle:?} type={a:?} message={b:?}");
             0
         }
         // Borrowed from OpenComposite
@@ -136,43 +173,9 @@ gen_vtable! {
         ) -> c_int {
             debug!(target: UNKNOWN_TAG, "Entered IVRMailbox::undoc4 with arguments handle: {handle:?}, out_buf: {out_buf:?}, out_len: {out_len:?}, c: {len:?}");
 
-            static RECEIVED_MESSAGE: AtomicBool = AtomicBool::new(false);
-            if !RECEIVED_MESSAGE.load(Ordering::Relaxed) {
-                RECEIVED_MESSAGE.store(true, Ordering::Relaxed);
-
-                // Match OpenComposite's Alyx compatibility behaviour exactly:
-                // report the JSON payload length excluding the terminating NUL,
-                // but require/copy one additional byte for the NUL terminator.
-                // Alyx uses the reported length when consuming the mailbox payload.
-                let msg = c"{ \"type\": \"ready\", }";
-                let payload_len = msg.to_bytes().len() as u32;
-                unsafe {
-                    *len.as_mut().unwrap() = payload_len;
-                }
-
-                if out_len < payload_len + 1 {
-                    info!(
-                        "[alyx-mailbox] ReadMessage ready buffer-too-short handle={handle:?} out_len={out_len} payload_len={payload_len}"
-                    );
-                    return 2;
-                }
-
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        msg.as_ptr(),
-                        out_buf,
-                        payload_len as usize + 1,
-                    );
-                }
-
-                info!(
-                    "[alyx-mailbox] ReadMessage -> ready handle={handle:?} payload_len={payload_len} text={msg:?}"
-                );
-                0
-            } else {
-                trace!("[alyx-mailbox] ReadMessage -> no-message handle={handle:?}");
-                1
-            }
+            let result = unsafe { MAILBOX.lock().unwrap().read(out_buf, out_len, len) };
+            trace!("[alyx-mailbox] ReadMessage handle={handle:?} result={result}");
+            result
         }
     }
 }
@@ -191,3 +194,47 @@ seq!(N in 0..=25 {
         }
     });
 });
+
+#[cfg(test)]
+mod mailbox_tests {
+    use super::*;
+    #[test]
+    fn size_query_and_short_buffer_preserve_ready() {
+        let mut mailbox = MailboxState::default();
+        let mut length = 0;
+        assert_eq!(
+            unsafe { mailbox.read(std::ptr::null_mut(), 0, &mut length) },
+            2
+        );
+        let required = length;
+        let mut buffer = vec![0 as c_char; required as usize + 1];
+        assert_eq!(
+            unsafe { mailbox.read(buffer.as_mut_ptr(), required, &mut length) },
+            2
+        );
+        assert_eq!(
+            unsafe { mailbox.read(buffer.as_mut_ptr(), required + 1, &mut length) },
+            0
+        );
+        assert_eq!(length, required);
+        assert_eq!(
+            unsafe { CStr::from_ptr(buffer.as_ptr()) },
+            c"{ \"type\": \"ready\", }"
+        );
+        assert_eq!(
+            unsafe { mailbox.read(buffer.as_mut_ptr(), required + 1, &mut length) },
+            1
+        );
+        assert_eq!(length, 0);
+    }
+    #[test]
+    fn invalid_length_does_not_consume_ready() {
+        let mut mailbox = MailboxState::default();
+        let mut buffer = [0 as c_char; 64];
+        assert_eq!(
+            unsafe { mailbox.read(buffer.as_mut_ptr(), 64, std::ptr::null_mut()) },
+            2
+        );
+        assert!(!mailbox.ready_delivered);
+    }
+}
