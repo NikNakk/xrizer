@@ -1,122 +1,69 @@
 # Windows OpenXR / D3D11 port
 
-This branch adds a Windows x64 path intended to run Windows OpenVR games through xrizer and a Windows OpenXR runtime.
-
-The immediate target is Half-Life: Alyx under Wine/DXMT on macOS, using the Windows OpenXR bridge from the macOS Monado port.
-
-## Architecture
+Status reviewed 2026-10-14. This branch builds a Windows x64 OpenVR-to-OpenXR
+runtime. The current macOS target is Alyx under CrossOver Wine/DXMT, through
+`macos-wine-xr`'s in-process `wineopenxr` bridge to native Monado.
 
 ```text
-Windows OpenVR game (Alyx)
-        |
-        | OpenVR
-        v
-openvr_api.dll (xrizer, Windows x64)
-        |
-        | OpenXR + XR_KHR_D3D11_enable
-        v
-Windows OpenXR loader
-        |
-        v
-libopenxr_monado.dll
-        |
-        | Wine/DXMT + IOSurface transport
-        v
-native macOS Monado service
+Alyx → Valve openvr_api.dll → xrizer bin/vrclient_x64.dll
+     → Windows OpenXR loader → wineopenxr → native Monado / PS VR2
 ```
 
-xrizer does not need to know about Metal or IOSurface. It consumes the game's D3D11 texture and submits through ordinary D3D11 OpenXR swapchains. The existing Monado Windows bridge remains responsible for the macOS transport.
+The DLL also exports a drop-in OpenVR API, but the current Alyx runner preserves
+Valve's original `openvr_api.dll` and selects xrizer with `VR_OVERRIDE`. It places
+the Windows `openxr_loader.dll` beside `hlvr.exe`. The bridge owns D3D11-to-Metal
+resource adaptation; xrizer does not implement Metal or IOSurface transport.
 
-## Current branch functionality
+Windows production sessions start on a temporary D3D11 device and restart on
+the game's device when the first DirectX texture arrives. The ordinary submit
+path copies OpenVR texture bounds into stereo OpenXR array images. The new stage
+path decodes OBJ/PNG/TGA/DDS assets and draws a loading diorama; it uses a private deferred
+context, cached shaders/RTVs and a bounded asynchronous asset loader. See
+[the follow-up](ALYX_REVIEW_FOLLOWUP.md) for validation and remaining limits.
 
-- Windows x64 builds no longer pull in the Linux GLX implementation.
-- `cargo xbuild` packages the Windows cdylib as:
-  - `bin/vrclient_x64.dll`
-  - `openvr_api.dll`
-- The DLL exports the modern drop-in OpenVR client entry points, including:
-  - `VR_InitInternal2`
-  - `VR_InitInternal`
-  - `VR_ShutdownInternal`
-  - `VR_GetGenericInterface`
-  - `VR_IsInterfaceVersionValid`
-  - `VR_GetInitToken`
-- `TextureType_DirectX` selects a D3D11 graphics backend.
-- Windows OpenXR instances enable `XR_KHR_D3D11_enable`.
-- Temporary pre-submit sessions use D3D11 on Windows rather than Vulkan.
-- D3D11 submissions copy the requested OpenVR texture bounds into the appropriate eye layer of the OpenXR swapchain image.
-- DirectX output-device queries return the OpenXR runtime's D3D11 adapter LUID; legacy DXGI adapter queries use adapter 0.
+## Build
 
-## Cross-build on Apple Silicon macOS
+Install MinGW, Rust's `x86_64-pc-windows-gnu` target and `glslc`, then run:
 
-Install the Windows GNU toolchain if needed:
-
-```zsh
-brew install mingw-w64
-rustup target add x86_64-pc-windows-gnu
+```sh
+XRIZER_VERSION=macos-dev cargo xbuild --locked --release \
+  --target x86_64-pc-windows-gnu --no-default-features
 ```
 
-Then:
+Use the Rust toolchain that actually contains the Windows target. On this Mac,
+Homebrew `rustc` and the rustup compiler have separate standard-library trees;
+set `RUSTC` to the rustup toolchain's compiler when using Homebrew cargo. Bindgen
+also needs the installed MinGW C++ include paths on macOS. Runtime outputs are
+`target/x86_64-pc-windows-gnu/release/bin/vrclient_x64.dll` and
+`target/x86_64-pc-windows-gnu/release/openvr_api.dll`.
 
-```zsh
-cd ~/Code/xrizer
-git checkout windows-openxr-d3d11
+## Evidence and remaining limits
 
-XRIZER_VERSION=macos-dev \
-cargo xbuild \
-  --release \
-  --target x86_64-pc-windows-gnu \
-  --no-default-features
-```
+The [Windows OpenXR workflow](https://github.com/NikNakk/xrizer/actions/runs/35930876849)
+passes for committed baseline `655d448`. It cross-builds on Ubuntu, compiles the
+Windows tests with `--no-run`, verifies exported symbols and uploads DLLs; it
+does **not** execute Windows unit tests. The
+[Linux regression workflow](https://github.com/NikNakk/xrizer/actions/runs/35930876864)
+fails three input tests. The local Wine suite reproduces the same three failures.
 
-Expected drop-in DLL:
+The baseline's initial graphics restart deadlocked on a recursive session read.
+The correction and subsequent cleanup are committed locally. The fixture defects
+behind the three baseline input failures are repaired: local Linux tests pass
+96 unit and 2 integration tests; the Windows/Wine cleanup suite passes 96 tests
+with 2 ignored. Strict Windows and Linux Clippy checks pass. These local results
+do not imply that a new remote CI run has passed.
 
-```text
-target/x86_64-pc-windows-gnu/release/openvr_api.dll
-```
+Later commits through `1eb76cd` correct display-frequency fallback units, HMD
+naming and successful property error reporting. User-operated Alyx gameplay with
+that combined code is recorded in Monado's
+`doc/macos-steamvr-keyed-ownership-followup.md`, including 45% scale at 120 Hz
+and auto-fidelity behavior. Frame pacing and GPU cost remain under investigation.
 
-Expected runtime DLL:
-
-```text
-target/x86_64-pc-windows-gnu/release/bin/vrclient_x64.dll
-```
-
-## First Alyx test
-
-Back up the Alyx copy of `openvr_api.dll`, then replace it with the xrizer build.
-
-Use the existing Monado Wine/DXMT launcher and OpenXR runtime registration. Do not use the legacy Unity OpenVR proxy.
-
-Enable verbose logging for the first run, for example:
-
-```zsh
-RUST_LOG='xrizer=trace,openvr_calls=trace'
-```
-
-The first milestone is:
-
-1. Alyx loads the xrizer `openvr_api.dll`.
-2. Modern interfaces including `IVRSystem_026`, `IVROverlay_028`, and `IVRInput_011` are returned successfully.
-3. xrizer creates its temporary D3D11 OpenXR session.
-4. On the first `TextureType_DirectX` submit, xrizer restarts onto the game's D3D11 device.
-5. An OpenXR D3D11 swapchain is created and the first eye textures are submitted to Monado.
-
-Controllers are not required for this milestone.
-
-## Known unverified areas
-
-This is an initial bring-up and still needs a real Windows compile and runtime test.
-
-In particular:
-
-- The Windows build has not yet completed in GitHub Actions on this fork.
-- The temporary D3D11 device currently uses the default hardware adapter. If the OpenXR runtime requires a specific adapter, device creation should be changed to select the adapter by the LUID returned by `graphics_requirements::<openxr::D3D11>()`.
-- The initial copy path assumes the common Alyx case of a compatible D3D11 source/swapchain format and sample layout.
-- MSAA resolve, incompatible/typeless format conversion, texture-array source selection, and unusual flipped bounds should be added only if observed.
-- Overlay D3D11 copying currently targets array layer 0.
-- Controller/input behavior still depends on xrizer's existing OpenVR-to-OpenXR mappings and the controller support exposed by Monado.
-
-## CI
-
-The branch adds a `windows-build` job on `windows-latest` which builds the runtime, runs tests, verifies the drop-in exports indirectly through the integration tests, and uploads both Windows DLL names.
-
-If a new fork has GitHub Actions disabled, enable Actions for the repository before relying on this job.
+The runtime now reports measured CPU phases and nonblocking D3D11 timestamp
+samples, preserves timing history, rejects unsupported copy formats, bounds
+image waits and returns frame-path failures rather than panicking. This does not
+provide native compositor GPU telemetry or automatic session recovery. Some
+inherited initialization/teardown paths still panic on errors. Temporary device
+creation still uses the default adapter rather than the runtime's required LUID.
+The direct launcher defaults to manual fidelity; auto-fidelity was explicitly
+enabled for later hardware experiments. See the follow-up for exact limits.
