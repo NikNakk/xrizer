@@ -254,19 +254,21 @@ impl<C: openxr_data::Compositor> Input<C> {
 
     fn state_from_bindings_left_right(
         &self,
+        session: &SessionData,
         action: vr::VRActionHandle_t,
     ) -> Option<(xr::ActionState<bool>, vr::VRInputValueHandle_t)> {
         debug_assert!(self.left_hand_key.0.as_ffi() != 0);
         debug_assert!(self.right_hand_key.0.as_ffi() != 0);
-        let left_state = self.state_from_bindings(action, self.left_hand_key.0.as_ffi());
+        let left_state = self.state_from_bindings(session, action, self.left_hand_key.0.as_ffi());
 
         match left_state {
-            None => self.state_from_bindings(action, self.right_hand_key.0.as_ffi()),
+            None => self.state_from_bindings(session, action, self.right_hand_key.0.as_ffi()),
             Some((left, _)) => {
                 if left.is_active && left.current_state {
                     return left_state;
                 }
-                let right_state = self.state_from_bindings(action, self.right_hand_key.0.as_ffi());
+                let right_state =
+                    self.state_from_bindings(session, action, self.right_hand_key.0.as_ffi());
                 match right_state {
                     None => left_state,
                     Some((right, _)) => {
@@ -285,21 +287,22 @@ impl<C: openxr_data::Compositor> Input<C> {
 
     fn state_from_bindings(
         &self,
+        session: &SessionData,
         action: vr::VRActionHandle_t,
         restrict_to_device: vr::VRInputValueHandle_t,
     ) -> Option<(xr::ActionState<bool>, vr::VRInputValueHandle_t)> {
         let subaction = self.subaction_path_from_handle(restrict_to_device)?;
         if subaction == xr::Path::NULL {
-            return self.state_from_bindings_left_right(action);
+            return self.state_from_bindings_left_right(session, action);
         }
 
-        let session = self.openxr.session_data.get();
+        // Reuse the caller's session guard: a nested read can deadlock when
+        // the compositor queues a writer to replace the graphics session.
         let LoadedActions::Manifest(loaded_actions) = session.input_data.actions.get()? else {
             return None;
         };
 
-        let interaction_profile =
-            self.effective_interaction_profile(&session, subaction)?;
+        let interaction_profile = self.effective_interaction_profile(session, subaction)?;
         let bindings = loaded_actions
             .try_get_bindings(action, interaction_profile)
             .ok()?;
@@ -308,7 +311,7 @@ impl<C: openxr_data::Compositor> Input<C> {
         let mut best_state: Option<xr::ActionState<bool>> = None;
 
         for x in bindings.iter() {
-            let Ok(Some(state)) = x.state(&session, extra_data, subaction) else {
+            let Ok(Some(state)) = x.state(session, extra_data, subaction) else {
                 continue;
             };
 
@@ -1154,7 +1157,7 @@ impl<C: openxr_data::Compositor> vr::IVRInput011_Interface for Input<C> {
                 // It's generally not clear how SteamVR handles float actions with multiple bindings;
                 //   so emulate OpenXR, which takes maximum among active actions
                 if let Some((binding_state, binding_source)) =
-                    self.state_from_bindings(handle, restrict_to_device)
+                    self.state_from_bindings(&session_data, handle, restrict_to_device)
                     && binding_state.is_active
                     && (binding_state.current_state && state.current_state != 1.0
                         || !state.is_active)
@@ -1244,7 +1247,7 @@ impl<C: openxr_data::Compositor> vr::IVRInput011_Interface for Input<C> {
 
         let mut active_hand = restrict_to_device;
         if let Some((binding_state, binding_source)) =
-            self.state_from_bindings(handle, restrict_to_device)
+            self.state_from_bindings(&session_data, handle, restrict_to_device)
             && binding_state.is_active
             && (binding_state.current_state && !state.current_state || !state.is_active)
         {

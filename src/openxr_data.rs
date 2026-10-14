@@ -487,13 +487,13 @@ impl SessionData {
         create_info: Option<&SessionCreateInfo>,
     ) -> Result<(Self, xr::FrameWaiter, FrameStream), SessionCreationError> {
         let temporary_info;
-        #[cfg(target_os = "windows")]
+        #[cfg(all(target_os = "windows", not(test)))]
         let temp_vulkan = None;
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(any(not(target_os = "windows"), test))]
         let mut temp_vulkan = None;
-        #[cfg(target_os = "windows")]
+        #[cfg(all(target_os = "windows", not(test)))]
         let mut temp_d3d11 = None;
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(any(not(target_os = "windows"), test))]
         let temp_d3d11 = None;
         let info = if let Some(info) = create_info {
             if let SessionCreateInfo::Vulkan(info) = info {
@@ -504,7 +504,7 @@ impl SessionData {
             }
             info
         } else {
-            #[cfg(target_os = "windows")]
+            #[cfg(all(target_os = "windows", not(test)))]
             {
                 let d3d11 = D3D11Data::new_temporary()
                     .expect("Failed to create temporary D3D11 device");
@@ -513,7 +513,7 @@ impl SessionData {
                 temp_d3d11 = Some(d3d11);
             }
 
-            #[cfg(not(target_os = "windows"))]
+            #[cfg(any(not(target_os = "windows"), test))]
             {
                 let vk = VulkanData::new_temporary(instance, system_id);
                 temporary_info =
