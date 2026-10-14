@@ -205,11 +205,10 @@ static OPENVR_API_TOKEN: AtomicU32 = AtomicU32::new(0);
 static OPENVR_RUNTIME_PATH: OnceLock<CString> = OnceLock::new();
 
 fn openvr_api_core() -> Option<&'static Arc<ClientCore>> {
-    if OPENVR_API_CORE.get().is_none() {
-        let core = ClientCore::new(c"IVRClientCore_003")?;
-        let _ = OPENVR_API_CORE.set(core);
-    }
-    OPENVR_API_CORE.get()
+    Some(OPENVR_API_CORE.get_or_init(|| {
+        ClientCore::new(c"IVRClientCore_003")
+            .expect("built-in ClientCore version must be supported")
+    }))
 }
 
 fn set_init_error(out: *mut vr::EVRInitError, error: vr::EVRInitError) {
@@ -402,9 +401,7 @@ pub extern "C" fn VR_GetVRInitErrorAsSymbol(error: vr::EVRInitError) -> *const c
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn VR_GetVRInitErrorAsEnglishDescription(
-    error: vr::EVRInitError,
-) -> *const c_char {
+pub extern "C" fn VR_GetVRInitErrorAsEnglishDescription(error: vr::EVRInitError) -> *const c_char {
     init_error_description(error).as_ptr()
 }
 
@@ -421,34 +418,35 @@ pub unsafe extern "C" fn VRClientCoreFactory(
     interface_name: *const c_char,
     return_code: *mut i32,
 ) -> *mut c_void {
-    let interface = unsafe { CStr::from_ptr(interface_name) };
-
-    struct ClientCorePtr(*mut c_void);
-    // SAFETY: Vtables are fine to send across threads.
-    unsafe impl Send for ClientCorePtr {}
-    unsafe impl Sync for ClientCorePtr {}
-
-    static C: OnceLock<ClientCorePtr> = OnceLock::new();
-    if C.get().is_none() {
-        let ret = ClientCore::new(interface).map(|c| {
-            if let Some(ret) = unsafe { return_code.as_mut() } {
-                *ret = 0;
-            }
-            let vtable = match c.base.get().unwrap() {
-                clientcore::Vtable::V2(v) => v as *const _ as *const vr::IVRClientCore002 as _,
-                clientcore::Vtable::V3(v) => v as *const _ as *const vr::IVRClientCore003 as _,
-            };
-            // Leak it!
-            let _ = Arc::into_raw(c);
-            vtable
-        });
-
-        if let Some(c) = ret {
-            C.set(ClientCorePtr(c)).unwrap_or_else(|_| unreachable!());
+    if interface_name.is_null() {
+        if let Some(code) = unsafe { return_code.as_mut() } {
+            *code = vr::EVRInitError::Init_InvalidInterface as i32;
         }
+        return std::ptr::null_mut();
     }
-
-    C.get().map(|c| c.0).unwrap_or(std::ptr::null_mut())
+    let interface = unsafe { CStr::from_ptr(interface_name) };
+    static V2_CORE: OnceLock<Arc<ClientCore>> = OnceLock::new();
+    let core = match interface {
+        version if version == c"IVRClientCore_003" => openvr_api_core().unwrap(),
+        version if version == c"IVRClientCore_002" => V2_CORE.get_or_init(|| {
+            ClientCore::new(c"IVRClientCore_002")
+                .expect("built-in ClientCore version must be supported")
+        }),
+        _ => {
+            if let Some(code) = unsafe { return_code.as_mut() } {
+                *code = vr::EVRInitError::Init_InterfaceNotFound as i32;
+            }
+            return std::ptr::null_mut();
+        }
+    };
+    if let Some(code) = unsafe { return_code.as_mut() } {
+        *code = 0;
+    }
+    // The static Arc owns each version's vtable for the lifetime of the DLL.
+    match core.base.get().unwrap() {
+        clientcore::Vtable::V2(v) => v as *const _ as *const vr::IVRClientCore002 as _,
+        clientcore::Vtable::V3(v) => v as *const _ as *const vr::IVRClientCore003 as _,
+    }
 }
 
 /// Needed for Proton, but seems unused.
@@ -464,4 +462,54 @@ pub unsafe extern "C" fn HmdSystemFactory(
         *code = vr::EVRInitError::Init_InterfaceNotFound as i32;
     }
     std::ptr::null_mut()
+}
+
+#[cfg(test)]
+mod export_tests {
+    use super::*;
+
+    #[test]
+    fn concurrent_factory_calls_keep_each_version_stable() {
+        for version in [c"IVRClientCore_002", c"IVRClientCore_003"] {
+            let barrier = std::sync::Barrier::new(16);
+            std::thread::scope(|scope| {
+                let calls: Vec<_> = (0..16)
+                    .map(|_| {
+                        let barrier = &barrier;
+                        scope.spawn(move || {
+                            barrier.wait();
+                            let mut error = -1;
+                            let pointer =
+                                unsafe { VRClientCoreFactory(version.as_ptr(), &mut error) };
+                            assert_eq!(error, 0);
+                            assert!(!pointer.is_null());
+                            pointer as usize
+                        })
+                    })
+                    .collect();
+                let pointers: Vec<_> = calls.into_iter().map(|call| call.join().unwrap()).collect();
+                assert!(pointers.iter().all(|pointer| *pointer == pointers[0]));
+            });
+        }
+        let v2 =
+            unsafe { VRClientCoreFactory(c"IVRClientCore_002".as_ptr(), std::ptr::null_mut()) };
+        let v3 =
+            unsafe { VRClientCoreFactory(c"IVRClientCore_003".as_ptr(), std::ptr::null_mut()) };
+        assert_ne!(v2, v3);
+        let mut error = 0;
+        assert!(unsafe { VRClientCoreFactory(c"unsupported".as_ptr(), &mut error) }.is_null());
+        assert_eq!(error, vr::EVRInitError::Init_InterfaceNotFound as i32);
+    }
+
+    #[test]
+    fn runtime_path_short_buffer_reports_required_size() {
+        let mut required = 0;
+        let mut short = [1 as c_char; 1];
+        assert!(unsafe { VR_GetRuntimePath(short.as_mut_ptr(), 1, &mut required) });
+        assert_eq!(short[0], 0);
+        assert_eq!(required as usize, runtime_path().to_bytes_with_nul().len());
+        let mut full = vec![0 as c_char; required as usize];
+        assert!(unsafe { VR_GetRuntimePath(full.as_mut_ptr(), required, &mut required) });
+        assert_eq!(unsafe { CStr::from_ptr(full.as_ptr()) }, runtime_path());
+    }
 }
