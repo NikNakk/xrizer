@@ -108,27 +108,30 @@ fn get_controller_pose(
     controller: &TrackedDevice,
     origin: vr::ETrackingUniverseOrigin,
 ) -> Option<vr::TrackedDevicePose_t> {
+    let hand = controller.get_controller_hand().unwrap();
     let pose_data = session_data.input_data.pose_data.get()?;
 
-    let spaces = match controller.get_controller_hand().unwrap() {
+    let spaces = match hand {
         Hand::Left => &pose_data.left_space,
         Hand::Right => &pose_data.right_space,
     };
 
-    let (location, velocity) = if let Some(raw) =
+    let pose = if let Some(raw) =
         spaces.try_get_or_init_raw(&controller.profile_data, session_data, pose_data)
     {
-        raw.relate(
-            session_data.get_space_for_origin(origin),
-            xr_data.display_time.get(),
-        )
-        .ok()?
+        let (location, velocity) = raw
+            .relate(
+                session_data.get_space_for_origin(origin),
+                xr_data.display_time.get(),
+            )
+            .ok()?;
+        vr::space_relation_to_openvr_pose(location, velocity)
     } else {
-        trace!("Failed to get raw space, returning empty pose");
-        (xr::SpaceLocation::default(), xr::SpaceVelocity::default())
+        trace!("Failed to get raw controller space");
+        vr::TrackedDevicePose_t::default()
     };
 
-    Some(vr::space_relation_to_openvr_pose(location, velocity))
+    Some(pose)
 }
 
 #[cfg(feature = "monado")]
@@ -564,6 +567,35 @@ impl<C: openxr_data::Compositor> Input<C> {
         let devices = session_data.input_data.devices.read().unwrap();
 
         devices.get_controller_index(hand)
+    }
+
+    pub fn connected_device_indices_of_class(
+        &self,
+        class: vr::ETrackedDeviceClass,
+    ) -> Vec<vr::TrackedDeviceIndex_t> {
+        let session_data = self.openxr.session_data.get();
+        let devices = session_data.input_data.devices.read().unwrap();
+
+        devices
+            .iter()
+            .enumerate()
+            .filter_map(|(index, device)| {
+                if !device.connected {
+                    return None;
+                }
+
+                let device_class = match device.get_type() {
+                    TrackedDeviceType::Hmd => vr::ETrackedDeviceClass::HMD,
+                    TrackedDeviceType::Controller { .. } => vr::ETrackedDeviceClass::Controller,
+                    #[cfg(feature = "monado")]
+                    TrackedDeviceType::GenericTracker { .. } => {
+                        vr::ETrackedDeviceClass::GenericTracker
+                    }
+                };
+
+                (device_class == class).then_some(index as vr::TrackedDeviceIndex_t)
+            })
+            .collect()
     }
 
     pub fn get_device_string_tracked_property(

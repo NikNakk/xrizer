@@ -1,13 +1,42 @@
+mod d3d11;
+#[cfg(target_os = "windows")]
+mod d3d11_stage;
+#[cfg(target_os = "windows")]
+mod d3d11_timing;
+#[cfg(target_os = "linux")]
 mod gl;
+#[cfg(target_os = "windows")]
+mod gl_stub;
 mod vulkan;
 
+pub use d3d11::D3D11Data;
 use derive_more::{From, TryInto};
+#[cfg(target_os = "linux")]
 pub use gl::GlData;
+#[cfg(target_os = "windows")]
+pub use gl_stub::GlData;
 use openvr as vr;
 use openxr as xr;
 pub use vulkan::VulkanData;
 
+#[derive(Clone, Copy, Debug)]
+pub struct GpuTiming {
+    pub frame: u32,
+    pub milliseconds: f64,
+}
+
 pub trait GraphicsBackend: Into<SupportedBackend> {
+    fn supports_format_conversion() -> bool {
+        true
+    }
+    fn requires_gpu_timing() -> bool {
+        false
+    }
+    fn begin_gpu_timing(&mut self, _frame: u32) {}
+    fn finish_gpu_timing(&mut self) {}
+    fn poll_gpu_timings(&mut self) -> Vec<GpuTiming> {
+        Vec::new()
+    }
     type Api: xr::Graphics + 'static;
     type OpenVrTexture: Copy;
     type NiceFormat: std::fmt::Debug;
@@ -48,12 +77,33 @@ pub trait GraphicsBackend: Into<SupportedBackend> {
         bounds: vr::VRTextureBounds_t,
         image_index: usize,
     ) -> xr::Extent2Di;
+
+    fn stage_swapchain_info(
+        &self,
+        _width: u32,
+        _height: u32,
+    ) -> Option<xr::SwapchainCreateInfo<Self::Api>> {
+        None
+    }
+
+    fn render_stage(
+        &mut self,
+        _stage: &crate::stage::StageAsset,
+        _views: &[xr::View; 2],
+        _image_index: usize,
+        _extent: xr::Extent2Di,
+    ) -> Result<(), String> {
+        Err("stage overrides are unsupported by this graphics backend".into())
+    }
+
+    fn clear_stage(&mut self) {}
 }
 
 #[derive(macros::Backends, TryInto, From)]
 #[try_into(owned, ref)]
 #[allow(clippy::large_enum_variant)]
 pub enum SupportedBackend {
+    D3D11(D3D11Data),
     Vulkan(VulkanData),
     OpenGL(GlData),
     #[cfg(test)]
@@ -110,7 +160,9 @@ pub trait WithAnyGraphicsOwned<G>: WithAnyGraphicsParams {
 impl SupportedBackend {
     pub fn is_texture_type_supported(texture_type: vr::ETextureType) -> bool {
         match texture_type {
-            vr::ETextureType::Vulkan | vr::ETextureType::OpenGL => true,
+            vr::ETextureType::DirectX => cfg!(target_os = "windows"),
+            vr::ETextureType::Vulkan => true,
+            vr::ETextureType::OpenGL => cfg!(target_os = "linux"),
             #[cfg(test)]
             vr::ETextureType::Reserved => true,
             _ => false,
@@ -119,6 +171,7 @@ impl SupportedBackend {
 
     pub fn new(texture: &vr::Texture_t, _bounds: vr::VRTextureBounds_t) -> Option<Self> {
         match texture.eType {
+            vr::ETextureType::DirectX => D3D11Data::new(texture).map(Self::D3D11),
             vr::ETextureType::Vulkan => {
                 let vk_texture = unsafe { &*(texture.handle as *const vr::VRVulkanTextureData_t) };
                 Some(Self::Vulkan(VulkanData::new(vk_texture)))
