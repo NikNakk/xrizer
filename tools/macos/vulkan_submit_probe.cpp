@@ -21,6 +21,8 @@
 #include <dlfcn.h>
 
 #include <cmath>
+#include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -75,8 +77,71 @@ struct EyeImage {
 	VkDeviceMemory memory = VK_NULL_HANDLE;
 };
 
+static void report_device(VkInstance instance, VkPhysicalDevice physical)
+{
+    VkPhysicalDeviceDriverProperties driver = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+    VkPhysicalDeviceIDProperties id = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
+    driver.pNext = &id;
+    VkPhysicalDeviceProperties2 props = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &driver};
+    vkGetPhysicalDeviceProperties2(physical, &props);
+    const auto &p = props.properties;
+    std::printf("device=%s vendor=%#x deviceID=%#x api=%u.%u.%u driverVersion=%u driverID=%d driver=%s info=%s UUID=",
+        p.deviceName, p.vendorID, p.deviceID, VK_API_VERSION_MAJOR(p.apiVersion),
+        VK_API_VERSION_MINOR(p.apiVersion), VK_API_VERSION_PATCH(p.apiVersion),
+        p.driverVersion, driver.driverID, driver.driverName, driver.driverInfo);
+    for (auto b : id.deviceUUID) std::printf("%02x", b);
+    std::printf("\n");
+    uint32_t count = 0;
+    CHECK_VK(vkEnumerateDeviceExtensionProperties(physical, nullptr, &count, nullptr));
+    std::vector<VkExtensionProperties> exts(count);
+    CHECK_VK(vkEnumerateDeviceExtensionProperties(physical, nullptr, &count, exts.data()));
+    for (const auto &e : exts) std::printf("available_device_extension=%s version=%u\n", e.extensionName, e.specVersion);
+    (void)instance;
+}
+
+// Driver-only mode deliberately avoids OpenVR/OpenXR, so unsupported runtime
+// interoperability can be distinguished from ICD initialisation failure.
+static int driver_only()
+{
+    VkApplicationInfo app = {VK_STRUCTURE_TYPE_APPLICATION_INFO};
+    app.apiVersion = VK_API_VERSION_1_2;
+    const char *ext = VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME;
+    VkInstanceCreateInfo ci = {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
+    ci.pApplicationInfo = &app;
+    uint32_t count = 0;
+    CHECK_VK(vkEnumerateInstanceExtensionProperties(nullptr, &count, nullptr));
+    std::vector<VkExtensionProperties> exts(count);
+    CHECK_VK(vkEnumerateInstanceExtensionProperties(nullptr, &count, exts.data()));
+    for (const auto &e : exts) std::printf("available_instance_extension=%s version=%u\n", e.extensionName, e.specVersion);
+    if (has_extension(exts, ext)) {
+        ci.flags = VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+        ci.enabledExtensionCount = 1;
+        ci.ppEnabledExtensionNames = &ext;
+    }
+    VkInstance instance;
+    CHECK_VK(vkCreateInstance(&ci, nullptr, &instance));
+    CHECK_VK(vkEnumeratePhysicalDevices(instance, &count, nullptr));
+    std::vector<VkPhysicalDevice> devices(count);
+    CHECK_VK(vkEnumeratePhysicalDevices(instance, &count, devices.data()));
+    for (auto device : devices) report_device(instance, device);
+    vkDestroyInstance(instance, nullptr);
+    return devices.empty() ? 1 : 0;
+}
+
+static double clock_ms()
+{
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+static double percentile(std::vector<double> values, double p)
+{
+    if (values.empty()) return 0;
+    std::sort(values.begin(), values.end());
+    return values[(size_t)(p * (values.size()-1))];
+}
 int main(int argc, char **argv)
 {
+    const double startup = clock_ms();
+	if (argc == 2 && !std::strcmp(argv[1], "--driver-only")) return driver_only();
 	if (argc < 2) {
 		std::fprintf(stderr, "usage: %s /path/to/vrclient.dylib [frames]\n", argv[0]);
 		return 2;
@@ -136,7 +201,7 @@ int main(int argc, char **argv)
 	auto instance_names = pointers(instance_exts);
 	VkApplicationInfo app = {VK_STRUCTURE_TYPE_APPLICATION_INFO};
 	app.pApplicationName = "xrizer macOS probe";
-	app.apiVersion = VK_API_VERSION_1_1;
+	app.apiVersion = VK_API_VERSION_1_2;
 	VkInstanceCreateInfo instance_info = {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
 	instance_info.flags = instance_flags;
 	instance_info.pApplicationInfo = &app;
@@ -154,6 +219,7 @@ int main(int argc, char **argv)
 		vkEnumeratePhysicalDevices(instance, &n, &physical);
 		std::printf("GetOutputDevice gave none; using the first device\n");
 	}
+	report_device(instance, physical);
 	VkPhysicalDeviceProperties props;
 	vkGetPhysicalDeviceProperties(physical, &props);
 	std::printf("Vulkan device: %s\n", props.deviceName);
@@ -182,7 +248,12 @@ int main(int argc, char **argv)
 	queue_info.queueCount = 1;
 	queue_info.pQueuePriorities = &priority;
 	auto device_names = pointers(device_exts);
+	VkPhysicalDeviceTimelineSemaphoreFeatures timeline = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES};
+	VkPhysicalDeviceFeatures2 features = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &timeline};
+	vkGetPhysicalDeviceFeatures2(physical, &features);
+	std::printf("enabled_timeline_semaphore=%u\n", timeline.timelineSemaphore);
 	VkDeviceCreateInfo device_info = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
+	device_info.pNext = &timeline;
 	device_info.queueCreateInfoCount = 1;
 	device_info.pQueueCreateInfos = &queue_info;
 	device_info.enabledExtensionCount = (uint32_t)device_names.size();
@@ -239,11 +310,17 @@ int main(int argc, char **argv)
 	CHECK_VK(vkCreateFence(device, &fence_info, nullptr, &fence));
 
 	VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
+	int failures = 0;
+	std::vector<double> frame_ms;
+	double first_handoff_ms = 0;
 	vr::TrackedDevicePose_t poses[vr::k_unMaxTrackedDeviceCount];
 	for (int frame = 0; frame < frames; frame++) {
+		const double frame_start = clock_ms();
 		vr::EVRCompositorError wait = compositor->WaitGetPoses(poses, vr::k_unMaxTrackedDeviceCount, nullptr, 0);
-		if (wait != vr::VRCompositorError_None)
+		if (wait != vr::VRCompositorError_None) {
+			++failures;
 			std::printf("frame %d: WaitGetPoses error %d\n", frame, (int)wait);
+		}
 
 		// Clear both eyes, leaving them in TRANSFER_SRC_OPTIMAL as OpenVR expects at Submit.
 		VkCommandBufferBeginInfo begin = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -296,10 +373,14 @@ int main(int argc, char **argv)
 			data.m_nSampleCount = 1;
 			vr::Texture_t texture = {&data, vr::TextureType_Vulkan, vr::ColorSpace_Auto};
 			vr::EVRCompositorError result = compositor->Submit(e == 0 ? vr::Eye_Left : vr::Eye_Right, &texture);
-			if (result != vr::VRCompositorError_None)
+			if (result != vr::VRCompositorError_None) {
+				++failures;
 				std::printf("frame %d: Submit(%s) error %d\n", frame, e == 0 ? "left" : "right", (int)result);
+			}
 		}
 		compositor->PostPresentHandoff();
+		if (frame == 0) first_handoff_ms = clock_ms()-startup;
+		if (frame >= 30) frame_ms.push_back(clock_ms()-frame_start);
 
 		if (frame % 90 == 0) {
 			const auto &hmd = poses[vr::k_unTrackedDeviceIndex_Hmd];
@@ -319,6 +400,8 @@ int main(int argc, char **argv)
 	}
 	vkDestroyDevice(device, nullptr);
 	vkDestroyInstance(instance, nullptr);
-	std::printf("done: %d frames\n", frames);
-	return 0;
+	std::printf("done: %d frames, %d errors\n", frames, failures);
+	std::printf("{\"frames\":%d,\"errors\":%d,\"startup_first_handoff_ms\":%.3f,\"warmup_frames\":30,\"frame_ms_median\":%.3f,\"frame_ms_p95\":%.3f,\"frame_ms_p99\":%.3f}\n",
+	    frames, failures, first_handoff_ms, percentile(frame_ms, .5), percentile(frame_ms, .95), percentile(frame_ms, .99));
+	return failures ? 1 : 0;
 }

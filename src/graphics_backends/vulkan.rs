@@ -539,7 +539,7 @@ impl VulkanData {
                         .flags(inst_flags)
                         .application_info(
                             &vk::ApplicationInfo::default()
-                                .api_version(vk::API_VERSION_1_0)
+                                .api_version(if cfg!(target_os = "macos") { vk::API_VERSION_1_2 } else { vk::API_VERSION_1_0 })
                                 .application_name(c"XRizer temporary session"),
                         )
                         .enabled_extension_names(&inst_exts),
@@ -982,7 +982,23 @@ mod portability {
     /// macOS (Homebrew and the LunarG SDK install it elsewhere). XRIZER_VULKAN_LIBRARY names one.
     #[cfg_attr(test, allow(dead_code))]
     pub fn load_entry() -> ash::Entry {
-        if std::env::var_os("XRIZER_VULKAN_LIBRARY").is_none() {
+        // An explicit selection is a contract, never a hint followed by fallback.
+        // Reject a second dispatcher before passing any application handles to it.
+        if let Some(path) = std::env::var_os("XRIZER_VULKAN_LIBRARY") {
+            let entry = unsafe { ash::Entry::load_from(&path) }
+                .unwrap_or_else(|e| panic!("Cannot load XRIZER_VULKAN_LIBRARY={path:?}: {e}"));
+            let symbol =
+                unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"vkGetInstanceProcAddr".as_ptr()) };
+            let selected =
+                entry.static_fn().get_instance_proc_addr as *const () as *mut libc::c_void;
+            assert!(
+                symbol.is_null() || symbol == selected,
+                "XRIZER_VULKAN_LIBRARY disagrees with the process Vulkan dispatcher; use one loader for the app and xrizer"
+            );
+            info!("Vulkan: explicitly loaded {path:?}, vkGetInstanceProcAddr={selected:p}");
+            return entry;
+        }
+        {
             let symbol =
                 unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"vkGetInstanceProcAddr".as_ptr()) };
             if !symbol.is_null() {
