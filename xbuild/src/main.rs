@@ -65,7 +65,9 @@ fn main() {
                 lib_path = Some(
                     a.filenames
                         .into_iter()
-                        .find(|p| p.ends_with(".so") || p.ends_with(".dll"))
+                        .find(|p| {
+                            p.ends_with(".so") || p.ends_with(".dll") || p.ends_with(".dylib")
+                        })
                         .expect("xrizer cdylib artifact missing"),
                 )
             }
