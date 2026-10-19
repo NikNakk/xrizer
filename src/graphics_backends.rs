@@ -5,7 +5,7 @@ mod d3d11_stage;
 mod d3d11_timing;
 #[cfg(target_os = "linux")]
 mod gl;
-#[cfg(target_os = "windows")]
+#[cfg(not(target_os = "linux"))]
 mod gl_stub;
 mod vulkan;
 
@@ -13,7 +13,7 @@ pub use d3d11::D3D11Data;
 use derive_more::{From, TryInto};
 #[cfg(target_os = "linux")]
 pub use gl::GlData;
-#[cfg(target_os = "windows")]
+#[cfg(not(target_os = "linux"))]
 pub use gl_stub::GlData;
 use openvr as vr;
 use openxr as xr;
