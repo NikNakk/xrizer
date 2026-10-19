@@ -40,9 +40,10 @@ pub unsafe extern "system" fn get_instance_proc_addr(
     let name = unsafe { CStr::from_ptr(name) };
 
     if instance.is_null() {
-        get_fn![name => CreateInstance]
+        get_fn![name => CreateInstance, EnumerateInstanceExtensionProperties]
     } else {
         get_fn![name =>
+            EnumerateDeviceExtensionProperties,
             GetPhysicalDeviceQueueFamilyProperties,
             CreateDevice,
             GetDeviceProcAddr,
@@ -62,6 +63,22 @@ extern "system" fn get_device_proc_addr(
         let name = unsafe { CStr::from_ptr(name) };
         get_fn![name => GetDeviceQueue, DeviceWaitIdle, DestroyDevice]
     }
+}
+
+// The macOS temporary-session path queries portability support. The fake
+// driver has no optional extensions, but must provide the core query functions.
+extern "system" fn enumerate_instance_extension_properties(
+    _: *const c_char, count: *mut u32, _: *mut vk::ExtensionProperties,
+) -> vk::Result {
+    unsafe { *count = 0; }
+    vk::Result::SUCCESS
+}
+extern "system" fn enumerate_device_extension_properties(
+    _: vk::PhysicalDevice, _: *const c_char, count: *mut u32,
+    _: *mut vk::ExtensionProperties,
+) -> vk::Result {
+    unsafe { *count = 0; }
+    vk::Result::SUCCESS
 }
 
 struct Instance;
