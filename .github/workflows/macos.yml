@@ -1,0 +1,62 @@
+name: macOS
+
+on:
+  push:
+    branches: [ "claude/macos-port", "macos" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  XRIZER_VERSION: ci
+
+jobs:
+  macos:
+    name: macOS arm64
+    runs-on: macos-14
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: brew install shaderc vulkan-headers vulkan-loader molten-vk
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build the OpenVR runtime
+        run: cargo xbuild --release --verbose
+
+      - name: Check the packaged runtime
+        run: |
+          release=target/release
+          test -e "${release}/bin/osx32/vrclient.dylib"
+          file -L "${release}/bin/osx32/vrclient.dylib"
+          nm -gU "${release}/bin/osx32/vrclient.dylib" | grep -E ' _VRClientCoreFactory$'
+          cat "${release}/openvrpaths.vrpath"
+
+      # The three input tests also fail on Linux on this branch (see docs/MACOS.md).
+      - name: Run tests
+        run: |
+          cargo test -p xrizer --lib -- \
+            --skip input::tests::action_origins_match_pose_and_skeleton_hands \
+            --skip input::tests::non_hand_restriction_activates_only_secondary_set_for_hands \
+            --skip input::tests::restricted_action_set_activates_secondary_set_for_other_hand
+
+      - name: Clippy
+        run: cargo clippy -p xrizer --all-targets
+
+      - name: Build the Vulkan submit probe
+        run: tools/macos/build-probe.sh target/release/vulkan_submit_probe
+
+      - name: Upload macOS runtime
+        uses: actions/upload-artifact@v4
+        with:
+          name: xrizer-macos-arm64
+          if-no-files-found: error
+          path: |
+            target/release/libxrizer.dylib
+            target/release/vulkan_submit_probe

@@ -524,12 +524,19 @@ impl VulkanData {
             .split_ascii_whitespace()
             .map(|ext| CString::new(ext).unwrap())
             .collect();
+        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+        let mut inst_exts = inst_exts;
+        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+        let mut inst_flags = vk::InstanceCreateFlags::empty();
+        #[cfg(target_os = "macos")]
+        portability::add_instance_enumeration(&entry, &mut inst_exts, &mut inst_flags);
         let inst_exts: Vec<*const c_char> = inst_exts.iter().map(|ext| ext.as_ptr()).collect();
 
         let instance = unsafe {
             entry
                 .create_instance(
                     &vk::InstanceCreateInfo::default()
+                        .flags(inst_flags)
                         .application_info(
                             &vk::ApplicationInfo::default()
                                 .api_version(vk::API_VERSION_1_0)
@@ -553,6 +560,10 @@ impl VulkanData {
             .split_ascii_whitespace()
             .map(|ext| CString::new(ext).unwrap())
             .collect();
+        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+        let mut dev_exts = dev_exts;
+        #[cfg(target_os = "macos")]
+        portability::add_device_subset(&instance, physical_device, &mut dev_exts);
         let dev_exts: Vec<*const c_char> = dev_exts.iter().map(|ext| ext.as_ptr()).collect();
 
         // find whatever graphics queue family
@@ -898,9 +909,14 @@ fn texture_extent_from_bounds(
 }
 
 fn new_entry() -> ash::Entry {
-    #[cfg(not(test))]
+    #[cfg(all(not(test), not(target_os = "macos")))]
     unsafe {
         ash::Entry::load().unwrap()
+    }
+
+    #[cfg(all(not(test), target_os = "macos"))]
+    {
+        portability::load_entry()
     }
 
     #[cfg(test)]
@@ -908,5 +924,103 @@ fn new_entry() -> ash::Entry {
         ash::Entry::from_static_fn(ash::StaticFn {
             get_instance_proc_addr: fakexr::vulkan::get_instance_proc_addr,
         })
+    }
+}
+
+/// Vulkan on macOS runs on MoltenVK, a "portability" implementation: the loader only lists it when
+/// the instance asks for VK_KHR_portability_enumeration, and a device that offers
+/// VK_KHR_portability_subset must have it enabled. Apps that hand xrizer their own instance and
+/// device have done this themselves; this is for the temporary session xrizer makes itself.
+#[cfg(target_os = "macos")]
+mod portability {
+    use ash::vk;
+    use log::{info, warn};
+    use std::ffi::{CStr, CString};
+
+    const ENUMERATION: &CStr = c"VK_KHR_portability_enumeration";
+    const SUBSET: &CStr = c"VK_KHR_portability_subset";
+
+    fn push_unique(exts: &mut Vec<CString>, ext: &CStr) {
+        if !exts.iter().any(|e| e.as_c_str() == ext) {
+            exts.push(ext.to_owned());
+        }
+    }
+
+    pub fn add_instance_enumeration(
+        entry: &ash::Entry,
+        exts: &mut Vec<CString>,
+        flags: &mut vk::InstanceCreateFlags,
+    ) {
+        let available = unsafe { entry.enumerate_instance_extension_properties(None) }
+            .unwrap_or_default()
+            .iter()
+            .any(|p| p.extension_name_as_c_str() == Ok(ENUMERATION));
+        // Without a loader (MoltenVK loaded directly) the extension is not listed and not needed.
+        if available {
+            push_unique(exts, ENUMERATION);
+            *flags |= vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR;
+        }
+    }
+
+    pub fn add_device_subset(
+        instance: &ash::Instance,
+        physical_device: vk::PhysicalDevice,
+        exts: &mut Vec<CString>,
+    ) {
+        let offered = unsafe { instance.enumerate_device_extension_properties(physical_device) }
+            .unwrap_or_default()
+            .iter()
+            .any(|p| p.extension_name_as_c_str() == Ok(SUBSET));
+        if offered {
+            push_unique(exts, SUBSET);
+        }
+    }
+
+    /// The game's own Vulkan, when the process has one: xrizer then drives the game's instance and
+    /// device with the same library that made them (the Vulkan loader, or MoltenVK linked directly).
+    /// Otherwise the loader is searched for, since it is not on the default library search path on
+    /// macOS (Homebrew and the LunarG SDK install it elsewhere). XRIZER_VULKAN_LIBRARY names one.
+    #[cfg_attr(test, allow(dead_code))]
+    pub fn load_entry() -> ash::Entry {
+        if std::env::var_os("XRIZER_VULKAN_LIBRARY").is_none() {
+            let symbol =
+                unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"vkGetInstanceProcAddr".as_ptr()) };
+            if !symbol.is_null() {
+                info!("Vulkan: using the vkGetInstanceProcAddr already loaded in this process");
+                return unsafe {
+                    ash::Entry::from_static_fn(ash::StaticFn {
+                        get_instance_proc_addr: std::mem::transmute::<
+                            *mut libc::c_void,
+                            vk::PFN_vkGetInstanceProcAddr,
+                        >(symbol),
+                    })
+                };
+            }
+        }
+        let candidates: Vec<String> = std::env::var("XRIZER_VULKAN_LIBRARY")
+            .ok()
+            .into_iter()
+            .chain(
+                [
+                    "libvulkan.dylib",
+                    "libvulkan.1.dylib",
+                    "/opt/homebrew/lib/libvulkan.1.dylib",
+                    "/usr/local/lib/libvulkan.1.dylib",
+                    "libMoltenVK.dylib",
+                    "/opt/homebrew/lib/libMoltenVK.dylib",
+                ]
+                .map(String::from),
+            )
+            .collect();
+        for path in &candidates {
+            match unsafe { ash::Entry::load_from(path) } {
+                Ok(entry) => {
+                    info!("Vulkan: loaded {path}");
+                    return entry;
+                }
+                Err(e) => warn!("Vulkan: could not load {path}: {e}"),
+            }
+        }
+        panic!("No Vulkan library found (tried {candidates:?}); set XRIZER_VULKAN_LIBRARY")
     }
 }

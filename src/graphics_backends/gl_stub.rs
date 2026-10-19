@@ -20,9 +20,16 @@ impl GraphicsBackend for GlData {
     }
 
     fn session_create_info(&self) -> <Self::Api as xr::Graphics>::SessionCreateInfo {
-        xr::opengl::SessionCreateInfo::Windows {
-            h_dc: 0,
-            h_glrc: 0,
+        // Never used: GlData::new() returns None, so no OpenGL session is ever created.
+        #[cfg(target_os = "windows")]
+        {
+            xr::opengl::SessionCreateInfo::Windows { h_dc: 0, h_glrc: 0 }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            xr::opengl::SessionCreateInfo::Wayland {
+                display: std::ptr::null_mut(),
+            }
         }
     }
 
@@ -36,7 +43,7 @@ impl GraphicsBackend for GlData {
         _bounds: vr::VRTextureBounds_t,
         _color_space: vr::EColorSpace,
     ) -> xr::SwapchainCreateInfo<Self::Api> {
-        panic!("OpenGL OpenVR submissions are not supported on Windows")
+        panic!("OpenGL OpenVR submissions are only supported on Linux")
     }
 
     fn store_swapchain_images(
@@ -55,7 +62,7 @@ impl GraphicsBackend for GlData {
         _image_index: usize,
         _submit_flags: vr::EVRSubmitFlags,
     ) -> xr::Extent2Di {
-        panic!("OpenGL OpenVR submissions are not supported on Windows")
+        panic!("OpenGL OpenVR submissions are only supported on Linux")
     }
 
     fn copy_overlay_to_swapchain(
@@ -64,6 +71,6 @@ impl GraphicsBackend for GlData {
         _bounds: vr::VRTextureBounds_t,
         _image_index: usize,
     ) -> xr::Extent2Di {
-        panic!("OpenGL OpenVR submissions are not supported on Windows")
+        panic!("OpenGL OpenVR submissions are only supported on Linux")
     }
 }

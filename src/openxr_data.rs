@@ -73,17 +73,16 @@ impl From<SessionCreationError> for InitError {
 }
 
 fn get_app_name() -> Option<String> {
-    #[cfg(target_os = "windows")]
+    #[cfg(not(target_os = "linux"))]
     {
         let exe = std::env::current_exe()
-            .inspect_err(|e| warn!("Couldn't get Windows executable path: {e}"))
+            .inspect_err(|e| warn!("Couldn't get executable path: {e}"))
             .ok()?;
-        return exe
-            .file_stem()
-            .map(|name| name.to_string_lossy().into_owned());
+        exe.file_stem()
+            .map(|name| name.to_string_lossy().into_owned())
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "linux")]
     {
         let exe = std::fs::read_link("/proc/self/exe")
             .inspect_err(|e| warn!("Couldn't get app name from /proc/self/exe: {e}"))
@@ -112,6 +111,35 @@ fn get_app_name() -> Option<String> {
     }
 }
 
+/// The Khronos loader is not on the default library search path on macOS. XRIZER_OPENXR_LOADER
+/// names one explicitly (for example Monado's build of libopenxr_loader.dylib).
+#[cfg(all(not(test), not(feature = "static-openxr"), target_os = "macos"))]
+fn load_macos_openxr_loader() -> xr::Entry {
+    let candidates: Vec<String> = std::env::var("XRIZER_OPENXR_LOADER")
+        .ok()
+        .into_iter()
+        .chain(
+            [
+                "libopenxr_loader.dylib",
+                "libopenxr_loader.1.dylib",
+                "/opt/homebrew/lib/libopenxr_loader.dylib",
+                "/usr/local/lib/libopenxr_loader.dylib",
+            ]
+            .map(String::from),
+        )
+        .collect();
+    for path in &candidates {
+        match unsafe { xr::Entry::load_from(std::path::Path::new(path)) } {
+            Ok(entry) => {
+                info!("OpenXR: loaded {path}");
+                return entry;
+            }
+            Err(e) => warn!("OpenXR: could not load {path}: {e}"),
+        }
+    }
+    panic!("No OpenXR loader found (tried {candidates:?}); set XRIZER_OPENXR_LOADER")
+}
+
 fn make_version() -> u32 {
     env!("CARGO_PKG_VERSION_MAJOR").parse::<u32>().unwrap_or(0) * 1000000
         + env!("CARGO_PKG_VERSION_MINOR").parse::<u32>().unwrap_or(0) * 1000
@@ -123,9 +151,12 @@ impl<C: Compositor> OpenXrData<C> {
         #[cfg(all(not(test), feature = "static-openxr"))]
         let entry = xr::Entry::linked();
 
-        #[cfg(all(not(test), not(feature = "static-openxr")))]
+        #[cfg(all(not(test), not(feature = "static-openxr"), not(target_os = "macos")))]
         let entry = unsafe { xr::Entry::load() }
             .expect("Failed to load OpenXR loader — is libopenxr-loader installed?");
+
+        #[cfg(all(not(test), not(feature = "static-openxr"), target_os = "macos"))]
+        let entry = load_macos_openxr_loader();
 
         #[cfg(test)]
         let entry =
