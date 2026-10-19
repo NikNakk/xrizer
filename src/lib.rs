@@ -18,6 +18,7 @@ mod system;
 mod timing;
 
 #[cfg(not(test))]
+#[cfg(not(target_os = "macos"))]
 mod error_dialog;
 
 use clientcore::ClientCore;
@@ -158,7 +159,12 @@ fn init_logging() {
                 log::error!("{info}");
                 let backtrace = std::backtrace::Backtrace::force_capture();
                 log::error!("Backtrace: \n{backtrace}");
+                // AppKit windows can only be opened on the main thread, and a panic can come from
+                // any of the game's threads: on macOS the log is the report.
+                #[cfg(not(target_os = "macos"))]
                 error_dialog::dialog(format!("{info}"), backtrace);
+                #[cfg(target_os = "macos")]
+                drop(backtrace);
                 std::process::abort();
             }));
         }

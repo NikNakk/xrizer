@@ -16,7 +16,8 @@ fn main() -> Result<(), anyhow::Error> {
     // Object name and platform directory logic is generally based on a couple of pieces of openvr_api code:
     //  - platform directory names: https://github.com/ValveSoftware/openvr/blob/ae46a8dd0172580648c8922658a100439115d3eb/src/vrcore/pathtools_public.h#L127-L157
     //  - general logic and special cases: https://github.com/ValveSoftware/openvr/blob/ae46a8dd0172580648c8922658a100439115d3eb/src/openvr_api_public.cpp#L128-L144
-    // The android and macos platforms have been omitted, since we are currently uninterested in supporting them.
+    // macOS has no 64-bit directory of its own: openvr_api looks in bin/osx32 there (PLATSUBDIR in
+    // pathtools_public.h) for vrclient.dylib, on Intel and Apple silicon alike. Android is omitted.
 
     let vrclient_name = match (target_os, target_arch) {
         ("windows", "x86_64") => "vrclient_x64",
@@ -28,6 +29,7 @@ fn main() -> Result<(), anyhow::Error> {
         ("linux", "x86") => "bin/",
         ("linux", "x86_64") => "bin/linux64/",
         ("linux", "aarch64") => "bin/linuxarm64/",
+        ("macos", "x86_64") | ("macos", "aarch64") => "bin/osx32/",
         _ => return Err(anyhow!("Unsupported platform: {target_os}/{target_arch}")),
     };
 
