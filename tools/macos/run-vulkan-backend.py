@@ -60,7 +60,7 @@ def main():
         result = subprocess.run(command, env=env, stdout=log, stderr=subprocess.STDOUT)
     manifest.update(exit_code=result.returncode, elapsed_seconds=time.time()-manifest['started_unix'])
     (args.output/'manifest.json').write_text(json.dumps(manifest, indent=2)+'\n')
-    print((args.output/'run.log').read_text(), end='')
+    print((args.output/'run.log').read_text(encoding='utf-8', errors='replace'), end='')
     return result.returncode
 
 
