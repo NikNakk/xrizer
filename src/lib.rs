@@ -1,5 +1,6 @@
 #![deny(clippy::all)]
 
+mod api_trace;
 mod applications;
 mod chaperone;
 mod clientcore;
