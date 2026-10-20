@@ -101,6 +101,17 @@ impl Compositor {
         }
     }
 
+    fn begin_application_gpu_timing(&self, session_data: &SessionData) {
+        #[macros::any_graphics(DynFrameController)]
+        fn begin<G: GraphicsBackend>(ctrl: &mut FrameController<G>, frame: u32, seconds: f64) {
+            ctrl.backend.begin_application_gpu_timing(frame, seconds);
+        }
+        if let Some(ctrl) = session_data.comp_data.0.lock().unwrap().as_mut() {
+            ctrl.with_any_graphics_mut::<begin>((self.metrics.index.load(Ordering::Relaxed),
+                self.metrics.system_start.elapsed().as_secs_f64()));
+        }
+    }
+
     fn maybe_wait_frame(&self, session_data: &SessionData) {
         tracy_span!();
         let mut frame_lock = { session_data.comp_data.0.lock().unwrap() };
@@ -471,6 +482,7 @@ impl vr::IVRCompositor029_Interface for Compositor {
 
         let session_data = self.openxr.session_data.get();
         self.maybe_begin_frame(&session_data);
+        self.begin_application_gpu_timing(&session_data);
         vr::EVRCompositorError::None
     }
     fn SetExplicitTimingMode(&self, timing_mode: vr::EVRCompositorTimingMode) {
@@ -710,7 +722,7 @@ impl vr::IVRCompositor029_Interface for Compositor {
     fn GetFrameTimings(&self, _pTiming: *mut vr::Compositor_FrameTiming, _nFrames: u32) -> u32 {
         todo!()
     }
-    fn GetFrameTiming(&self, timing: *mut vr::Compositor_FrameTiming, _frames_ago: u32) -> bool {
+    fn GetFrameTiming(&self, timing: *mut vr::Compositor_FrameTiming, frames_ago: u32) -> bool {
         if timing.is_null() || !timing.is_aligned() {
             return false;
         }
@@ -725,6 +737,41 @@ impl vr::IVRCompositor029_Interface for Compositor {
         {
             return false;
         }
+        #[macros::any_graphics(DynFrameController)]
+        fn measured<G: GraphicsBackend>(ctrl: &mut FrameController<G>, frames_ago: u32)
+            -> (bool, Option<crate::graphics_backends::ApplicationGpuTiming>) {
+            (ctrl.backend.gpu_timing_requested(), ctrl.backend.application_gpu_timing(frames_ago))
+        }
+        let session_data = self.openxr.session_data.get();
+        let mut lock = session_data.comp_data.0.lock().unwrap();
+        let (requested, sample) = lock.as_mut().map(|ctrl| ctrl.with_any_graphics_mut::<measured>(frames_ago))
+            .unwrap_or((false, None));
+        if requested {
+            let Some(sample) = sample else { return false; };
+            // Match the Wine branch's validity policy and zero unknown costs.
+            // Total is the measured application interval only: OpenXR exposes
+            // no compositor GPU or application post-submit measurement here.
+            let mut frame = vr::Compositor_FrameTiming::default();
+            frame.m_nSize = std::mem::size_of_val(&frame) as u32;
+            frame.m_nFrameIndex = sample.frame;
+            frame.m_flSystemTimeInSeconds = sample.system_seconds;
+            frame.m_flClientFrameIntervalMs = sample.client_interval_ms;
+            frame.m_flPreSubmitGpuMs = sample.pre_submit_gpu_ms;
+            frame.m_flTotalRenderGpuMs = sample.pre_submit_gpu_ms;
+            static REPORTS: AtomicU32 = AtomicU32::new(0);
+            if REPORTS.fetch_add(1, Ordering::Relaxed).is_multiple_of(120) {
+                info!("OpenVR measured timing returned: frame={}, pre_submit_gpu_ms={:.3}, total_application_gpu_ms={:.3}",
+                    sample.frame, sample.pre_submit_gpu_ms, sample.pre_submit_gpu_ms);
+            }
+            // Same bounded known-prefix copy used by the Wine timing code.
+            unsafe {
+                std::ptr::copy_nonoverlapping((&frame as *const vr::Compositor_FrameTiming).cast::<u8>(),
+                    timing.cast::<u8>(), size.min(std::mem::size_of_val(&frame)));
+                (&raw mut (*timing).m_nSize).write_unaligned(size as u32);
+            }
+            return true;
+        }
+
         // We're using raw pointers here because the Compositor_FrameTiming struct can be a
         // varaible size, so we don't want to create a reference to a struct with an incorrect
         // (to us) size, because that would be Undefined Behavior.
@@ -1064,12 +1111,16 @@ impl vr::IVRCompositor029_Interface for Compositor {
             input.frame_start_update();
         }
 
-        self.GetLastPoses(
+        let result = self.GetLastPoses(
             render_pose_array,
             render_pose_count,
             game_pose_array,
             game_pose_count,
-        )
+        );
+        if *self.timing_mode.lock().unwrap() == vr::EVRCompositorTimingMode::Implicit {
+            self.begin_application_gpu_timing(&self.openxr.session_data.get());
+        }
+        result
     }
 
     fn GetTrackingSpace(&self) -> vr::ETrackingUniverseOrigin {
@@ -1457,6 +1508,9 @@ impl<G: GraphicsBackend> FrameController<G> {
             self.should_render && !self.app_suspend_render
         );
         if self.eyes_submitted.iter().all(|eye| eye.is_some()) && !self.app_suspend_render {
+            if self.should_render && !self.submitting_null {
+                self.backend.end_application_gpu_timing();
+            }
             let mut swapchain_data = self.swapchain_data.as_mut();
             if let Some(data) = &mut swapchain_data {
                 let _api_trace = crate::api_trace::Span::new("xr_release_image", u32::MAX, -1);
@@ -1824,6 +1878,10 @@ mod tests {
         static SWAPCHAIN_HEIGHT: Cell<u32> = const { Cell::new(10) };
         static SWAPCHAIN_FORMAT: Cell<u32> = const { Cell::new(0) };
         static STAGE_SUPPORTED: Cell<bool> = const { Cell::new(false) };
+        static GPU_REQUESTED: Cell<bool> = const { Cell::new(false) };
+        static GPU_SAMPLE: Cell<Option<crate::graphics_backends::ApplicationGpuTiming>> = const { Cell::new(Option::None) };
+        static GPU_BEGINS: Cell<u32> = const { Cell::new(0) };
+        static GPU_ENDS: Cell<u32> = const { Cell::new(0) };
     }
 
     pub enum FakeApi {}
@@ -1864,6 +1922,11 @@ mod tests {
     }
 
     impl GraphicsBackend for FakeGraphicsData {
+        fn gpu_timing_requested(&self) -> bool { GPU_REQUESTED.get() }
+        fn begin_application_gpu_timing(&mut self, _: u32, _: f64) { GPU_BEGINS.set(GPU_BEGINS.get()+1); }
+        fn end_application_gpu_timing(&mut self) { GPU_ENDS.set(GPU_ENDS.get()+1); }
+        fn application_gpu_timing(&mut self, _: u32) -> Option<crate::graphics_backends::ApplicationGpuTiming> { GPU_SAMPLE.get() }
+
         fn supports_stage_rendering(&self) -> bool {
             STAGE_SUPPORTED.get()
         }
@@ -2182,6 +2245,55 @@ mod tests {
         assert_eq!(f.submit(vr::EVREye::Left), None);
         let newer_width = get_swapchain_width();
         assert_eq!(newer_width, new_width);
+    }
+
+    #[test]
+    fn explicit_timing_keeps_waitposes_off_queue_and_marks_after_stereo() {
+        let f = Fixture::new();
+        f.ensure_real_session(false);
+        f.comp.PostPresentHandoff();
+        f.comp.SetExplicitTimingMode(vr::EVRCompositorTimingMode::Explicit_ApplicationPerformsPostPresentHandoff);
+        let before = GPU_BEGINS.get();
+        assert_eq!(f.wait_get_poses(), None);
+        assert_eq!(GPU_BEGINS.get(), before);
+        assert_eq!(f.comp.SubmitExplicitTimingData(), None);
+        assert_eq!(GPU_BEGINS.get(), before+1);
+        let ends = GPU_ENDS.get();
+        assert_eq!(f.submit(vr::EVREye::Left), None);
+        assert_eq!(GPU_ENDS.get(), ends);
+        assert_eq!(f.submit(vr::EVREye::Right), None);
+        assert_eq!(GPU_ENDS.get(), ends+1);
+    }
+
+    #[test]
+    fn measured_timing_is_unavailable_until_gpu_result_and_preserves_abi_tail() {
+        let f = Fixture::new();
+        assert_eq!(f.wait_get_poses(), None);
+        assert_eq!(f.submit(vr::EVREye::Left), None);
+        assert_eq!(f.submit(vr::EVREye::Right), None);
+        GPU_REQUESTED.set(true);
+        GPU_SAMPLE.set(Option::None);
+        let mut record = vr::Compositor_FrameTiming::default();
+        record.m_nSize = std::mem::size_of_val(&record) as u32;
+        assert!(!f.comp.GetFrameTiming(&mut record, 0));
+        GPU_SAMPLE.set(Some(crate::graphics_backends::ApplicationGpuTiming {
+            frame: 42, system_seconds: 1.25, client_interval_ms: 22.2, pre_submit_gpu_ms: 17.75,
+        }));
+        assert!(f.comp.GetFrameTiming(&mut record, 0));
+        assert_eq!(record.m_nFrameIndex, 42);
+        assert_eq!(record.m_flPreSubmitGpuMs, 17.75);
+        assert_eq!(record.m_flTotalRenderGpuMs, 17.75);
+        assert_eq!(record.m_flCompositorRenderGpuMs, 0.0);
+        let size = offset_of!(vr::Compositor_FrameTiming, m_HmdPose) + size_of::<vr::TrackedDevicePose_t>();
+        let words = (size + 32).div_ceil(8);
+        let mut storage = vec![0xa5a5a5a5a5a5a5a5u64; words];
+        let pointer = storage.as_mut_ptr().cast::<vr::Compositor_FrameTiming>();
+        unsafe { (&raw mut (*pointer).m_nSize).write(size as u32); }
+        assert!(f.comp.GetFrameTiming(pointer, 0));
+        let bytes = unsafe { std::slice::from_raw_parts(storage.as_ptr().cast::<u8>(), storage.len()*8) };
+        assert!(bytes[size..].iter().all(|byte| *byte == 0xa5));
+        GPU_SAMPLE.set(Option::None);
+        GPU_REQUESTED.set(false);
     }
 
     #[test]
