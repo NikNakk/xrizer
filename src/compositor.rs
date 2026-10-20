@@ -1192,6 +1192,7 @@ struct FrameController<G: GraphicsBackend> {
     app_suspend_render: bool,
     app_fade_grid: bool,
     application_projection_override_logged: bool,
+    unsupported_stage_logged: bool,
     eyes_submitted: [Option<SubmittedEye>; 2],
     submitting_null: bool,
     backend: G,
@@ -1282,6 +1283,7 @@ impl<G: GraphicsBackend> FrameController<G> {
             app_suspend_render: false,
             app_fade_grid: false,
             application_projection_override_logged: false,
+            unsupported_stage_logged: false,
             eyes_submitted: Default::default(),
             submitting_null: false,
             backend,
@@ -1523,6 +1525,12 @@ impl<G: GraphicsBackend> FrameController<G> {
             && stage.is_some()
             && (self.app_suspend_render || self.app_fade_grid)
             && !bypass_stage;
+        let supports_stage = self.backend.supports_stage_rendering();
+        if stage_requested && !supports_stage && !self.unsupported_stage_logged {
+            warn!("stage overrides are unsupported by this graphics backend; retaining application/skybox layers");
+            self.unsupported_stage_logged = true;
+        }
+        let stage_requested = stage_requested && supports_stage;
         let mut stage_rendered = false;
 
         if stage_requested {
@@ -1660,6 +1668,10 @@ impl<G: GraphicsBackend> FrameController<G> {
             }
         }
 
+        // A stage attempt can recreate the swapchain and clear the eyes.
+        // Never use the pre-attempt readiness to index those discarded images.
+        let application_projection_ready = application_projection_ready
+            && self.eyes_submitted.iter().all(Option::is_some);
         if !stage_rendered && application_projection_ready {
             let swapchain_data = self
                 .swapchain_data
@@ -1805,6 +1817,7 @@ mod tests {
         static SWAPCHAIN_WIDTH: Cell<u32> = const { Cell::new(10) };
         static SWAPCHAIN_HEIGHT: Cell<u32> = const { Cell::new(10) };
         static SWAPCHAIN_FORMAT: Cell<u32> = const { Cell::new(0) };
+        static STAGE_SUPPORTED: Cell<bool> = const { Cell::new(false) };
     }
 
     pub enum FakeApi {}
@@ -1845,6 +1858,9 @@ mod tests {
     }
 
     impl GraphicsBackend for FakeGraphicsData {
+        fn supports_stage_rendering(&self) -> bool {
+            STAGE_SUPPORTED.get()
+        }
         type Api = FakeApi;
         type OpenVrTexture = <VulkanData as GraphicsBackend>::OpenVrTexture;
         type NiceFormat = <VulkanData as GraphicsBackend>::NiceFormat;
@@ -2083,6 +2099,50 @@ mod tests {
 
         assert_eq!(f.wait_get_poses(), None);
         assert_eq!(f.wait_get_poses(), None);
+    }
+
+    #[test]
+    fn unsupported_stage_keeps_submitted_application_eyes() {
+        check_stage_fallback(false);
+    }
+
+    #[test]
+    fn failed_stage_recreation_does_not_reuse_discarded_eyes() {
+        check_stage_fallback(true);
+    }
+
+    fn check_stage_fallback(supported: bool) {
+        STAGE_SUPPORTED.set(supported);
+        let f = Fixture::new();
+        f.ensure_real_session(false);
+        f.comp.openxr.poll_events();
+        // Match a complete application stereo pair while a loading-stage asset
+        // is active, with a different recommended stage target size.
+        assert_eq!(f.submit(vr::EVREye::Left), None);
+        assert_eq!(f.submit(vr::EVREye::Right), None);
+        let data = f.comp.openxr.session_data.get();
+        let system = f.comp.system.force(|injector| System::new(f.comp.openxr.clone(), injector));
+        let mut lock = data.comp_data.0.lock().unwrap();
+        let DynFrameController::Fake(ctrl) = lock.as_mut().unwrap() else { panic!("missing fake controller"); };
+        ctrl.should_render = true;
+        ctrl.app_fade_grid = true;
+        ctrl.eyes_submitted = [Some(SubmittedEye { extent: xr::Extent2Di { width: 40, height: 40 }, flip_vertically: false }); 2];
+        let original = ctrl.swapchain_data.as_ref().unwrap().swapchain.as_raw();
+        let stage = crate::stage::StageAsset {
+            id: 1, source_path: "regression-stage".into(), vertices: Vec::new(), indices: Vec::new(),
+            texture_rgba: vec![255; 4], texture_width: 1, texture_height: 1,
+            model_transform: glam::Mat4::IDENTITY, settings: crate::stage::StageSettings::default(),
+        };
+        ctrl.end_frame(&data, &system, xr::Time::from_nanos(0), Option::None, Some(&stage));
+        let current = ctrl.swapchain_data.as_ref().unwrap().swapchain.as_raw();
+        if supported {
+            assert_ne!(current, original);
+            assert!(ctrl.eyes_submitted.iter().all(Option::is_none));
+        } else {
+            assert_eq!(current, original);
+            assert!(ctrl.eyes_submitted.iter().all(Option::is_some));
+        }
+        STAGE_SUPPORTED.set(false);
     }
 
     #[test]
