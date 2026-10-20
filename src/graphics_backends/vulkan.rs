@@ -1,4 +1,4 @@
-use super::GraphicsBackend;
+use super::{GraphicsBackend, ApplicationGpuTiming, vulkan_timing::VulkanGpuTiming};
 use ash::vk::{self, Handle};
 use log::warn;
 use openvr as vr;
@@ -23,6 +23,8 @@ pub struct VulkanData {
     pub queue: vk::Queue,
     pub queue_family_index: u32,
     real_data: Option<RealSessionData>,
+    gpu_timing_requested: bool,
+    gpu_timing: Option<VulkanGpuTiming>,
 }
 
 impl Drop for VulkanData {
@@ -30,6 +32,7 @@ impl Drop for VulkanData {
         unsafe {
             self.device.device_wait_idle().unwrap();
         }
+        drop(self.gpu_timing.take());
         match &self.real_data {
             // Temporary session - we created these handles, so let's destroy them
             None => unsafe {
@@ -86,6 +89,17 @@ impl GraphicsBackend for VulkanData {
             queue_family_index: self.queue_family_index,
             queue_index,
         }
+    }
+
+    fn gpu_timing_requested(&self) -> bool { self.gpu_timing_requested }
+    fn begin_application_gpu_timing(&mut self, frame: u32, seconds: f64) {
+        if let Some(timing) = &mut self.gpu_timing { timing.begin(frame, seconds); }
+    }
+    fn end_application_gpu_timing(&mut self) {
+        if let Some(timing) = &mut self.gpu_timing { timing.end(); }
+    }
+    fn application_gpu_timing(&mut self, frames_ago: u32) -> Option<ApplicationGpuTiming> {
+        self.gpu_timing.as_mut().and_then(|timing| timing.sample(frames_ago))
     }
 
     fn get_texture(texture: &vr::Texture_t) -> Option<Self::OpenVrTexture> {
@@ -503,7 +517,7 @@ impl VulkanData {
             )
         };
 
-        Self {
+        let mut backend = Self {
             _entry: entry,
             instance,
             physical_device: vk::PhysicalDevice::from_raw(data.m_pPhysicalDevice as _),
@@ -511,7 +525,16 @@ impl VulkanData {
             queue: vk::Queue::from_raw(data.m_pQueue as _),
             queue_family_index: data.m_nQueueFamilyIndex,
             real_data: Default::default(),
+            gpu_timing_requested: std::env::var("XRIZER_VULKAN_GPU_TIMING").as_deref() == Ok("1"),
+            gpu_timing: None,
+        };
+        if backend.gpu_timing_requested {
+            backend.gpu_timing = unsafe { VulkanGpuTiming::new(&backend.instance,
+                backend.physical_device, &backend.device, backend.queue, backend.queue_family_index) }
+                .inspect_err(|error| warn!("Vulkan application GPU timing unavailable: {error}"))
+                .ok();
         }
+        backend
     }
 
     pub fn new_temporary(xr_instance: &xr::Instance, system_id: xr::SystemId) -> Self {
@@ -629,6 +652,8 @@ impl VulkanData {
             queue,
             queue_family_index,
             real_data: Default::default(),
+            gpu_timing_requested: std::env::var("XRIZER_VULKAN_GPU_TIMING").as_deref() == Ok("1"),
+            gpu_timing: None,
         }
     }
 }

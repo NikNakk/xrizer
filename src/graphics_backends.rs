@@ -6,6 +6,7 @@ mod gl;
 #[cfg(not(target_os = "linux"))]
 mod gl_stub;
 mod vulkan;
+mod vulkan_timing;
 
 use derive_more::{From, TryInto};
 pub use d3d11::D3D11Data;
@@ -16,6 +17,15 @@ pub use gl_stub::GlData;
 use openvr as vr;
 use openxr as xr;
 pub use vulkan::VulkanData;
+
+/// Completed application-queue timestamp interval, not compositor or scanout time.
+#[derive(Clone, Copy, Debug)]
+pub struct ApplicationGpuTiming {
+    pub frame: u32,
+    pub system_seconds: f64,
+    pub client_interval_ms: f32,
+    pub pre_submit_gpu_ms: f32,
+}
 
 pub trait GraphicsBackend: Into<SupportedBackend> {
     type Api: xr::Graphics + 'static;
@@ -75,6 +85,11 @@ pub trait GraphicsBackend: Into<SupportedBackend> {
     }
 
     fn clear_stage(&mut self) {}
+    fn gpu_timing_requested(&self) -> bool { false }
+    fn begin_application_gpu_timing(&mut self, _frame: u32, _seconds: f64) {}
+    fn end_application_gpu_timing(&mut self) {}
+    fn application_gpu_timing(&mut self, _frames_ago: u32) -> Option<ApplicationGpuTiming> { None }
+
 }
 
 #[derive(macros::Backends, TryInto, From)]
