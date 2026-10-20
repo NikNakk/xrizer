@@ -164,6 +164,21 @@ pub struct System {
     views: Mutex<ViewCache>,
 }
 
+// Optional capability/gating diagnostics. Never dereference gaze outputs or
+// record device strings. Calls remain unsupported with identical return values.
+fn foveation_trace(api: &str, details: std::fmt::Arguments<'_>) {
+    use std::sync::{OnceLock, atomic::{AtomicU32, Ordering}};
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var("XRIZER_FOVEATION_TRACE").as_deref() == Ok("1")) { return; }
+    static PROPERTIES: AtomicU32 = AtomicU32::new(0);
+    static EYES: AtomicU32 = AtomicU32::new(0);
+    let gaze = api.contains("Foveation");
+    let count = if gaze { EYES.fetch_add(1, Ordering::Relaxed) } else { PROPERTIES.fetch_add(1, Ordering::Relaxed) };
+    if (gaze && (count < 16 || count.is_multiple_of(600))) || (!gaze && count < 256) {
+        log::info!("OpenVR foveation trace: api={api} call={count} {details}");
+    }
+}
+
 mod log_tags {
     pub const TRACKED_PROP: &str = "tracked_property";
 }
@@ -491,6 +506,7 @@ impl vr::IVRSystem026_Interface for System {
         _: *mut openvr::HmdVector2_t,
         _: *mut openvr::HmdVector2_t,
     ) -> bool {
+        foveation_trace("GetEyeTrackedFoveationCenter", format_args!("result=false output_unchanged=true"));
         crate::warn_unimplemented!("GetEyeTrackedFoveationCenter");
         false
     }
@@ -499,6 +515,7 @@ impl vr::IVRSystem026_Interface for System {
         _: *const openvr::HmdMatrix44_t,
         _: *mut openvr::HmdVector2_t,
     ) -> bool {
+        foveation_trace("GetEyeTrackedFoveationCenterForProjection", format_args!("result=false output_unchanged=true"));
         crate::warn_unimplemented!("GetEyeTrackedFoveationCenterForProjection");
         false
     }
@@ -586,6 +603,9 @@ impl vr::IVRSystem026_Interface for System {
         error: *mut vr::ETrackedPropertyError,
     ) -> u32 {
         debug!(target: log_tags::TRACKED_PROP, "requesting string property: {prop:?} ({device_index})");
+        if device_index == vr::k_unTrackedDeviceIndex_Hmd {
+            foveation_trace("property_string", format_args!("device={device_index} property={prop:?}"));
+        }
 
         if !self.IsTrackedDeviceConnected(device_index) {
             if let Some(error) = unsafe { error.as_mut() } {
@@ -706,6 +726,9 @@ impl vr::IVRSystem026_Interface for System {
         err: *mut vr::ETrackedPropertyError,
     ) -> i32 {
         debug!(target: log_tags::TRACKED_PROP, "requesting int32 property: {prop:?} ({device_index})");
+        if device_index == vr::k_unTrackedDeviceIndex_Hmd {
+            foveation_trace("property_int32", format_args!("device={device_index} property={prop:?}"));
+        }
         if !self.IsTrackedDeviceConnected(device_index) {
             if let Some(err) = unsafe { err.as_mut() } {
                 *err = vr::ETrackedPropertyError::InvalidDevice;
@@ -733,6 +756,9 @@ impl vr::IVRSystem026_Interface for System {
         error: *mut vr::ETrackedPropertyError,
     ) -> f32 {
         debug!(target: log_tags::TRACKED_PROP, "requesting float property: {prop:?} ({device_index})");
+        if device_index == vr::k_unTrackedDeviceIndex_Hmd {
+            foveation_trace("property_float", format_args!("device={device_index} property={prop:?}"));
+        }
         if device_index != vr::k_unTrackedDeviceIndex_Hmd {
             if let Some(error) = unsafe { error.as_mut() } {
                 *error = vr::ETrackedPropertyError::UnknownProperty;
@@ -761,6 +787,9 @@ impl vr::IVRSystem026_Interface for System {
         err: *mut vr::ETrackedPropertyError,
     ) -> bool {
         debug!(target: log_tags::TRACKED_PROP, "requesting bool property: {prop:?} ({device_index})");
+        if device_index == vr::k_unTrackedDeviceIndex_Hmd {
+            foveation_trace("property_bool", format_args!("device={device_index} property={prop:?}"));
+        }
         if let Some(err) = unsafe { err.as_mut() } {
             *err = vr::ETrackedPropertyError::UnknownProperty;
         }
@@ -1114,6 +1143,22 @@ mod tests {
     use crate::{clientcore::Injector, openxr_data::OpenXrData};
     use std::ffi::CStr;
     use vr::IVRSystem022_Interface;
+
+    #[test]
+    fn unsupported_foveation_preserves_output_buffers() {
+        use vr::IVRSystem026_Interface;
+        crate::init_logging();
+        let xr = Arc::new(OpenXrData::new(&Injector::default()).unwrap());
+        let system = System::new(xr, &Injector::default());
+        let mut left = vr::HmdVector2_t { v: [0.25, -0.5] };
+        let mut right = vr::HmdVector2_t { v: [-0.75, 1.0] };
+        assert!(!system.GetEyeTrackedFoveationCenter(&mut left, &mut right));
+        assert_eq!(left.v, [0.25, -0.5]);
+        assert_eq!(right.v, [-0.75, 1.0]);
+        assert!(!system.GetEyeTrackedFoveationCenterForProjection(std::ptr::null(), &mut left));
+        assert_eq!(left.v, [0.25, -0.5]);
+        assert!(!system.GetEyeTrackedFoveationCenter(std::ptr::null_mut(), std::ptr::null_mut()));
+    }
 
     #[test]
     fn unity_required_properties() {
