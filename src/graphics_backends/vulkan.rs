@@ -675,6 +675,9 @@ impl PipelineData {
             .attachments(&attachments)
             .subpasses(std::slice::from_ref(&subpass));
 
+        log::info!(
+            "Vulkan overlay pipeline: source={source_format:?}, target={target_format:?}, samples={sample_count}"
+        );
         let renderpass = unsafe { device.create_render_pass(&info, None).unwrap() };
 
         let load_module = |stage, bytes| {
@@ -783,7 +786,10 @@ impl PipelineData {
             .cull_mode(vk::CullModeFlags::NONE)
             .line_width(1.0)
             .depth_bias_enable(false);
-        let multi_state = vk::PipelineMultisampleStateCreateInfo::default();
+        // Ash defaults this required bitmask to zero, which is not a sample count.
+        // Match the attachments in the render pass above.
+        let multi_state = vk::PipelineMultisampleStateCreateInfo::default()
+            .rasterization_samples(samples);
         let depth_state = vk::PipelineDepthStencilStateCreateInfo::default();
         let blend = vk::PipelineColorBlendAttachmentState {
             blend_enable: vk::FALSE,
@@ -1038,5 +1044,81 @@ mod portability {
             }
         }
         panic!("No Vulkan library found (tried {candidates:?}); set XRIZER_VULKAN_LIBRARY")
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod native_overlay_pipeline_tests {
+    use super::*;
+
+    /// Exercises the real private pipeline builder, not fakexr's Vulkan table.
+    /// No OpenXR instance, compositor, game or headset is created.
+    #[test]
+    #[ignore = "requires an explicit native Vulkan ICD and Metal access"]
+    fn native_overlay_pipeline() {
+        let entry = portability::load_entry();
+        let mut extensions = Vec::new();
+        let mut flags = vk::InstanceCreateFlags::empty();
+        portability::add_instance_enumeration(&entry, &mut extensions, &mut flags);
+        let extension_ptrs: Vec<_> = extensions.iter().map(|name| name.as_ptr()).collect();
+        let instance = unsafe {
+            entry
+                .create_instance(
+                    &vk::InstanceCreateInfo::default()
+                        .flags(flags)
+                        .application_info(
+                            &vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_2),
+                        )
+                        .enabled_extension_names(&extension_ptrs),
+                    None,
+                )
+                .unwrap()
+        };
+        let physical = unsafe { instance.enumerate_physical_devices().unwrap()[0] };
+        let props = unsafe { instance.get_physical_device_properties(physical) };
+        eprintln!(
+            "native overlay device: {:?}, driverVersion={}",
+            unsafe { std::ffi::CStr::from_ptr(props.device_name.as_ptr()) },
+            props.driver_version
+        );
+        let family = unsafe { instance.get_physical_device_queue_family_properties(physical) }
+            .iter()
+            .position(|q| q.queue_flags.contains(vk::QueueFlags::GRAPHICS))
+            .unwrap() as u32;
+        let mut extensions = Vec::new();
+        portability::add_device_subset(&instance, physical, &mut extensions);
+        let extension_ptrs: Vec<_> = extensions.iter().map(|name| name.as_ptr()).collect();
+        let device = unsafe {
+            instance
+                .create_device(
+                    physical,
+                    &vk::DeviceCreateInfo::default()
+                        .queue_create_infos(&[vk::DeviceQueueCreateInfo::default()
+                            .queue_family_index(family)
+                            .queue_priorities(&[1.0])])
+                        .enabled_extension_names(&extension_ptrs),
+                    None,
+                )
+                .unwrap()
+        };
+        for (source, target) in [
+            (vk::Format::R8G8B8A8_UNORM, vk::Format::R8G8B8A8_SRGB),
+            (vk::Format::B8G8R8A8_UNORM, vk::Format::B8G8R8A8_SRGB),
+        ] {
+            let pipeline = PipelineData::new(&device, source, target, 1, &[]);
+            assert_ne!(pipeline.pipeline, vk::Pipeline::null());
+            eprintln!("native overlay pipeline passed: {source:?} -> {target:?}, samples=1");
+            unsafe {
+                device.destroy_pipeline(pipeline.pipeline, None);
+                device.destroy_pipeline_layout(pipeline.layout, None);
+                device.destroy_render_pass(pipeline.renderpass, None);
+                device.destroy_descriptor_pool(pipeline.pool, None);
+                device.destroy_sampler(pipeline.sampler, None);
+            }
+        }
+        unsafe {
+            device.destroy_device(None);
+            instance.destroy_instance(None);
+        }
     }
 }
