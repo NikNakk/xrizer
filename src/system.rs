@@ -65,14 +65,17 @@ impl ViewCache {
     }
 
     fn get_views_view_space(session: &SessionData, display_time: xr::Time) -> ViewDataViewSpace {
-        let (flags, mut views) = session
-            .session
-            .locate_views(
-                xr::ViewConfigurationType::PRIMARY_STEREO,
-                display_time,
-                session.get_space_from_type(xr::ReferenceSpaceType::VIEW),
-            )
-            .expect("Couldn't locate views");
+        let (flags, mut views) = {
+            let _api_trace = crate::api_trace::Span::new("xr_locate_views_view", u32::MAX, -1);
+            session
+                .session
+                .locate_views(
+                    xr::ViewConfigurationType::PRIMARY_STEREO,
+                    display_time,
+                    session.get_space_from_type(xr::ReferenceSpaceType::VIEW),
+                )
+                .expect("Couldn't locate views")
+        };
 
         let original_orientations = views
             .iter_mut()
@@ -107,14 +110,17 @@ impl ViewCache {
         ty: xr::ReferenceSpaceType,
         view_data_orientations_inverse: [Quat; 2],
     ) -> ViewData {
-        let (flags, mut views) = session
-            .session
-            .locate_views(
-                xr::ViewConfigurationType::PRIMARY_STEREO,
-                display_time,
-                session.get_space_from_type(ty),
-            )
-            .expect("Couldn't locate views");
+        let (flags, mut views) = {
+            let _api_trace = crate::api_trace::Span::new("xr_locate_views_world", u32::MAX, -1);
+            session
+                .session
+                .locate_views(
+                    xr::ViewConfigurationType::PRIMARY_STEREO,
+                    display_time,
+                    session.get_space_from_type(ty),
+                )
+                .expect("Couldn't locate views")
+        };
 
         for (
             xr::View {
