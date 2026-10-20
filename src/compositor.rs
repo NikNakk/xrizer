@@ -1318,12 +1318,14 @@ impl<G: GraphicsBackend> FrameController<G> {
             .expect("Can't acquire swapchain image with no swapchain!")
             .swapchain;
 
-        self.image_index = swapchain
-            .acquire_image()
-            .expect("Failed to acquire swapchain image") as usize;
+        self.image_index = {
+            let _api_trace = crate::api_trace::Span::new("xr_acquire_image", u32::MAX, -1);
+            swapchain.acquire_image().expect("Failed to acquire swapchain image") as usize
+        };
 
         trace!("waiting image");
         {
+            let _api_trace = crate::api_trace::Span::new("xr_wait_image", u32::MAX, -1);
             tracy_span!("wait swapchain image");
             swapchain
                 .wait_image(xr::Duration::INFINITE)
@@ -1335,6 +1337,7 @@ impl<G: GraphicsBackend> FrameController<G> {
 
     fn wait_frame(&mut self) -> (xr::Time, i64) {
         let frame_state = {
+            let _api_trace = crate::api_trace::Span::new("xr_wait_frame", u32::MAX, -1);
             tracy_span!("wait frame");
             self.waiter.wait().unwrap()
         };
@@ -1369,6 +1372,7 @@ impl<G: GraphicsBackend> FrameController<G> {
         }
 
         {
+            let _api_trace = crate::api_trace::Span::new("xr_begin_frame", u32::MAX, -1);
             tracy_span!("begin frame");
             self.stream.begin().expect("Couldn't begin frame");
         }
@@ -1455,6 +1459,7 @@ impl<G: GraphicsBackend> FrameController<G> {
         if self.eyes_submitted.iter().all(|eye| eye.is_some()) && !self.app_suspend_render {
             let mut swapchain_data = self.swapchain_data.as_mut();
             if let Some(data) = &mut swapchain_data {
+                let _api_trace = crate::api_trace::Span::new("xr_release_image", u32::MAX, -1);
                 trace!("releasing image");
                 data.swapchain.release_image().unwrap();
             }
@@ -1768,9 +1773,10 @@ impl<G: GraphicsBackend> FrameController<G> {
             self.app_fade_grid
         );
 
-        self.stream
-            .end(display_time, xr::EnvironmentBlendMode::OPAQUE, &layers)
-            .unwrap();
+        {
+            let _api_trace = crate::api_trace::Span::new("xr_end_frame", u32::MAX, -1);
+            self.stream.end(display_time, xr::EnvironmentBlendMode::OPAQUE, &layers).unwrap();
+        }
 
         trace!("frame submitted");
     }
