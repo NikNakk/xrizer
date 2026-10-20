@@ -524,6 +524,10 @@ mod platform {
             extent
         }
 
+        fn supports_stage_rendering(&self) -> bool {
+            true
+        }
+
         fn render_stage(
             &mut self,
             stage: &crate::stage::StageAsset,

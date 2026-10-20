@@ -59,6 +59,11 @@ pub trait GraphicsBackend: Into<SupportedBackend> {
         image_index: usize,
     ) -> xr::Extent2Di;
 
+    /// Check before changing application swapchains for a stage override.
+    fn supports_stage_rendering(&self) -> bool {
+        false
+    }
+
     fn render_stage(
         &mut self,
         _stage: &crate::stage::StageAsset,
