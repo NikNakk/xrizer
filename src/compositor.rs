@@ -770,6 +770,7 @@ impl vr::IVRCompositor029_Interface for Compositor {
         true
     }
     fn PostPresentHandoff(&self) {
+        let _api_trace = crate::api_trace::Span::new("handoff", self.metrics.index.load(Ordering::Relaxed), -1);
         #[macros::any_graphics(DynFrameController)]
         fn end_frame<G: GraphicsBackend + 'static>(
             ctrl: &mut FrameController<G>,
@@ -861,6 +862,7 @@ impl vr::IVRCompositor029_Interface for Compositor {
         bounds: *const vr::VRTextureBounds_t,
         submit_flags: vr::EVRSubmitFlags,
     ) -> vr::EVRCompositorError {
+        let _api_trace = crate::api_trace::Span::new("submit", self.metrics.index.load(Ordering::Relaxed), eye as i32);
         let bounds = unsafe { bounds.as_ref() }
             .copied()
             .unwrap_or(vr::VRTextureBounds_t {
@@ -1020,6 +1022,7 @@ impl vr::IVRCompositor029_Interface for Compositor {
         game_pose_array: *mut vr::TrackedDevicePose_t,
         game_pose_count: u32,
     ) -> vr::EVRCompositorError {
+        let _api_trace = crate::api_trace::Span::new("wait_poses", self.metrics.index.load(Ordering::Relaxed), -1);
         tracy_span!("WaitGetPoses impl");
         trace!(
             "[alyx-comp] WaitGetPoses render_poses={} game_poses={} frame_state={:?} timing={:?} stage_active={}",
