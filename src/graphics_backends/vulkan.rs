@@ -560,10 +560,23 @@ impl VulkanData {
             .split_ascii_whitespace()
             .map(|ext| CString::new(ext).unwrap())
             .collect();
-        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
         let mut dev_exts = dev_exts;
         #[cfg(target_os = "macos")]
         portability::add_device_subset(&instance, physical_device, &mut dev_exts);
+        #[cfg(target_os = "macos")]
+        let timeline_handoff = std::env::var("XRIZER_MACOS_TIMELINE_HANDOFF").as_deref() == Ok("1");
+        #[cfg(not(target_os = "macos"))]
+        let timeline_handoff = false;
+        if timeline_handoff {
+            let supported = unsafe { instance.enumerate_device_extension_properties(physical_device) }
+                .expect("Could not query timeline extension support");
+            assert!(supported.iter().any(|ext| unsafe {
+                std::ffi::CStr::from_ptr(ext.extension_name.as_ptr()) == ash::khr::timeline_semaphore::NAME
+            }), "Timeline handoff requires VK_KHR_timeline_semaphore");
+            if !dev_exts.iter().any(|ext| ext.as_c_str() == ash::khr::timeline_semaphore::NAME) {
+                dev_exts.push(ash::khr::timeline_semaphore::NAME.to_owned());
+            }
+        }
         let dev_exts: Vec<*const c_char> = dev_exts.iter().map(|ext| ext.as_ptr()).collect();
 
         // find whatever graphics queue family
@@ -576,11 +589,25 @@ impl VulkanData {
                 })
                 .unwrap() as u32;
 
+        // Legacy OpenXR must only be told timeline semaphores are enabled
+        // after the explicit native profile enables them on this device too.
+        let mut timeline = vk::PhysicalDeviceTimelineSemaphoreFeatures::default();
+        if timeline_handoff {
+            let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut timeline);
+            unsafe { instance.get_physical_device_features2(physical_device, &mut features) };
+            assert_eq!(timeline.timeline_semaphore, vk::TRUE,
+                "Timeline handoff requires supported timeline semaphores");
+            log::info!("Vulkan temporary device: supported timelineSemaphore enabled for explicit handoff profile");
+        }
+        let mut device_info = vk::DeviceCreateInfo::default();
+        if timeline_handoff {
+            device_info = device_info.push_next(&mut timeline);
+        }
         let device = unsafe {
             instance
                 .create_device(
                     physical_device,
-                    &vk::DeviceCreateInfo::default()
+                    &device_info
                         .queue_create_infos(std::slice::from_ref(
                             &vk::DeviceQueueCreateInfo::default()
                                 .queue_family_index(queue_family_index)
