@@ -189,6 +189,12 @@ impl<C: Compositor> OpenXrData<C> {
         exts.fb_display_refresh_rate = supported_exts.fb_display_refresh_rate;
         exts.ext_view_configuration_views_change =
             supported_exts.ext_view_configuration_views_change;
+        if crate::fdm_gaze::enabled() && crate::fdm_gaze::fake_direction().is_none() {
+            exts.ext_eye_gaze_interaction = supported_exts.ext_eye_gaze_interaction;
+            if !supported_exts.ext_eye_gaze_interaction {
+                crate::fdm_gaze::warn_unsupported();
+            }
+        }
 
         // Extension that enables simple full body tracking support via generic tracked devices.
         // Available only in the Monado OpenXR runtime.
