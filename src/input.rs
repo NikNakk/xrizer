@@ -109,6 +109,7 @@ impl<C: openxr_data::Compositor> Input<C> {
             &openxr.instance,
             subaction_paths.left,
             subaction_paths.right,
+            openxr.enabled_extensions.ext_eye_gaze_interaction,
         );
         openxr
             .session_data
@@ -1902,6 +1903,43 @@ impl<C: openxr_data::Compositor> Input<C> {
         }
     }
 
+    /// Projects the current eye gaze into each view and hands it to the driver
+    /// for gaze-centred density maps.
+    pub fn update_fdm_gaze(&self, session_data: &SessionData, time: xr::Time) {
+        let Ok((_, views)) = session_data.session.locate_views(
+            xr::ViewConfigurationType::PRIMARY_STEREO,
+            time,
+            &session_data.view_space,
+        ) else {
+            return;
+        };
+
+        let direction = crate::fdm_gaze::fake_direction().or_else(|| {
+            let pose_data = session_data.input_data.pose_data.get()?;
+            let gaze = pose_data.gaze.as_ref()?;
+            if pose_data.gaze_space.read().unwrap().is_none() {
+                let space = gaze
+                    .create_space(&session_data.session, xr::Path::NULL, xr::Posef::IDENTITY)
+                    .ok()?;
+                *pose_data.gaze_space.write().unwrap() = Some(space);
+            }
+            let guard = pose_data.gaze_space.read().unwrap();
+            let location = guard.as_ref()?.locate(&session_data.view_space, time).ok()?;
+            let wanted =
+                xr::SpaceLocationFlags::ORIENTATION_VALID | xr::SpaceLocationFlags::ORIENTATION_TRACKED;
+            location
+                .location_flags
+                .contains(wanted)
+                .then(|| crate::fdm_gaze::pose_direction(&location.pose))
+        });
+
+        let points: Vec<_> = views
+            .iter()
+            .map(|view| direction.and_then(|d| crate::fdm_gaze::project(d, view)))
+            .collect();
+        crate::fdm_gaze::publish(&points);
+    }
+
     pub fn post_session_restart(&self, data: &SessionData) {
         // This function is called while a write lock is called on the session, and as such should
         // not use self.openxr.session_data.get().
@@ -1911,6 +1949,7 @@ impl<C: openxr_data::Compositor> Input<C> {
                 &self.openxr.instance,
                 self.subaction_paths.left,
                 self.subaction_paths.right,
+                self.openxr.enabled_extensions.ext_eye_gaze_interaction,
             ))
             .unwrap_or_else(|_| panic!("PoseData already setup"));
         self.ensure_fake_controllers(data);
@@ -2072,21 +2111,45 @@ impl ManifestLoadedActions {
 struct PoseData {
     set: xr::ActionSet,
     grip: xr::Action<xr::Posef>,
+    /// Eye gaze for gaze-centred density maps, see `crate::fdm_gaze`.
+    gaze: Option<xr::Action<xr::Posef>>,
+    gaze_space: RwLock<Option<xr::Space>>,
     left_space: HandSpace,
     right_space: HandSpace,
 }
 
 impl PoseData {
-    fn new(instance: &xr::Instance, left_path: xr::Path, right_path: xr::Path) -> Self {
+    fn new(
+        instance: &xr::Instance,
+        left_path: xr::Path,
+        right_path: xr::Path,
+        eye_gaze: bool,
+    ) -> Self {
         let set = instance
             .create_action_set("xrizer-pose-data", "xrizer pose data", 0)
             .unwrap();
         let grip = set
             .create_action("grip-pose", "Grip Pose", &[left_path, right_path])
             .unwrap();
+        let gaze = eye_gaze
+            .then(|| -> xr::Result<xr::Action<xr::Posef>> {
+                let gaze = set.create_action("eye-gaze", "Eye Gaze", &[])?;
+                let profile =
+                    instance.string_to_path("/interaction_profiles/ext/eye_gaze_interaction")?;
+                let pose = instance.string_to_path("/user/eyes_ext/input/gaze_ext/pose")?;
+                instance
+                    .suggest_interaction_profile_bindings(profile, &[xr::Binding::new(&gaze, pose)])?;
+                Ok(gaze)
+            })
+            .and_then(|r| {
+                r.inspect_err(|e| warn!("FDM gaze: could not set up the eye gaze action: {e}"))
+                    .ok()
+            });
         Self {
             set,
             grip,
+            gaze,
+            gaze_space: RwLock::default(),
             left_space: HandSpace {
                 hand: Hand::Left,
                 hand_path: left_path,

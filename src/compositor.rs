@@ -136,6 +136,13 @@ impl Compositor {
         self.openxr
             .display_period_nanos
             .store(display_period, Ordering::Relaxed);
+        drop(frame_lock);
+
+        if crate::fdm_gaze::enabled() {
+            if let Some(input) = self.input.get() {
+                input.update_fdm_gaze(session_data, display_time);
+            }
+        }
     }
 
     fn maybe_begin_frame(&self, session_data: &SessionData) {
