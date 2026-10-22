@@ -184,6 +184,12 @@ impl<C: Compositor> OpenXrData<C> {
             supported_exts.htc_vive_focus3_controller_interaction;
         exts.meta_touch_controller_plus = supported_exts.meta_touch_controller_plus;
         exts.fb_display_refresh_rate = supported_exts.fb_display_refresh_rate;
+        if crate::fdm_gaze::enabled() && crate::fdm_gaze::fake_direction().is_none() {
+            exts.ext_eye_gaze_interaction = supported_exts.ext_eye_gaze_interaction;
+            if !supported_exts.ext_eye_gaze_interaction {
+                crate::fdm_gaze::warn_unsupported();
+            }
+        }
 
         // Extension that enables simple full body tracking support via generic tracked devices.
         // Available only in the Monado OpenXR runtime.
