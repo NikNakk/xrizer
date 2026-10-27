@@ -510,6 +510,30 @@ pub enum SessionCreationError {
     BeginSessionFailed(xr::sys::Result),
 }
 
+/// Asks the runtime for the rate in `XRIZER_DISPLAY_REFRESH_RATE` (Hz), if set and
+/// XR_FB_display_refresh_rate is enabled. Failures are logged, not fatal.
+fn request_display_refresh_rate(instance: &xr::Instance, session: &xr::Session<xr::AnyGraphics>) {
+    let Ok(value) = std::env::var("XRIZER_DISPLAY_REFRESH_RATE") else {
+        return;
+    };
+    let Ok(rate) = value.trim().parse::<f32>() else {
+        warn!("XRIZER_DISPLAY_REFRESH_RATE={value:?} is not a number; ignoring");
+        return;
+    };
+    if instance.exts().fb_display_refresh_rate.is_none() {
+        warn!("XRIZER_DISPLAY_REFRESH_RATE={rate} ignored: XR_FB_display_refresh_rate is not enabled");
+        return;
+    }
+    let before = session.get_display_refresh_rate().ok();
+    match session.request_display_refresh_rate(rate) {
+        Ok(()) => info!(
+            "Display refresh rate requested: {rate} Hz (was {before:?}, now {:?})",
+            session.get_display_refresh_rate().ok()
+        ),
+        Err(e) => warn!("Display refresh rate request for {rate} Hz failed: {e:?}"),
+    }
+}
+
 impl SessionData {
     fn new(
         instance: &xr::Instance,
@@ -632,6 +656,7 @@ impl SessionData {
             .begin(xr::ViewConfigurationType::PRIMARY_STEREO)
             .map_err(SessionCreationError::BeginSessionFailed)?;
         info!("Began OpenXR session.");
+        request_display_refresh_rate(instance, &session);
 
         Ok((
             SessionData {
