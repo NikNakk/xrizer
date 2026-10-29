@@ -1190,3 +1190,99 @@ fn load_actions_race() {
     let res = f.get_bool_state(boolact);
     assert!(res.is_ok(), "{res:?}");
 }
+
+#[test]
+#[ignore = "requires XRIZER_FDM_GAZE_MODE=application without fake gaze"]
+fn application_gaze_legacy_acquisition_loss_and_restart() {
+    assert!(crate::fdm_gaze::application_enabled());
+    assert!(crate::fdm_gaze::fake_direction().is_none());
+    let f = Fixture::new();
+    f.input.setup_legacy_actions();
+    let data = f.input.openxr.session_data.get();
+    let fov = xr::Fovf {
+        angle_left: -0.8,
+        angle_right: 0.7,
+        angle_up: 0.8,
+        angle_down: -0.7,
+    };
+    fakexr::set_view_fovs(data.session.as_raw(), Some([fov; 2]));
+    let flags =
+        xr::SpaceLocationFlags::ORIENTATION_VALID | xr::SpaceLocationFlags::ORIENTATION_TRACKED;
+    fakexr::set_gaze(data.session.as_raw(), Some((xr::Posef::IDENTITY, flags)));
+    let time = xr::Time::from_nanos(42);
+    f.input.update_fdm_gaze(&data, time);
+    assert!(data.fdm_gaze.lock().unwrap().is_some());
+    assert!(data.input_data.get_loaded_actions().is_none());
+    fakexr::set_gaze(
+        data.session.as_raw(),
+        Some((
+            xr::Posef::IDENTITY,
+            xr::SpaceLocationFlags::ORIENTATION_VALID,
+        )),
+    );
+    f.input.update_fdm_gaze(&data, time);
+    assert!(data.fdm_gaze.lock().unwrap().is_none());
+    fakexr::set_gaze(data.session.as_raw(), Some((xr::Posef::IDENTITY, flags)));
+    f.input.update_fdm_gaze(&data, time);
+    assert!(data.fdm_gaze.lock().unwrap().is_some());
+    fakexr::set_view_fovs(data.session.as_raw(), None);
+    f.input.update_fdm_gaze(&data, time);
+    assert!(data.fdm_gaze.lock().unwrap().is_none());
+    fakexr::set_view_fovs(data.session.as_raw(), Some([fov; 2]));
+    f.input.update_fdm_gaze(&data, time);
+    assert!(data.fdm_gaze.lock().unwrap().is_some());
+    fakexr::set_gaze(data.session.as_raw(), None);
+    f.input.update_fdm_gaze(&data, time);
+    assert!(data.fdm_gaze.lock().unwrap().is_none());
+    fakexr::set_gaze(data.session.as_raw(), Some((xr::Posef::IDENTITY, flags)));
+    f.input.update_fdm_gaze(&data, time);
+    assert!(data.fdm_gaze.lock().unwrap().is_some());
+    drop(data);
+    f.input.openxr.restart_session();
+    assert!(
+        f.input
+            .openxr
+            .session_data
+            .get()
+            .fdm_gaze
+            .lock()
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+#[ignore = "requires XRIZER_FDM_GAZE_MODE=application without fake gaze"]
+fn application_gaze_manifest_requires_synced_pose_set() {
+    assert!(crate::fdm_gaze::application_enabled());
+    let mut f = Fixture::new();
+    f.load_actions(c"actions.json");
+    let set = f.get_action_set_handle(c"/actions/set1");
+    let fov = xr::Fovf {
+        angle_left: -0.8,
+        angle_right: 0.7,
+        angle_up: 0.8,
+        angle_down: -0.7,
+    };
+    {
+        let data = f.input.openxr.session_data.get();
+        fakexr::set_view_fovs(data.session.as_raw(), Some([fov; 2]));
+        fakexr::set_gaze(
+            data.session.as_raw(),
+            Some((
+                xr::Posef::IDENTITY,
+                xr::SpaceLocationFlags::ORIENTATION_VALID
+                    | xr::SpaceLocationFlags::ORIENTATION_TRACKED,
+            )),
+        );
+        f.input.update_fdm_gaze(&data, xr::Time::from_nanos(42));
+        assert!(data.fdm_gaze.lock().unwrap().is_none());
+    }
+    f.sync(vr::VRActiveActionSet_t {
+        ulActionSet: set,
+        ..Default::default()
+    });
+    let data = f.input.openxr.session_data.get();
+    f.input.update_fdm_gaze(&data, xr::Time::from_nanos(42));
+    assert!(data.fdm_gaze.lock().unwrap().is_some());
+}

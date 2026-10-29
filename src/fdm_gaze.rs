@@ -4,6 +4,10 @@
 //! `XR_EXT_eye_gaze_interaction`, projects it into each eye's field of view and
 //! hands it to the KosmicKrisp Vulkan driver in the same process
 //! (`kk_fdm_set_gaze`), which centres its fragment density maps on it.
+//! `XRIZER_FDM_GAZE_MODE=application` instead exposes projection-consistent NDC
+//! through OpenVR's foveation-centre helpers and disables private driver publication.
+//! Gaze is approximated as a head-space ray at infinity: combined OpenXR gaze
+//! does not supply independent per-eye fixation or convergence distances.
 //! `XRIZER_FAKE_GAZE=yaw,pitch` (degrees, right and up positive) replaces the
 //! eye tracker with a fixed direction, for testing without one.
 
@@ -12,12 +16,15 @@ use log::{info, warn};
 use openxr as xr;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 /// Whether gaze-centred density maps were requested.
 pub fn enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var("XRIZER_FDM_GAZE").is_ok_and(|v| v != "0") || fake_direction().is_some()
+        application_enabled()
+            || std::env::var("XRIZER_FDM_GAZE").is_ok_and(|v| v != "0")
+            || fake_direction().is_some()
     })
 }
 
@@ -29,6 +36,9 @@ pub fn fake_direction() -> Option<Vec3> {
         let mut parts = value.split(',').map(|p| p.trim().parse::<f32>());
         let yaw = parts.next()?.ok()?.to_radians();
         let pitch = parts.next()?.ok()?.to_radians();
+        if parts.next().is_some() || !yaw.is_finite() || !pitch.is_finite() {
+            return None;
+        }
         Some(Quat::from_euler(glam::EulerRot::YXZ, -yaw, pitch, 0.0) * Vec3::NEG_Z)
     })
 }
@@ -123,6 +133,9 @@ fn find_kk_set_gaze() -> Option<SetGaze> {
 
 /// Hands the gaze point of each view to the driver; `None` turns it off.
 pub fn publish(points: &[Option<(f32, f32)>]) {
+    if application_enabled() {
+        return;
+    }
     let Some(set_gaze) = kk_set_gaze() else {
         return;
     };
@@ -192,5 +205,154 @@ mod tests {
     #[test]
     fn looking_backwards_has_no_point() {
         assert!(project(Vec3::Z, &view(-45.0, 45.0, 45.0, -45.0)).is_none());
+    }
+}
+
+pub fn application_enabled() -> bool {
+    static APPLICATION: OnceLock<bool> = OnceLock::new();
+    *APPLICATION
+        .get_or_init(|| std::env::var("XRIZER_FDM_GAZE_MODE").as_deref() == Ok("application"))
+}
+
+#[derive(Clone, Copy)]
+pub struct Sample {
+    pub direction: Vec3,
+    pub fovs: [xr::Fovf; 2],
+    pub display_time: xr::Time,
+    pub acquired: Instant,
+}
+
+impl Sample {
+    pub fn current(&self, display_time: xr::Time) -> bool {
+        self.display_time == display_time && self.acquired.elapsed() <= Duration::from_millis(100)
+    }
+
+    pub fn centres(&self) -> Option<[[f32; 2]; 2]> {
+        Some([
+            project_ndc(self.direction, self.fovs[0])?,
+            project_ndc(self.direction, self.fovs[1])?,
+        ])
+    }
+}
+
+pub fn project_ndc(direction: Vec3, fov: xr::Fovf) -> Option<[f32; 2]> {
+    let left = fov.angle_left.tan();
+    let right = fov.angle_right.tan();
+    let down = fov.angle_down.tan();
+    let up = fov.angle_up.tan();
+    if !direction.is_finite()
+        || direction.z >= -1e-6
+        || ![left, right, down, up].iter().all(|v| v.is_finite())
+        || right <= left
+        || up <= down
+    {
+        return None;
+    }
+    let point = [
+        2.0 * (direction.x / -direction.z - left) / (right - left) - 1.0,
+        2.0 * (direction.y / -direction.z - down) / (up - down) - 1.0,
+    ];
+    point.iter().all(|v| v.is_finite()).then_some(point)
+}
+
+pub fn project_matrix(direction: Vec3, matrix: &[[f32; 4]; 4]) -> Option<[f32; 2]> {
+    if !direction.is_finite()
+        || direction.z >= -1e-6
+        || !matrix.iter().flatten().all(|v| v.is_finite())
+    {
+        return None;
+    }
+    let clip = matrix.map(|r| r[0] * direction.x + r[1] * direction.y + r[2] * direction.z);
+    if clip[3] <= 1e-6 {
+        return None;
+    }
+    let point = [clip[0] / clip[3], clip[1] / clip[3]];
+    point.iter().all(|v| v.is_finite()).then_some(point)
+}
+
+#[cfg(test)]
+mod application_tests {
+    use super::*;
+
+    fn fov(left: f32, right: f32, down: f32, up: f32) -> xr::Fovf {
+        xr::Fovf {
+            angle_left: left.to_radians(),
+            angle_right: right.to_radians(),
+            angle_down: down.to_radians(),
+            angle_up: up.to_radians(),
+        }
+    }
+
+    #[test]
+    fn ndc_signs_and_no_image_space_clamp() {
+        let symmetric = fov(-45.0, 45.0, -45.0, 45.0);
+        assert_eq!(project_ndc(Vec3::NEG_Z, symmetric), Some([0.0, 0.0]));
+        let p = project_ndc(Vec3::new(0.4, 0.2, -1.0), symmetric).unwrap();
+        assert!((p[0] - 0.4).abs() < 1e-6 && (p[1] - 0.2).abs() < 1e-6);
+        assert!(project_ndc(Vec3::new(2.0, 0.0, -1.0), symmetric).unwrap()[0] > 1.0);
+    }
+
+    #[test]
+    fn asymmetric_ndc_agrees_with_openvr_matrix() {
+        let f = fov(-61.5, 43.5, -48.0, 53.0);
+        let [l, r, d, u] = [
+            f.angle_left.tan(),
+            f.angle_right.tan(),
+            f.angle_down.tan(),
+            f.angle_up.tan(),
+        ];
+        let m = [
+            [2.0 / (r - l), 0.0, (r + l) / (r - l), 0.0],
+            [0.0, 2.0 / (u - d), (u + d) / (u - d), 0.0],
+            [0.0, 0.0, -1.01, -0.1],
+            [0.0, 0.0, -1.0, 0.0],
+        ];
+        for direction in [Vec3::NEG_Z, Vec3::new(0.4, -0.2, -1.0)] {
+            let a = project_ndc(direction, f).unwrap();
+            let b = project_matrix(direction, &m).unwrap();
+            assert!((a[0] - b[0]).abs() < 1e-6 && (a[1] - b[1]).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn supplied_matrix_uses_rows_and_perspective_divide() {
+        let m = [
+            [4.0, 0.0, 0.3, 100.0],
+            [0.0, 3.0, -0.2, 200.0],
+            [0.0, 0.0, -1.0, -1.0],
+            [0.0, 0.0, -2.0, 0.0],
+        ];
+        let p = project_matrix(Vec3::new(0.5, 0.25, -1.0), &m).unwrap();
+        assert!((p[0] - 0.85).abs() < 1e-6 && (p[1] - 0.475).abs() < 1e-6);
+    }
+
+    #[test]
+    fn invalid_directions_and_projections_fail() {
+        let f = fov(-45.0, 45.0, -45.0, 45.0);
+        for direction in [
+            Vec3::Z,
+            Vec3::ZERO,
+            Vec3::splat(f32::NAN),
+            Vec3::splat(f32::INFINITY),
+        ] {
+            assert!(project_ndc(direction, f).is_none());
+        }
+        assert!(project_ndc(Vec3::NEG_Z, fov(45.0, -45.0, -45.0, 45.0)).is_none());
+        assert!(project_matrix(Vec3::NEG_Z, &[[0.0; 4]; 4]).is_none());
+        assert!(project_matrix(Vec3::NEG_Z, &[[f32::NAN; 4]; 4]).is_none());
+    }
+
+    #[test]
+    fn cache_expires_and_rejects_a_different_frame() {
+        let mut sample = Sample {
+            direction: Vec3::NEG_Z,
+            fovs: [fov(-45.0, 45.0, -45.0, 45.0); 2],
+            display_time: xr::Time::from_nanos(42),
+            acquired: Instant::now(),
+        };
+        assert!(sample.current(xr::Time::from_nanos(42)));
+        assert!(!sample.current(xr::Time::from_nanos(43)));
+        sample.acquired -= Duration::from_millis(101);
+        assert!(!sample.current(xr::Time::from_nanos(42)));
     }
 }

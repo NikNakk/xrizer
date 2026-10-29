@@ -139,12 +139,6 @@ impl Compositor {
             .display_period_nanos
             .store(display_period, Ordering::Relaxed);
         drop(frame_lock);
-
-        if crate::fdm_gaze::enabled() {
-            if let Some(input) = self.input.get() {
-                input.update_fdm_gaze(session_data, display_time);
-            }
-        }
     }
 
     fn maybe_begin_frame(&self, session_data: &SessionData) {
@@ -1141,6 +1135,10 @@ impl vr::IVRCompositor029_Interface for Compositor {
         }
         if let Some(input) = self.input.get() {
             input.frame_start_update();
+            if crate::fdm_gaze::enabled() {
+                let session_data = self.openxr.session_data.get();
+                input.update_fdm_gaze(&session_data, self.openxr.display_time.get());
+            }
         }
 
         let result = self.GetLastPoses(

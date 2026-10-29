@@ -165,8 +165,8 @@ pub struct System {
 }
 
 // Optional capability/gating diagnostics. Never dereference gaze outputs or
-// record device strings. Calls remain unsupported with identical return values.
-fn foveation_trace(api: &str, details: std::fmt::Arguments<'_>) {
+// record device strings.
+pub(crate) fn foveation_trace(api: &str, details: std::fmt::Arguments<'_>) {
     use std::sync::{
         OnceLock,
         atomic::{AtomicU32, Ordering},
@@ -177,8 +177,11 @@ fn foveation_trace(api: &str, details: std::fmt::Arguments<'_>) {
     }
     static PROPERTIES: AtomicU32 = AtomicU32::new(0);
     static EYES: AtomicU32 = AtomicU32::new(0);
+    static SAMPLES: AtomicU32 = AtomicU32::new(0);
     let gaze = api.contains("Foveation");
-    let count = if gaze {
+    let count = if api == "FoveationSample" {
+        SAMPLES.fetch_add(1, Ordering::Relaxed)
+    } else if gaze {
         EYES.fetch_add(1, Ordering::Relaxed)
     } else {
         PROPERTIES.fetch_add(1, Ordering::Relaxed)
@@ -201,6 +204,21 @@ impl System {
             vtables: Default::default(),
             views: Mutex::default(),
         }
+    }
+
+    fn application_gaze(&self) -> Option<crate::fdm_gaze::Sample> {
+        if !crate::fdm_gaze::application_enabled() {
+            return None;
+        }
+        let session = self.openxr.session_data.get();
+        if matches!(
+            session.state,
+            xr::SessionState::STOPPING | xr::SessionState::LOSS_PENDING | xr::SessionState::EXITING
+        ) {
+            return None;
+        }
+        let sample = *session.fdm_gaze.lock().unwrap();
+        sample.filter(|sample| sample.current(self.openxr.display_time.get()))
     }
 
     pub fn reset_views(&self) {
@@ -512,27 +530,47 @@ impl vr::IVRSystem026_Interface for System {
 
     fn GetEyeTrackedFoveationCenter(
         &self,
-        _: *mut openvr::HmdVector2_t,
-        _: *mut openvr::HmdVector2_t,
+        left: *mut vr::HmdVector2_t,
+        right: *mut vr::HmdVector2_t,
     ) -> bool {
+        let centres = self.application_gaze().and_then(|sample| sample.centres());
+        let valid = !left.is_null() && !right.is_null() && centres.is_some();
+        if valid {
+            let points = centres.unwrap();
+            unsafe {
+                (*left).v = points[0];
+                (*right).v = points[1];
+            }
+        }
         foveation_trace(
             "GetEyeTrackedFoveationCenter",
-            format_args!("result=false output_unchanged=true"),
+            format_args!("result={valid} ndc={centres:?}"),
         );
-        crate::warn_unimplemented!("GetEyeTrackedFoveationCenter");
-        false
+        valid
     }
+
     fn GetEyeTrackedFoveationCenterForProjection(
         &self,
-        _: *const openvr::HmdMatrix44_t,
-        _: *mut openvr::HmdVector2_t,
+        matrix: *const vr::HmdMatrix44_t,
+        point: *mut vr::HmdVector2_t,
     ) -> bool {
+        let result = if matrix.is_null() || point.is_null() {
+            None
+        } else {
+            self.application_gaze().and_then(|sample| unsafe {
+                crate::fdm_gaze::project_matrix(sample.direction, &(*matrix).m)
+            })
+        };
+        if let Some(value) = result {
+            unsafe {
+                (*point).v = value;
+            }
+        }
         foveation_trace(
             "GetEyeTrackedFoveationCenterForProjection",
-            format_args!("result=false output_unchanged=true"),
+            format_args!("result={} ndc={result:?}", result.is_some()),
         );
-        crate::warn_unimplemented!("GetEyeTrackedFoveationCenterForProjection");
-        false
+        result.is_some()
     }
 
     fn GetEventTypeNameFromEnum(&self, _: vr::EVREventType) -> *const std::os::raw::c_char {
@@ -1184,6 +1222,72 @@ mod tests {
         assert!(!system.GetEyeTrackedFoveationCenterForProjection(std::ptr::null(), &mut left));
         assert_eq!(left.v, [0.25, -0.5]);
         assert!(!system.GetEyeTrackedFoveationCenter(std::ptr::null_mut(), std::ptr::null_mut()));
+    }
+
+    #[test]
+    #[ignore = "requires XRIZER_FDM_GAZE_MODE=application"]
+    fn application_gaze_api_matches_projection_and_preserves_invalid_outputs() {
+        use vr::IVRSystem026_Interface;
+        assert!(crate::fdm_gaze::application_enabled());
+        let xr = Arc::new(OpenXrData::new(&Injector::default()).unwrap());
+        let system = System::new(xr.clone(), &Injector::default());
+        let fovs = [
+            xr::Fovf {
+                angle_left: -1.0,
+                angle_right: 0.7,
+                angle_down: -0.8,
+                angle_up: 0.9,
+            },
+            xr::Fovf {
+                angle_left: -0.7,
+                angle_right: 1.0,
+                angle_down: -0.8,
+                angle_up: 0.9,
+            },
+        ];
+        let direction = Vec3::new(0.2, 0.1, -1.0);
+        let sample = crate::fdm_gaze::Sample {
+            direction,
+            fovs,
+            display_time: xr.display_time.get(),
+            acquired: std::time::Instant::now(),
+        };
+        {
+            let session = xr.session_data.get();
+            fakexr::set_view_fovs(session.session.as_raw(), Some(fovs));
+            *session.fdm_gaze.lock().unwrap() = Some(sample);
+        }
+        let mut left = vr::HmdVector2_t { v: [9.0, 9.0] };
+        let mut right = left;
+        assert!(system.GetEyeTrackedFoveationCenter(&mut left, &mut right));
+        for (eye, result) in [(vr::EVREye::Left, left.v), (vr::EVREye::Right, right.v)] {
+            let matrix = vr::IVRSystem026_Interface::GetProjectionMatrix(&system, eye, 0.1, 100.0);
+            let expected = crate::fdm_gaze::project_matrix(direction, &matrix.m).unwrap();
+            assert!(
+                (expected[0] - result[0]).abs() < 1e-6 && (expected[1] - result[1]).abs() < 1e-6
+            );
+            let mut supplied = vr::HmdVector2_t { v: [9.0, 9.0] };
+            assert!(system.GetEyeTrackedFoveationCenterForProjection(&matrix, &mut supplied));
+            assert_eq!(supplied.v, expected);
+        }
+        let before = right.v;
+        assert!(!system.GetEyeTrackedFoveationCenter(std::ptr::null_mut(), &mut right));
+        assert_eq!(right.v, before);
+        let invalid_matrix = vr::HmdMatrix44_t {
+            m: [[f32::NAN; 4]; 4],
+        };
+        assert!(!system.GetEyeTrackedFoveationCenterForProjection(&invalid_matrix, &mut right));
+        assert_eq!(right.v, before);
+        let mut stale = sample;
+        stale.acquired -= std::time::Duration::from_millis(101);
+        *xr.session_data.get().fdm_gaze.lock().unwrap() = Some(stale);
+        assert!(!system.GetEyeTrackedFoveationCenter(&mut left, &mut right));
+        assert_eq!(right.v, before);
+        *xr.session_data.get().fdm_gaze.lock().unwrap() = Some(sample);
+        xr.display_time
+            .set(xr::Time::from_nanos(sample.display_time.as_nanos() + 1));
+        assert!(!system.GetEyeTrackedFoveationCenter(&mut left, &mut right));
+        assert_eq!(right.v, before);
     }
 
     #[test]

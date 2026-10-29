@@ -319,7 +319,7 @@ pub unsafe extern "system" fn get_instance_proc_addr(
                     GetActionStateBoolean,
                     GetActionStateFloat,
                     GetActionStateVector2f,
-                    (GetActionStatePose),
+                    GetActionStatePose,
                     CreateActionSet,
                     DestroyActionSet,
                     CreateAction,
@@ -357,8 +357,8 @@ extern "system" fn enumerate_instance_extension_properties(
     properties: *mut xr::ExtensionProperties,
 ) -> xr::Result {
     assert!(layer_name.is_null());
-    unsafe { *property_count_output = 4 };
-    if property_capacity_input >= 4 {
+    unsafe { *property_count_output = 5 };
+    if property_capacity_input >= 5 {
         let props =
             unsafe { std::slice::from_raw_parts_mut(properties, property_capacity_input as usize) };
 
@@ -405,6 +405,16 @@ extern "system" fn enumerate_instance_extension_properties(
         let name =
             unsafe { std::slice::from_raw_parts(name.as_ptr() as *const c_char, name.len()) };
         props[3].extension_name[..name.len()].copy_from_slice(name);
+        props[4] = xr::ExtensionProperties {
+            ty: xr::ExtensionProperties::TYPE,
+            next: std::ptr::null_mut(),
+            extension_name: [0 as c_char; xr::MAX_EXTENSION_NAME_SIZE],
+            extension_version: 1,
+        };
+        let name = xr::EXT_EYE_GAZE_INTERACTION_EXTENSION_NAME;
+        let name =
+            unsafe { std::slice::from_raw_parts(name.as_ptr() as *const c_char, name.len()) };
+        props[4].extension_name[..name.len()].copy_from_slice(name);
     }
     xr::Result::SUCCESS
 }
@@ -529,6 +539,14 @@ pub enum FrameState {
     Ended,
 }
 
+pub fn set_view_fovs(session: xr::Session, fovs: Option<[xr::Fovf; 2]>) {
+    *session.to_handle().unwrap().view_fovs.write().unwrap() = fovs;
+}
+
+pub fn set_gaze(session: xr::Session, gaze: Option<(xr::Posef, xr::SpaceLocationFlags)>) {
+    *session.to_handle().unwrap().gaze.write().unwrap() = gaze;
+}
+
 struct Session {
     instance: Weak<Instance>,
     event_sender: mpsc::Sender<EventDataBuffer>,
@@ -542,6 +560,8 @@ struct Session {
     should_render: AtomicBool,
     frame_state: AtomicCell<FrameState>,
     with_trackers: AtomicBool,
+    view_fovs: RwLock<Option<[xr::Fovf; 2]>>,
+    gaze: RwLock<Option<(xr::Posef, xr::SpaceLocationFlags)>>,
 }
 
 impl Session {
@@ -681,6 +701,18 @@ impl Space {
                 pose: ret,
             });
         };
+
+        if action.upgrade().unwrap().name.as_c_str() == c"eye-gaze" {
+            return Ok(match *session.gaze.read().unwrap() {
+                Some((pose, flags)) => xr::SpaceLocation {
+                    ty: xr::SpaceLocation::TYPE,
+                    next: std::ptr::null_mut(),
+                    pose,
+                    location_flags: flags,
+                },
+                None => default(),
+            });
+        }
 
         // Check if this hand has an interaction profile
         let hand = hand.unwrap_or(UserPath::LeftHand);
@@ -886,6 +918,8 @@ extern "system" fn create_session(
         should_render: false.into(),
         frame_state: FrameState::Ended.into(),
         with_trackers: false.into(),
+        view_fovs: Default::default(),
+        gaze: Default::default(),
     });
 
     let tx = sess.event_sender.clone();
@@ -1427,6 +1461,30 @@ extern "system" fn get_action_state_boolean(
     xr::Result::SUCCESS
 }
 
+extern "system" fn get_action_state_pose(
+    session: xr::Session,
+    info: *const xr::ActionStateGetInfo,
+    state: *mut xr::ActionStatePose,
+) -> xr::Result {
+    let session = get_handle!(session);
+    let Some((set, action)) = session.get_action_if_attached(info) else {
+        return xr::Result::ERROR_ACTIONSET_NOT_ATTACHED;
+    };
+    if !matches!(action.state.left.load().state, ActionState::Pose(_)) {
+        return xr::Result::ERROR_ACTION_TYPE_MISMATCH;
+    }
+    let active = set.active.load(Ordering::Relaxed)
+        && if action.name.as_c_str() == c"eye-gaze" {
+            session.gaze.read().unwrap().is_some()
+        } else {
+            action.active.load(Ordering::Relaxed)
+        };
+    unsafe {
+        (*state).is_active = active.into();
+    }
+    xr::Result::SUCCESS
+}
+
 extern "system" fn get_action_state_float(
     session: xr::Session,
     info: *const xr::ActionStateGetInfo,
@@ -1536,7 +1594,7 @@ extern "system" fn locate_space(
     assert!(
         !matches!(
             base_space.ty,
-            SpaceType::Reference(xr::ReferenceSpaceType::STAGE | xr::ReferenceSpaceType::VIEW),
+            SpaceType::Reference(xr::ReferenceSpaceType::STAGE),
         ),
         "stage/view locate unimplemented"
     );
@@ -1591,10 +1649,14 @@ extern "system" fn locate_space(
             Err(e) => return e,
         };
 
-        if base_loc.location_flags.contains(*LOCATION_FLAGS_TRACKED)
-            && target_loc.location_flags.contains(*LOCATION_FLAGS_TRACKED)
+        if base_loc
+            .location_flags
+            .contains(xr::SpaceLocationFlags::ORIENTATION_VALID)
+            && target_loc
+                .location_flags
+                .contains(xr::SpaceLocationFlags::ORIENTATION_VALID)
         {
-            out_loc.location_flags = *LOCATION_FLAGS_TRACKED;
+            out_loc.location_flags = base_loc.location_flags & target_loc.location_flags;
             let base_mat = pose_to_mat(base_loc.pose);
             let target_mat = pose_to_mat(target_loc.pose);
 
@@ -1745,13 +1807,18 @@ extern "system" fn locate_views(
     output: *mut u32,
     views: *mut xr::View,
 ) -> xr::Result {
-    let _session = get_handle!(session);
+    let session = get_handle!(session);
+    let configured = *session.view_fovs.read().unwrap();
     if !state.is_null() {
         unsafe {
             state.write(xr::ViewState {
                 ty: xr::ViewState::TYPE,
                 next: std::ptr::null_mut(),
-                view_state_flags: xr::ViewStateFlags::EMPTY,
+                view_state_flags: if configured.is_some() {
+                    xr::ViewStateFlags::ORIENTATION_VALID | xr::ViewStateFlags::ORIENTATION_TRACKED
+                } else {
+                    xr::ViewStateFlags::EMPTY
+                },
             });
         }
     }
@@ -1774,6 +1841,10 @@ extern "system" fn locate_views(
         };
         views[0] = view;
         views[1] = view;
+        if let Some(fovs) = configured {
+            views[0].fov = fovs[0];
+            views[1].fov = fovs[1];
+        }
     }
 
     xr::Result::SUCCESS
