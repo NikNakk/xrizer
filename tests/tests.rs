@@ -13,7 +13,6 @@ fn smoke_test() {
     assert!(!i.is_null());
 }
 
-
 #[test]
 #[cfg_attr(miri, ignore)]
 fn drop_in_openvr_api_exports() {
@@ -35,7 +34,8 @@ fn drop_in_openvr_api_exports() {
         b"VR_GetVRInitErrorAsEnglishDescription\0".as_slice(),
         b"VR_GetStringForHmdError\0".as_slice(),
     ] {
-        let _: Symbol<unsafe extern "C" fn()> = unsafe { lib.get(symbol) }
-            .unwrap_or_else(|e| panic!("missing export {:?}: {e}", String::from_utf8_lossy(symbol)));
+        let _: Symbol<unsafe extern "C" fn()> = unsafe { lib.get(symbol) }.unwrap_or_else(|e| {
+            panic!("missing export {:?}: {e}", String::from_utf8_lossy(symbol))
+        });
     }
 }

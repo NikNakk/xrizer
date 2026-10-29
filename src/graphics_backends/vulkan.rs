@@ -1,4 +1,4 @@
-use super::{GraphicsBackend, ApplicationGpuTiming, vulkan_timing::VulkanGpuTiming};
+use super::{ApplicationGpuTiming, GraphicsBackend, vulkan_timing::VulkanGpuTiming};
 use ash::vk::{self, Handle};
 use log::warn;
 use openvr as vr;
@@ -91,15 +91,23 @@ impl GraphicsBackend for VulkanData {
         }
     }
 
-    fn gpu_timing_requested(&self) -> bool { self.gpu_timing_requested }
+    fn gpu_timing_requested(&self) -> bool {
+        self.gpu_timing_requested
+    }
     fn begin_application_gpu_timing(&mut self, frame: u32, seconds: f64) {
-        if let Some(timing) = &mut self.gpu_timing { timing.begin(frame, seconds); }
+        if let Some(timing) = &mut self.gpu_timing {
+            timing.begin(frame, seconds);
+        }
     }
     fn end_application_gpu_timing(&mut self) {
-        if let Some(timing) = &mut self.gpu_timing { timing.end(); }
+        if let Some(timing) = &mut self.gpu_timing {
+            timing.end();
+        }
     }
     fn application_gpu_timing(&mut self, frames_ago: u32) -> Option<ApplicationGpuTiming> {
-        self.gpu_timing.as_mut().and_then(|timing| timing.sample(frames_ago))
+        self.gpu_timing
+            .as_mut()
+            .and_then(|timing| timing.sample(frames_ago))
     }
 
     fn get_texture(texture: &vr::Texture_t) -> Option<Self::OpenVrTexture> {
@@ -529,10 +537,17 @@ impl VulkanData {
             gpu_timing: None,
         };
         if backend.gpu_timing_requested {
-            backend.gpu_timing = unsafe { VulkanGpuTiming::new(&backend.instance,
-                backend.physical_device, &backend.device, backend.queue, backend.queue_family_index) }
-                .inspect_err(|error| warn!("Vulkan application GPU timing unavailable: {error}"))
-                .ok();
+            backend.gpu_timing = unsafe {
+                VulkanGpuTiming::new(
+                    &backend.instance,
+                    backend.physical_device,
+                    &backend.device,
+                    backend.queue,
+                    backend.queue_family_index,
+                )
+            }
+            .inspect_err(|error| warn!("Vulkan application GPU timing unavailable: {error}"))
+            .ok();
         }
         backend
     }
@@ -562,7 +577,11 @@ impl VulkanData {
                         .flags(inst_flags)
                         .application_info(
                             &vk::ApplicationInfo::default()
-                                .api_version(if cfg!(target_os = "macos") { vk::API_VERSION_1_2 } else { vk::API_VERSION_1_0 })
+                                .api_version(if cfg!(target_os = "macos") {
+                                    vk::API_VERSION_1_2
+                                } else {
+                                    vk::API_VERSION_1_0
+                                })
                                 .application_name(c"XRizer temporary session"),
                         )
                         .enabled_extension_names(&inst_exts),
@@ -591,12 +610,20 @@ impl VulkanData {
         #[cfg(not(target_os = "macos"))]
         let timeline_handoff = false;
         if timeline_handoff {
-            let supported = unsafe { instance.enumerate_device_extension_properties(physical_device) }
-                .expect("Could not query timeline extension support");
-            assert!(supported.iter().any(|ext| unsafe {
-                std::ffi::CStr::from_ptr(ext.extension_name.as_ptr()) == ash::khr::timeline_semaphore::NAME
-            }), "Timeline handoff requires VK_KHR_timeline_semaphore");
-            if !dev_exts.iter().any(|ext| ext.as_c_str() == ash::khr::timeline_semaphore::NAME) {
+            let supported =
+                unsafe { instance.enumerate_device_extension_properties(physical_device) }
+                    .expect("Could not query timeline extension support");
+            assert!(
+                supported.iter().any(|ext| unsafe {
+                    std::ffi::CStr::from_ptr(ext.extension_name.as_ptr())
+                        == ash::khr::timeline_semaphore::NAME
+                }),
+                "Timeline handoff requires VK_KHR_timeline_semaphore"
+            );
+            if !dev_exts
+                .iter()
+                .any(|ext| ext.as_c_str() == ash::khr::timeline_semaphore::NAME)
+            {
                 dev_exts.push(ash::khr::timeline_semaphore::NAME.to_owned());
             }
         }
@@ -618,9 +645,14 @@ impl VulkanData {
         if timeline_handoff {
             let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut timeline);
             unsafe { instance.get_physical_device_features2(physical_device, &mut features) };
-            assert_eq!(timeline.timeline_semaphore, vk::TRUE,
-                "Timeline handoff requires supported timeline semaphores");
-            log::info!("Vulkan temporary device: supported timelineSemaphore enabled for explicit handoff profile");
+            assert_eq!(
+                timeline.timeline_semaphore,
+                vk::TRUE,
+                "Timeline handoff requires supported timeline semaphores"
+            );
+            log::info!(
+                "Vulkan temporary device: supported timelineSemaphore enabled for explicit handoff profile"
+            );
         }
         let mut device_info = vk::DeviceCreateInfo::default();
         if timeline_handoff {
@@ -840,8 +872,8 @@ impl PipelineData {
             .depth_bias_enable(false);
         // Ash defaults this required bitmask to zero, which is not a sample count.
         // Match the attachments in the render pass above.
-        let multi_state = vk::PipelineMultisampleStateCreateInfo::default()
-            .rasterization_samples(samples);
+        let multi_state =
+            vk::PipelineMultisampleStateCreateInfo::default().rasterization_samples(samples);
         let depth_state = vk::PipelineDepthStencilStateCreateInfo::default();
         let blend = vk::PipelineColorBlendAttachmentState {
             blend_enable: vk::FALSE,

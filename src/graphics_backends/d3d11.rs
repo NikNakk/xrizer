@@ -4,29 +4,26 @@ use openxr as xr;
 
 #[cfg(target_os = "windows")]
 mod platform {
-    use super::*;
     use super::super::d3d11_stage::StageRenderer;
+    use super::*;
     use std::ffi::c_void;
     use std::mem::ManuallyDrop;
     use std::sync::atomic::{AtomicU32, Ordering};
     use windows::Win32::Foundation::HMODULE;
-    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
     use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
     use windows::Win32::Graphics::Direct3D11::{
         D3D11_BOX, D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_FLAG, D3D11_MAP_READ,
-        D3D11_MAPPED_SUBRESOURCE, D3D11_RENDER_TARGET_VIEW_DESC,
-        D3D11_RENDER_TARGET_VIEW_DESC_0, D3D11_RTV_DIMENSION_TEXTURE2D,
-        D3D11_SDK_VERSION, D3D11_TEX2D_RTV, D3D11_TEXTURE2D_DESC,
-        D3D11_USAGE_STAGING, D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext,
-        ID3D11Texture2D,
+        D3D11_MAPPED_SUBRESOURCE, D3D11_RENDER_TARGET_VIEW_DESC, D3D11_RENDER_TARGET_VIEW_DESC_0,
+        D3D11_RTV_DIMENSION_TEXTURE2D, D3D11_SDK_VERSION, D3D11_TEX2D_RTV, D3D11_TEXTURE2D_DESC,
+        D3D11_USAGE_STAGING, D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
     };
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
     use windows::core::Interface;
 
     static COPY_DIAGNOSTIC_COUNT: AtomicU32 = AtomicU32::new(0);
 
     fn env_enabled(name: &str) -> bool {
-        std::env::var(name)
-            .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+        std::env::var(name).is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
     }
 
     pub struct D3D11Data {
@@ -314,7 +311,10 @@ mod platform {
             _submit_flags: vr::EVRSubmitFlags,
         ) -> xr::Extent2Di {
             let Some(&dst) = self.images.get(image_index) else {
-                return xr::Extent2Di { width: 0, height: 0 };
+                return xr::Extent2Di {
+                    width: 0,
+                    height: 0,
+                };
             };
 
             let src_desc = Self::texture_desc(texture);
@@ -436,14 +436,9 @@ mod platform {
             }
 
             if env_enabled("XRIZER_D3D11_CPU_COPY") {
-                if let Err(err) = self.cpu_copy_region(
-                    &src,
-                    &src_desc,
-                    &src_box,
-                    &dst,
-                    eye as u32,
-                    extent,
-                ) {
+                if let Err(err) =
+                    self.cpu_copy_region(&src, &src_desc, &src_box, &dst, eye as u32, extent)
+                {
                     log::warn!("D3D11 CPU-copy diagnostic failed: {err}");
                 }
             } else {
@@ -500,7 +495,10 @@ mod platform {
             image_index: usize,
         ) -> xr::Extent2Di {
             let Some(&dst) = self.images.get(image_index) else {
-                return xr::Extent2Di { width: 0, height: 0 };
+                return xr::Extent2Di {
+                    width: 0,
+                    height: 0,
+                };
             };
 
             let src_desc = Self::texture_desc(texture);
@@ -536,7 +534,9 @@ mod platform {
             extent: xr::Extent2Di,
         ) -> Result<(), String> {
             let Some(&dst) = self.images.get(image_index) else {
-                return Err(format!("stage swapchain image index {image_index} is unavailable"));
+                return Err(format!(
+                    "stage swapchain image index {image_index} is unavailable"
+                ));
             };
             let dst = Self::borrow_texture(dst as *mut c_void);
 

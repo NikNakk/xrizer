@@ -120,63 +120,63 @@ impl StageAsset {
                     .find_map(|material| material.diffuse_texture.clone())
             });
 
-        let (texture_rgba, texture_width, texture_height) =
-            if let Some(texture_name) = texture_name {
-                let texture_path = path
-                    .parent()
-                    .unwrap_or_else(|| Path::new("."))
-                    .join(texture_name);
+        let (texture_rgba, texture_width, texture_height) = if let Some(texture_name) = texture_name
+        {
+            let texture_path = path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(texture_name);
 
-                // Alyx's diorama MTLs name PNG textures, while current game depots
-                // ship the corresponding baked textures as DDS files. SteamVR accepts
-                // those stage assets transparently, so mirror that behaviour here.
-                let mut candidates = vec![texture_path.clone()];
-                for extension in ["dds", "png", "tga"] {
-                    let candidate = texture_path.with_extension(extension);
-                    if !candidates.contains(&candidate) {
-                        candidates.push(candidate);
-                    }
+            // Alyx's diorama MTLs name PNG textures, while current game depots
+            // ship the corresponding baked textures as DDS files. SteamVR accepts
+            // those stage assets transparently, so mirror that behaviour here.
+            let mut candidates = vec![texture_path.clone()];
+            for extension in ["dds", "png", "tga"] {
+                let candidate = texture_path.with_extension(extension);
+                if !candidates.contains(&candidate) {
+                    candidates.push(candidate);
                 }
+            }
 
-                let mut errors = Vec::new();
-                let mut loaded = None;
-                for candidate in candidates {
-                    match load_stage_texture(&candidate) {
-                        Ok((rgba, width, height)) => {
-                            if candidate != texture_path {
-                                log::info!(
-                                    "stage texture {:?} is unavailable; using {:?}",
-                                    texture_path,
-                                    candidate
-                                );
-                            }
-                            loaded = Some((candidate, rgba, width, height));
-                            break;
+            let mut errors = Vec::new();
+            let mut loaded = None;
+            for candidate in candidates {
+                match load_stage_texture(&candidate) {
+                    Ok((rgba, width, height)) => {
+                        if candidate != texture_path {
+                            log::info!(
+                                "stage texture {:?} is unavailable; using {:?}",
+                                texture_path,
+                                candidate
+                            );
                         }
-                        Err(error) => errors.push(format!("{candidate:?}: {error}")),
+                        loaded = Some((candidate, rgba, width, height));
+                        break;
                     }
+                    Err(error) => errors.push(format!("{candidate:?}: {error}")),
                 }
+            }
 
-                if let Some((loaded_path, rgba, width, height)) = loaded {
-                    log::info!(
-                        "loaded stage texture {:?}: {}x{} RGBA",
-                        loaded_path,
-                        width,
-                        height
-                    );
-                    (rgba, width, height)
-                } else {
-                    log::warn!(
-                        "stage texture {:?} could not be decoded; tried {}. Using white compatibility texture",
-                        texture_path,
-                        errors.join("; ")
-                    );
-                    (vec![255, 255, 255, 255], 1, 1)
-                }
+            if let Some((loaded_path, rgba, width, height)) = loaded {
+                log::info!(
+                    "loaded stage texture {:?}: {}x{} RGBA",
+                    loaded_path,
+                    width,
+                    height
+                );
+                (rgba, width, height)
             } else {
-                log::warn!("stage OBJ {:?} has no diffuse texture; using white", path);
+                log::warn!(
+                    "stage texture {:?} could not be decoded; tried {}. Using white compatibility texture",
+                    texture_path,
+                    errors.join("; ")
+                );
                 (vec![255, 255, 255, 255], 1, 1)
-            };
+            }
+        } else {
+            log::warn!("stage OBJ {:?} has no diffuse texture; using white", path);
+            (vec![255, 255, 255, 255], 1, 1)
+        };
 
         Ok(Self {
             id: NEXT_STAGE_ID.fetch_add(1, Ordering::Relaxed),
@@ -244,7 +244,6 @@ fn load_dds_texture(path: &Path) -> Result<(Vec<u8>, u32, u32), String> {
     );
     Ok((rgba, size.width, size.height))
 }
-
 
 pub fn mat4_from_hmd34(matrix: &openvr::HmdMatrix34_t) -> Mat4 {
     Mat4::from_cols(

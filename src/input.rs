@@ -37,6 +37,7 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard};
+use std::time::{Duration, Instant};
 
 new_key_type! {
     struct InputSourceKey;
@@ -62,6 +63,7 @@ pub struct Input<C: openxr_data::Compositor> {
     subaction_paths: SubactionPaths,
     events: Mutex<VecDeque<InputEvent>>,
     alyx_diagnostic_markers: Mutex<HashSet<String>>,
+    alyx_diagnostic_last_sample: Mutex<HashMap<String, Instant>>,
     loading_actions: AtomicBool,
 }
 
@@ -137,6 +139,7 @@ impl<C: openxr_data::Compositor> Input<C> {
             subaction_paths,
             events: Mutex::default(),
             alyx_diagnostic_markers: Mutex::default(),
+            alyx_diagnostic_last_sample: Mutex::default(),
             loading_actions: false.into(),
         };
 
@@ -172,6 +175,24 @@ impl<C: openxr_data::Compositor> Input<C> {
                 .lock()
                 .unwrap()
                 .insert(marker.into())
+    }
+
+    fn alyx_diagnostic_sample(&self, key: &str) -> bool {
+        if !self.alyx_input_diagnostics_enabled() {
+            return false;
+        }
+
+        let now = Instant::now();
+        let mut samples = self.alyx_diagnostic_last_sample.lock().unwrap();
+
+        if let Some(last) = samples.get(key) {
+            if now.duration_since(*last) < Duration::from_millis(100) {
+                return false;
+            }
+        }
+
+        samples.insert(key.to_owned(), now);
+        true
     }
 
     fn action_path(&self, action: vr::VRActionHandle_t) -> String {
@@ -299,8 +320,7 @@ impl<C: openxr_data::Compositor> Input<C> {
             return None;
         };
 
-        let interaction_profile =
-            self.effective_interaction_profile(&session, subaction)?;
+        let interaction_profile = self.effective_interaction_profile(&session, subaction)?;
         let bindings = loaded_actions
             .try_get_bindings(action, interaction_profile)
             .ok()?;
@@ -454,11 +474,7 @@ impl<C: openxr_data::Compositor> vr::IVRInput011_Interface for Input<C> {
             return vr::EVRInputError::BufferTooSmall;
         }
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                value.as_ptr().cast::<c_char>(),
-                variant,
-                value.len(),
-            );
+            std::ptr::copy_nonoverlapping(value.as_ptr().cast::<c_char>(), variant, value.len());
         }
         vr::EVRInputError::None
     }
@@ -730,13 +746,15 @@ impl<C: openxr_data::Compositor> vr::IVRInput011_Interface for Input<C> {
         self.get_bone_summary_from_hand_tracking(&session_data, summary_type, data, *hand);
 
         let action_path = self.action_path(action_handle);
-        if self.alyx_diagnostic_once(format!("skeletal-summary:{action_path}")) {
+
+        if self.alyx_diagnostic_sample(&format!("summary:{action_path}")) {
             info!(
-                "[alyx-input] skeletal-summary action={action_path} hand={hand:?} type={summary_type:?} curls={:?} splays={:?}",
-                data.flFingerCurl, data.flFingerSplay
+                "[alyx-input] skeletal-sample \
+                action={action_path} hand={hand:?} \
+                type={summary_type:?} curls={:?} splays={:?}",
+                data.flFingerCurl, data.flFingerSplay,
             );
         }
-
         vr::EVRInputError::None
     }
     fn GetSkeletalBoneData(
@@ -898,11 +916,12 @@ impl<C: openxr_data::Compositor> vr::IVRInput011_Interface for Input<C> {
             std::ptr::addr_of_mut!((*action_data).activeOrigin).write(origin);
         }
         let action_path = self.action_path(action);
-        if self.alyx_diagnostic_once(format!("skeletal-action:{action_path}")) {
-            let index = self.get_controller_device_index(hand);
+
+        if self.alyx_diagnostic_sample(&format!("skeletal-active:{action_path}")) {
             info!(
-                "[alyx-input] skeletal-action action={action_path} hand={hand:?} device={index:?} active={active} active_origin={origin} tracking_level={:?}",
-                vr::EVRSkeletalTrackingLevel::Partial
+                "[alyx-input] skeletal-state \
+                action={action_path} hand={hand:?} \
+                active={active} origin={origin}"
             );
         }
         vr::EVRInputError::None
@@ -1218,6 +1237,24 @@ impl<C: openxr_data::Compositor> vr::IVRInput011_Interface for Input<C> {
             ..Default::default()
         };
 
+        if self.alyx_input_diagnostics_enabled() {
+            let action_path = self.action_path(handle);
+            let path_lower = action_path.to_ascii_lowercase();
+
+            if path_lower.ends_with("/handcurl") || path_lower.ends_with("/triggerpull") {
+                let key = format!("analog:{action_path}:{restrict_to_device}");
+
+                if self.alyx_diagnostic_sample(&key) {
+                    info!(
+                        "[alyx-input] analog-sample \
+                        action={action_path} restrict={restrict_to_device} \
+                        active={} value={:.3} delta={:.3} origin={active_hand}",
+                        state.is_active, state.current_state.x, delta.x,
+                    );
+                }
+            }
+        }
+
         vr::EVRInputError::None
     }
 
@@ -1274,8 +1311,7 @@ impl<C: openxr_data::Compositor> vr::IVRInput011_Interface for Input<C> {
             let action_path = self.action_path(handle);
             info!(
                 "[alyx-input] digital-edge action={action_path} restrict={restrict_to_device} active={} state={} origin={active_hand}",
-                state.is_active,
-                state.current_state,
+                state.is_active, state.current_state,
             );
         }
 
@@ -1726,13 +1762,12 @@ impl<C: openxr_data::Compositor> Input<C> {
                 .session
                 .current_interaction_profile(subaction_path)
                 .unwrap();
-            let profile_path = if runtime_profile_path == xr::Path::NULL
-                && self.fake_controllers_enabled()
-            {
-                self.fake_controller_profile_path()
-            } else {
-                runtime_profile_path
-            };
+            let profile_path =
+                if runtime_profile_path == xr::Path::NULL && self.fake_controllers_enabled() {
+                    self.fake_controller_profile_path()
+                } else {
+                    runtime_profile_path
+                };
 
             if let Some(controller) = controller.as_mut() {
                 controller.profile_path = profile_path;
@@ -1924,9 +1959,12 @@ impl<C: openxr_data::Compositor> Input<C> {
                 *pose_data.gaze_space.write().unwrap() = Some(space);
             }
             let guard = pose_data.gaze_space.read().unwrap();
-            let location = guard.as_ref()?.locate(&session_data.view_space, time).ok()?;
-            let wanted =
-                xr::SpaceLocationFlags::ORIENTATION_VALID | xr::SpaceLocationFlags::ORIENTATION_TRACKED;
+            let location = guard
+                .as_ref()?
+                .locate(&session_data.view_space, time)
+                .ok()?;
+            let wanted = xr::SpaceLocationFlags::ORIENTATION_VALID
+                | xr::SpaceLocationFlags::ORIENTATION_TRACKED;
             location
                 .location_flags
                 .contains(wanted)
@@ -2013,9 +2051,7 @@ impl<C: openxr_data::Compositor> Input<C> {
         if let Some(event) = self.events.lock().unwrap().pop_front() {
             trace!(
                 "[alyx-event] delivering event={:?} device={} size={}",
-                event.ty,
-                event.index,
-                size
+                event.ty, event.index, size
             );
             const MIN_CONTROLLER_EVENT_SIZE: usize = std::mem::offset_of!(vr::VREvent_t, data)
                 + std::mem::size_of::<vr::VREvent_Controller_t>();
@@ -2137,8 +2173,10 @@ impl PoseData {
                 let profile =
                     instance.string_to_path("/interaction_profiles/ext/eye_gaze_interaction")?;
                 let pose = instance.string_to_path("/user/eyes_ext/input/gaze_ext/pose")?;
-                instance
-                    .suggest_interaction_profile_bindings(profile, &[xr::Binding::new(&gaze, pose)])?;
+                instance.suggest_interaction_profile_bindings(
+                    profile,
+                    &[xr::Binding::new(&gaze, pose)],
+                )?;
                 Ok(gaze)
             })
             .and_then(|r| {

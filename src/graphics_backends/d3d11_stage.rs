@@ -2,11 +2,9 @@ use crate::stage::{StageAsset, StageVertex, projection_matrix, view_matrix};
 use openxr as xr;
 use std::ffi::c_void;
 use std::mem::size_of;
+use windows::Win32::Graphics::Direct3D::Fxc::{D3DCOMPILE_ENABLE_STRICTNESS, D3DCompile};
 use windows::Win32::Graphics::Direct3D::{
     D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, ID3DBlob, ID3DInclude,
-};
-use windows::Win32::Graphics::Direct3D::Fxc::{
-    D3DCOMPILE_ENABLE_STRICTNESS, D3DCompile,
 };
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -110,10 +108,18 @@ impl StageRenderer {
         let mut pixel_shader = None;
         unsafe {
             device
-                .CreateVertexShader(vs_bytes, None::<&ID3D11ClassLinkage>, Some(&mut vertex_shader))
+                .CreateVertexShader(
+                    vs_bytes,
+                    None::<&ID3D11ClassLinkage>,
+                    Some(&mut vertex_shader),
+                )
                 .map_err(|e| format!("CreateVertexShader failed: {e}"))?;
             device
-                .CreatePixelShader(ps_bytes, None::<&ID3D11ClassLinkage>, Some(&mut pixel_shader))
+                .CreatePixelShader(
+                    ps_bytes,
+                    None::<&ID3D11ClassLinkage>,
+                    Some(&mut pixel_shader),
+                )
                 .map_err(|e| format!("CreatePixelShader failed: {e}"))?;
         }
 
@@ -176,7 +182,10 @@ impl StageRenderer {
             MipLevels: 1,
             ArraySize: 1,
             Format: DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
             Usage: D3D11_USAGE_IMMUTABLE,
             BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
             ..Default::default()
@@ -373,12 +382,7 @@ impl StageRenderer {
                 context.OMSetRenderTargets(Some(&[Some(rtv.clone())]), self.depth_view.as_ref());
                 context.ClearRenderTargetView(&rtv, &stage.settings.secondary_color);
                 if let Some(depth_view) = self.depth_view.as_ref() {
-                    context.ClearDepthStencilView(
-                        depth_view,
-                        D3D11_CLEAR_DEPTH.0 as u32,
-                        1.0,
-                        0,
-                    );
+                    context.ClearDepthStencilView(depth_view, D3D11_CLEAR_DEPTH.0 as u32, 1.0, 0);
                 }
                 context.DrawIndexed(self.index_count, 0, 0);
             }
@@ -410,7 +414,10 @@ impl StageRenderer {
             MipLevels: 1,
             ArraySize: 1,
             Format: DXGI_FORMAT_D32_FLOAT,
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
             Usage: D3D11_USAGE_DEFAULT,
             BindFlags: D3D11_BIND_DEPTH_STENCIL.0 as u32,
             ..Default::default()
@@ -515,10 +522,5 @@ fn blob_string(blob: &ID3DBlob) -> String {
 }
 
 fn bytes_of_slice<T>(slice: &[T]) -> &[u8] {
-    unsafe {
-        std::slice::from_raw_parts(
-            slice.as_ptr() as *const u8,
-            std::mem::size_of_val(slice),
-        )
-    }
+    unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u8, std::mem::size_of_val(slice)) }
 }
