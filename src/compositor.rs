@@ -107,8 +107,10 @@ impl Compositor {
             ctrl.backend.begin_application_gpu_timing(frame, seconds);
         }
         if let Some(ctrl) = session_data.comp_data.0.lock().unwrap().as_mut() {
-            ctrl.with_any_graphics_mut::<begin>((self.metrics.index.load(Ordering::Relaxed),
-                self.metrics.system_start.elapsed().as_secs_f64()));
+            ctrl.with_any_graphics_mut::<begin>((
+                self.metrics.index.load(Ordering::Relaxed),
+                self.metrics.system_start.elapsed().as_secs_f64(),
+            ));
         }
     }
 
@@ -745,16 +747,25 @@ impl vr::IVRCompositor029_Interface for Compositor {
             return false;
         }
         #[macros::any_graphics(DynFrameController)]
-        fn measured<G: GraphicsBackend>(ctrl: &mut FrameController<G>, frames_ago: u32)
-            -> (bool, Option<crate::graphics_backends::ApplicationGpuTiming>) {
-            (ctrl.backend.gpu_timing_requested(), ctrl.backend.application_gpu_timing(frames_ago))
+        fn measured<G: GraphicsBackend>(
+            ctrl: &mut FrameController<G>,
+            frames_ago: u32,
+        ) -> (bool, Option<crate::graphics_backends::ApplicationGpuTiming>) {
+            (
+                ctrl.backend.gpu_timing_requested(),
+                ctrl.backend.application_gpu_timing(frames_ago),
+            )
         }
         let session_data = self.openxr.session_data.get();
         let mut lock = session_data.comp_data.0.lock().unwrap();
-        let (requested, sample) = lock.as_mut().map(|ctrl| ctrl.with_any_graphics_mut::<measured>(frames_ago))
+        let (requested, sample) = lock
+            .as_mut()
+            .map(|ctrl| ctrl.with_any_graphics_mut::<measured>(frames_ago))
             .unwrap_or((false, None));
         if requested {
-            let Some(sample) = sample else { return false; };
+            let Some(sample) = sample else {
+                return false;
+            };
             // Match the Wine branch's validity policy and zero unknown costs.
             // Total is the measured application interval only: OpenXR exposes
             // no compositor GPU or application post-submit measurement here.
@@ -767,13 +778,18 @@ impl vr::IVRCompositor029_Interface for Compositor {
             frame.m_flTotalRenderGpuMs = sample.pre_submit_gpu_ms;
             static REPORTS: AtomicU32 = AtomicU32::new(0);
             if REPORTS.fetch_add(1, Ordering::Relaxed).is_multiple_of(120) {
-                info!("OpenVR measured timing returned: frame={}, pre_submit_gpu_ms={:.3}, total_application_gpu_ms={:.3}",
-                    sample.frame, sample.pre_submit_gpu_ms, sample.pre_submit_gpu_ms);
+                info!(
+                    "OpenVR measured timing returned: frame={}, pre_submit_gpu_ms={:.3}, total_application_gpu_ms={:.3}",
+                    sample.frame, sample.pre_submit_gpu_ms, sample.pre_submit_gpu_ms
+                );
             }
             // Same bounded known-prefix copy used by the Wine timing code.
             unsafe {
-                std::ptr::copy_nonoverlapping((&frame as *const vr::Compositor_FrameTiming).cast::<u8>(),
-                    timing.cast::<u8>(), size.min(std::mem::size_of_val(&frame)));
+                std::ptr::copy_nonoverlapping(
+                    (&frame as *const vr::Compositor_FrameTiming).cast::<u8>(),
+                    timing.cast::<u8>(),
+                    size.min(std::mem::size_of_val(&frame)),
+                );
                 (&raw mut (*timing).m_nSize).write_unaligned(size as u32);
             }
             return true;
@@ -824,7 +840,8 @@ impl vr::IVRCompositor029_Interface for Compositor {
         true
     }
     fn PostPresentHandoff(&self) {
-        let _api_trace = crate::api_trace::Span::new("handoff", self.metrics.index.load(Ordering::Relaxed), -1);
+        let _api_trace =
+            crate::api_trace::Span::new("handoff", self.metrics.index.load(Ordering::Relaxed), -1);
         #[macros::any_graphics(DynFrameController)]
         fn end_frame<G: GraphicsBackend + 'static>(
             ctrl: &mut FrameController<G>,
@@ -916,7 +933,11 @@ impl vr::IVRCompositor029_Interface for Compositor {
         bounds: *const vr::VRTextureBounds_t,
         submit_flags: vr::EVRSubmitFlags,
     ) -> vr::EVRCompositorError {
-        let _api_trace = crate::api_trace::Span::new("submit", self.metrics.index.load(Ordering::Relaxed), eye as i32);
+        let _api_trace = crate::api_trace::Span::new(
+            "submit",
+            self.metrics.index.load(Ordering::Relaxed),
+            eye as i32,
+        );
         let bounds = unsafe { bounds.as_ref() }
             .copied()
             .unwrap_or(vr::VRTextureBounds_t {
@@ -1076,7 +1097,11 @@ impl vr::IVRCompositor029_Interface for Compositor {
         game_pose_array: *mut vr::TrackedDevicePose_t,
         game_pose_count: u32,
     ) -> vr::EVRCompositorError {
-        let _api_trace = crate::api_trace::Span::new("wait_poses", self.metrics.index.load(Ordering::Relaxed), -1);
+        let _api_trace = crate::api_trace::Span::new(
+            "wait_poses",
+            self.metrics.index.load(Ordering::Relaxed),
+            -1,
+        );
         tracy_span!("WaitGetPoses impl");
         trace!(
             "[alyx-comp] WaitGetPoses render_poses={} game_poses={} frame_state={:?} timing={:?} stage_active={}",
@@ -1378,7 +1403,9 @@ impl<G: GraphicsBackend> FrameController<G> {
 
         self.image_index = {
             let _api_trace = crate::api_trace::Span::new("xr_acquire_image", u32::MAX, -1);
-            swapchain.acquire_image().expect("Failed to acquire swapchain image") as usize
+            swapchain
+                .acquire_image()
+                .expect("Failed to acquire swapchain image") as usize
         };
 
         trace!("waiting image");
@@ -1460,7 +1487,10 @@ impl<G: GraphicsBackend> FrameController<G> {
             self.app_suspend_render,
             self.app_fade_grid,
             self.image_acquired,
-            self.eyes_submitted.iter().map(Option::is_some).collect::<Vec<_>>()
+            self.eyes_submitted
+                .iter()
+                .map(Option::is_some)
+                .collect::<Vec<_>>()
         );
 
         // No Man's Sky does this.
@@ -1511,7 +1541,10 @@ impl<G: GraphicsBackend> FrameController<G> {
 
         trace!(
             "[alyx-comp] submitted eye={eye:?} eye_ready={:?} projection_copy_enabled={}",
-            self.eyes_submitted.iter().map(Option::is_some).collect::<Vec<_>>(),
+            self.eyes_submitted
+                .iter()
+                .map(Option::is_some)
+                .collect::<Vec<_>>(),
             self.should_render && !self.app_suspend_render
         );
         if self.eyes_submitted.iter().all(|eye| eye.is_some()) && !self.app_suspend_render {
@@ -1551,7 +1584,10 @@ impl<G: GraphicsBackend> FrameController<G> {
             self.app_suspend_render,
             self.app_fade_grid,
             stage.is_some(),
-            self.eyes_submitted.iter().map(Option::is_some).collect::<Vec<_>>(),
+            self.eyes_submitted
+                .iter()
+                .map(Option::is_some)
+                .collect::<Vec<_>>(),
             self.submitting_null,
             self.image_acquired
         );
@@ -1573,9 +1609,8 @@ impl<G: GraphicsBackend> FrameController<G> {
             && !self.app_suspend_render
             && !self.submitting_null
             && self.eyes_submitted.iter().all(|eye| eye.is_some());
-        let prefer_application_projection =
-            std::env::var("XRIZER_PREFER_APPLICATION_PROJECTION")
-                .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"));
+        let prefer_application_projection = std::env::var("XRIZER_PREFER_APPLICATION_PROJECTION")
+            .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"));
         let bypass_stage = prefer_application_projection
             && application_projection_ready
             && stage.is_some()
@@ -1593,7 +1628,9 @@ impl<G: GraphicsBackend> FrameController<G> {
             && !bypass_stage;
         let supports_stage = self.backend.supports_stage_rendering();
         if stage_requested && !supports_stage && !self.unsupported_stage_logged {
-            warn!("stage overrides are unsupported by this graphics backend; retaining application/skybox layers");
+            warn!(
+                "stage overrides are unsupported by this graphics backend; retaining application/skybox layers"
+            );
             self.unsupported_stage_logged = true;
         }
         let stage_requested = stage_requested && supports_stage;
@@ -1659,12 +1696,10 @@ impl<G: GraphicsBackend> FrameController<G> {
                     height: recommended_height as i32,
                 };
 
-                match self.backend.render_stage(
-                    stage,
-                    &views,
-                    self.image_index,
-                    extent,
-                ) {
+                match self
+                    .backend
+                    .render_stage(stage, &views, self.image_index, extent)
+                {
                     Ok(()) => {
                         if self.image_acquired {
                             self.swapchain_data
@@ -1692,8 +1727,7 @@ impl<G: GraphicsBackend> FrameController<G> {
                                     } else {
                                         xr::Quaternionf::IDENTITY
                                     },
-                                    position: if flags
-                                        .contains(xr::ViewStateFlags::POSITION_VALID)
+                                    position: if flags.contains(xr::ViewStateFlags::POSITION_VALID)
                                     {
                                         view.pose.position
                                     } else {
@@ -1736,8 +1770,8 @@ impl<G: GraphicsBackend> FrameController<G> {
 
         // A stage attempt can recreate the swapchain and clear the eyes.
         // Never use the pre-attempt readiness to index those discarded images.
-        let application_projection_ready = application_projection_ready
-            && self.eyes_submitted.iter().all(Option::is_some);
+        let application_projection_ready =
+            application_projection_ready && self.eyes_submitted.iter().all(Option::is_some);
         if !stage_rendered && application_projection_ready {
             let swapchain_data = self
                 .swapchain_data
@@ -1793,7 +1827,11 @@ impl<G: GraphicsBackend> FrameController<G> {
         if !proj_layer_views.is_empty() {
             trace!(
                 "{} projection layer present",
-                if stage_rendered { "stage" } else { "application" }
+                if stage_rendered {
+                    "stage"
+                } else {
+                    "application"
+                }
             );
             proj_layer = Some(
                 xr::CompositionLayerProjection::new()
@@ -1809,9 +1847,8 @@ impl<G: GraphicsBackend> FrameController<G> {
 
         let overlay_layers;
         if let Some(overlay_man) = overlays {
-            let hide_skybox_with_projection =
-                std::env::var("XRIZER_HIDE_SKYBOX_WITH_PROJECTION")
-                    .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"));
+            let hide_skybox_with_projection = std::env::var("XRIZER_HIDE_SKYBOX_WITH_PROJECTION")
+                .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"));
             // A stage override replaces SteamVR's grid/environment. Do not put the
             // equirect loading skybox in front of the stage projection.
             let render_skybox = self.app_fade_grid
@@ -1826,7 +1863,13 @@ impl<G: GraphicsBackend> FrameController<G> {
             "[alyx-comp] xrEndFrame layers={} projection={} projection_source={} app_projection_ready={} stage_requested={} stage_rendered={} suspended={} fade_grid={}",
             layers.len(),
             proj_layer.is_some(),
-            if stage_rendered { "stage" } else if proj_layer.is_some() { "application" } else { "none" },
+            if stage_rendered {
+                "stage"
+            } else if proj_layer.is_some() {
+                "application"
+            } else {
+                "none"
+            },
             application_projection_ready,
             stage_requested,
             stage_rendered,
@@ -1836,7 +1879,9 @@ impl<G: GraphicsBackend> FrameController<G> {
 
         {
             let _api_trace = crate::api_trace::Span::new("xr_end_frame", u32::MAX, -1);
-            self.stream.end(display_time, xr::EnvironmentBlendMode::OPAQUE, &layers).unwrap();
+            self.stream
+                .end(display_time, xr::EnvironmentBlendMode::OPAQUE, &layers)
+                .unwrap();
         }
 
         trace!("frame submitted");
@@ -1929,10 +1974,21 @@ mod tests {
     }
 
     impl GraphicsBackend for FakeGraphicsData {
-        fn gpu_timing_requested(&self) -> bool { GPU_REQUESTED.get() }
-        fn begin_application_gpu_timing(&mut self, _: u32, _: f64) { GPU_BEGINS.set(GPU_BEGINS.get()+1); }
-        fn end_application_gpu_timing(&mut self) { GPU_ENDS.set(GPU_ENDS.get()+1); }
-        fn application_gpu_timing(&mut self, _: u32) -> Option<crate::graphics_backends::ApplicationGpuTiming> { GPU_SAMPLE.get() }
+        fn gpu_timing_requested(&self) -> bool {
+            GPU_REQUESTED.get()
+        }
+        fn begin_application_gpu_timing(&mut self, _: u32, _: f64) {
+            GPU_BEGINS.set(GPU_BEGINS.get() + 1);
+        }
+        fn end_application_gpu_timing(&mut self) {
+            GPU_ENDS.set(GPU_ENDS.get() + 1);
+        }
+        fn application_gpu_timing(
+            &mut self,
+            _: u32,
+        ) -> Option<crate::graphics_backends::ApplicationGpuTiming> {
+            GPU_SAMPLE.get()
+        }
 
         fn supports_stage_rendering(&self) -> bool {
             STAGE_SUPPORTED.get()
@@ -2197,19 +2253,42 @@ mod tests {
         assert_eq!(f.submit(vr::EVREye::Left), None);
         assert_eq!(f.submit(vr::EVREye::Right), None);
         let data = f.comp.openxr.session_data.get();
-        let system = f.comp.system.force(|injector| System::new(f.comp.openxr.clone(), injector));
+        let system = f
+            .comp
+            .system
+            .force(|injector| System::new(f.comp.openxr.clone(), injector));
         let mut lock = data.comp_data.0.lock().unwrap();
-        let DynFrameController::Fake(ctrl) = lock.as_mut().unwrap() else { panic!("missing fake controller"); };
+        let DynFrameController::Fake(ctrl) = lock.as_mut().unwrap() else {
+            panic!("missing fake controller");
+        };
         ctrl.should_render = true;
         ctrl.app_fade_grid = true;
-        ctrl.eyes_submitted = [Some(SubmittedEye { extent: xr::Extent2Di { width: 40, height: 40 }, flip_vertically: false }); 2];
+        ctrl.eyes_submitted = [Some(SubmittedEye {
+            extent: xr::Extent2Di {
+                width: 40,
+                height: 40,
+            },
+            flip_vertically: false,
+        }); 2];
         let original = ctrl.swapchain_data.as_ref().unwrap().swapchain.as_raw();
         let stage = crate::stage::StageAsset {
-            id: 1, source_path: "regression-stage".into(), vertices: Vec::new(), indices: Vec::new(),
-            texture_rgba: vec![255; 4], texture_width: 1, texture_height: 1,
-            model_transform: glam::Mat4::IDENTITY, settings: crate::stage::StageSettings::default(),
+            id: 1,
+            source_path: "regression-stage".into(),
+            vertices: Vec::new(),
+            indices: Vec::new(),
+            texture_rgba: vec![255; 4],
+            texture_width: 1,
+            texture_height: 1,
+            model_transform: glam::Mat4::IDENTITY,
+            settings: crate::stage::StageSettings::default(),
         };
-        ctrl.end_frame(&data, &system, xr::Time::from_nanos(0), Option::None, Some(&stage));
+        ctrl.end_frame(
+            &data,
+            &system,
+            xr::Time::from_nanos(0),
+            Option::None,
+            Some(&stage),
+        );
         let current = ctrl.swapchain_data.as_ref().unwrap().swapchain.as_raw();
         if supported {
             assert_ne!(current, original);
@@ -2259,17 +2338,19 @@ mod tests {
         let f = Fixture::new();
         f.ensure_real_session(false);
         f.comp.PostPresentHandoff();
-        f.comp.SetExplicitTimingMode(vr::EVRCompositorTimingMode::Explicit_ApplicationPerformsPostPresentHandoff);
+        f.comp.SetExplicitTimingMode(
+            vr::EVRCompositorTimingMode::Explicit_ApplicationPerformsPostPresentHandoff,
+        );
         let before = GPU_BEGINS.get();
         assert_eq!(f.wait_get_poses(), None);
         assert_eq!(GPU_BEGINS.get(), before);
         assert_eq!(f.comp.SubmitExplicitTimingData(), None);
-        assert_eq!(GPU_BEGINS.get(), before+1);
+        assert_eq!(GPU_BEGINS.get(), before + 1);
         let ends = GPU_ENDS.get();
         assert_eq!(f.submit(vr::EVREye::Left), None);
         assert_eq!(GPU_ENDS.get(), ends);
         assert_eq!(f.submit(vr::EVREye::Right), None);
-        assert_eq!(GPU_ENDS.get(), ends+1);
+        assert_eq!(GPU_ENDS.get(), ends + 1);
     }
 
     #[test]
@@ -2284,20 +2365,27 @@ mod tests {
         record.m_nSize = std::mem::size_of_val(&record) as u32;
         assert!(!f.comp.GetFrameTiming(&mut record, 0));
         GPU_SAMPLE.set(Some(crate::graphics_backends::ApplicationGpuTiming {
-            frame: 42, system_seconds: 1.25, client_interval_ms: 22.2, pre_submit_gpu_ms: 17.75,
+            frame: 42,
+            system_seconds: 1.25,
+            client_interval_ms: 22.2,
+            pre_submit_gpu_ms: 17.75,
         }));
         assert!(f.comp.GetFrameTiming(&mut record, 0));
         assert_eq!(record.m_nFrameIndex, 42);
         assert_eq!(record.m_flPreSubmitGpuMs, 17.75);
         assert_eq!(record.m_flTotalRenderGpuMs, 17.75);
         assert_eq!(record.m_flCompositorRenderGpuMs, 0.0);
-        let size = offset_of!(vr::Compositor_FrameTiming, m_HmdPose) + size_of::<vr::TrackedDevicePose_t>();
+        let size = offset_of!(vr::Compositor_FrameTiming, m_HmdPose)
+            + size_of::<vr::TrackedDevicePose_t>();
         let words = (size + 32).div_ceil(8);
         let mut storage = vec![0xa5a5a5a5a5a5a5a5u64; words];
         let pointer = storage.as_mut_ptr().cast::<vr::Compositor_FrameTiming>();
-        unsafe { (&raw mut (*pointer).m_nSize).write(size as u32); }
+        unsafe {
+            (&raw mut (*pointer).m_nSize).write(size as u32);
+        }
         assert!(f.comp.GetFrameTiming(pointer, 0));
-        let bytes = unsafe { std::slice::from_raw_parts(storage.as_ptr().cast::<u8>(), storage.len()*8) };
+        let bytes =
+            unsafe { std::slice::from_raw_parts(storage.as_ptr().cast::<u8>(), storage.len() * 8) };
         assert!(bytes[size..].iter().all(|byte| *byte == 0xa5));
         GPU_SAMPLE.set(Option::None);
         GPU_REQUESTED.set(false);

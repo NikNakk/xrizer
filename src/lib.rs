@@ -410,9 +410,7 @@ pub extern "C" fn VR_GetVRInitErrorAsSymbol(error: vr::EVRInitError) -> *const c
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn VR_GetVRInitErrorAsEnglishDescription(
-    error: vr::EVRInitError,
-) -> *const c_char {
+pub extern "C" fn VR_GetVRInitErrorAsEnglishDescription(error: vr::EVRInitError) -> *const c_char {
     init_error_description(error).as_ptr()
 }
 

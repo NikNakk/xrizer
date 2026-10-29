@@ -543,8 +543,8 @@ impl SessionData {
         } else {
             #[cfg(target_os = "windows")]
             {
-                let d3d11 = D3D11Data::new_temporary()
-                    .expect("Failed to create temporary D3D11 device");
+                let d3d11 =
+                    D3D11Data::new_temporary().expect("Failed to create temporary D3D11 device");
                 temporary_info =
                     SessionCreateInfo::from_info::<xr::D3D11>(d3d11.session_create_info());
                 temp_d3d11 = Some(d3d11);
