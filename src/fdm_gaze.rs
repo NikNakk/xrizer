@@ -10,8 +10,8 @@
 use glam::{Quat, Vec3};
 use log::{info, warn};
 use openxr as xr;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 /// Whether gaze-centred density maps were requested.
 pub fn enabled() -> bool {
@@ -88,7 +88,7 @@ fn kk_set_gaze() -> Option<SetGaze> {
 
 #[cfg(target_os = "macos")]
 fn find_kk_set_gaze() -> Option<SetGaze> {
-    use std::ffi::{c_char, CStr};
+    use std::ffi::{CStr, c_char};
     unsafe extern "C" {
         fn _dyld_image_count() -> u32;
         fn _dyld_get_image_name(index: u32) -> *const c_char;
@@ -172,15 +172,19 @@ mod tests {
     fn straight_ahead_in_asymmetric_view_is_off_centre() {
         // PS VR2 left eye: wider to the left than to the right.
         let (x, _) = project(Vec3::NEG_Z, &view(-61.5, 43.5, 53.0, -53.0)).unwrap();
-        let expected = 61.5f32.to_radians().tan()
-            / (61.5f32.to_radians().tan() + 43.5f32.to_radians().tan());
+        let expected =
+            61.5f32.to_radians().tan() / (61.5f32.to_radians().tan() + 43.5f32.to_radians().tan());
         assert!((x - expected).abs() < 1e-5);
     }
 
     #[test]
     fn looking_right_and_up_moves_right_and_up() {
-        let d = Quat::from_euler(glam::EulerRot::YXZ, -20f32.to_radians(), 10f32.to_radians(), 0.0)
-            * Vec3::NEG_Z;
+        let d = Quat::from_euler(
+            glam::EulerRot::YXZ,
+            -20f32.to_radians(),
+            10f32.to_radians(),
+            0.0,
+        ) * Vec3::NEG_Z;
         let (x, y) = project(d, &view(-45.0, 45.0, 45.0, -45.0)).unwrap();
         assert!(x > 0.5 && y < 0.5);
     }

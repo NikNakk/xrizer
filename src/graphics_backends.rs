@@ -8,8 +8,8 @@ mod gl_stub;
 mod vulkan;
 mod vulkan_timing;
 
-use derive_more::{From, TryInto};
 pub use d3d11::D3D11Data;
+use derive_more::{From, TryInto};
 #[cfg(target_os = "linux")]
 pub use gl::GlData;
 #[cfg(not(target_os = "linux"))]
@@ -85,11 +85,14 @@ pub trait GraphicsBackend: Into<SupportedBackend> {
     }
 
     fn clear_stage(&mut self) {}
-    fn gpu_timing_requested(&self) -> bool { false }
+    fn gpu_timing_requested(&self) -> bool {
+        false
+    }
     fn begin_application_gpu_timing(&mut self, _frame: u32, _seconds: f64) {}
     fn end_application_gpu_timing(&mut self) {}
-    fn application_gpu_timing(&mut self, _frames_ago: u32) -> Option<ApplicationGpuTiming> { None }
-
+    fn application_gpu_timing(&mut self, _frames_ago: u32) -> Option<ApplicationGpuTiming> {
+        None
+    }
 }
 
 #[derive(macros::Backends, TryInto, From)]

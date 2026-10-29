@@ -1866,24 +1866,34 @@ extern "system" fn apply_haptic_feedback(
 
 // Stereo stage-fallback regression: deliberately differs from app swapchain size.
 extern "system" fn enumerate_view_configuration_views(
-    _instance: xr::Instance, _system: xr::SystemId, kind: xr::ViewConfigurationType,
-    capacity: u32, count: *mut u32, views: *mut xr::ViewConfigurationView,
+    _instance: xr::Instance,
+    _system: xr::SystemId,
+    kind: xr::ViewConfigurationType,
+    capacity: u32,
+    count: *mut u32,
+    views: *mut xr::ViewConfigurationView,
 ) -> xr::Result {
     if kind != xr::ViewConfigurationType::PRIMARY_STEREO {
         return xr::Result::ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED;
     }
-    unsafe { count.write(2); }
-    if capacity==0 { return xr::Result::SUCCESS; }
-    if capacity<2 { return xr::Result::ERROR_SIZE_INSUFFICIENT; }
+    unsafe {
+        count.write(2);
+    }
+    if capacity == 0 {
+        return xr::Result::SUCCESS;
+    }
+    if capacity < 2 {
+        return xr::Result::ERROR_SIZE_INSUFFICIENT;
+    }
     for i in 0..2 {
         unsafe {
-            let view=&mut *views.add(i);
-            view.recommended_image_rect_width=100;
-            view.recommended_image_rect_height=100;
-            view.max_image_rect_width=100;
-            view.max_image_rect_height=100;
-            view.recommended_swapchain_sample_count=1;
-            view.max_swapchain_sample_count=1;
+            let view = &mut *views.add(i);
+            view.recommended_image_rect_width = 100;
+            view.recommended_image_rect_height = 100;
+            view.max_image_rect_width = 100;
+            view.max_image_rect_height = 100;
+            view.recommended_swapchain_sample_count = 1;
+            view.max_swapchain_sample_count = 1;
         }
     }
     xr::Result::SUCCESS
