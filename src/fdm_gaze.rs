@@ -9,7 +9,8 @@
 //! Gaze is approximated as a head-space ray at infinity: combined OpenXR gaze
 //! does not supply independent per-eye fixation or convergence distances.
 //! `XRIZER_FAKE_GAZE=yaw,pitch` (degrees, right and up positive) replaces the
-//! eye tracker with a fixed direction, for testing without one.
+//! eye tracker with a fixed direction, for testing without one;
+//! `XRIZER_FAKE_GAZE=sweep:yaw,pitch,period_s` moves it continuously.
 
 use glam::{Quat, Vec3};
 use log::{info, warn};
@@ -28,19 +29,49 @@ pub fn enabled() -> bool {
     })
 }
 
-/// A fixed gaze direction in view space from `XRIZER_FAKE_GAZE`.
+/// A fake gaze direction in view space from `XRIZER_FAKE_GAZE`: either fixed
+/// `yaw,pitch`, or `sweep:yaw_amplitude,pitch_amplitude,period_seconds`, which
+/// moves the gaze along a Lissajous path (yaw at the period, pitch at 0.7x).
 pub fn fake_direction() -> Option<Vec3> {
-    static FAKE: OnceLock<Option<Vec3>> = OnceLock::new();
-    *FAKE.get_or_init(|| {
+    #[derive(Clone, Copy)]
+    enum Fake {
+        Fixed(f32, f32),
+        Sweep(f32, f32, f32, Instant),
+    }
+    static FAKE: OnceLock<Option<Fake>> = OnceLock::new();
+    let fake = (*FAKE.get_or_init(|| {
         let value = std::env::var("XRIZER_FAKE_GAZE").ok()?;
-        let mut parts = value.split(',').map(|p| p.trim().parse::<f32>());
-        let yaw = parts.next()?.ok()?.to_radians();
-        let pitch = parts.next()?.ok()?.to_radians();
-        if parts.next().is_some() || !yaw.is_finite() || !pitch.is_finite() {
+        let (sweep, rest) = match value.strip_prefix("sweep:") {
+            Some(rest) => (true, rest.to_owned()),
+            None => (false, value),
+        };
+        let parts: Vec<f32> = rest
+            .split(',')
+            .map(|p| p.trim().parse::<f32>())
+            .collect::<Result<_, _>>()
+            .ok()?;
+        if parts.iter().any(|v| !v.is_finite()) {
             return None;
         }
-        Some(Quat::from_euler(glam::EulerRot::YXZ, -yaw, pitch, 0.0) * Vec3::NEG_Z)
-    })
+        match (sweep, parts.as_slice()) {
+            (false, [yaw, pitch]) => Some(Fake::Fixed(yaw.to_radians(), pitch.to_radians())),
+            (true, [yaw, pitch, period]) if *period > 0.0 => Some(Fake::Sweep(
+                yaw.to_radians(),
+                pitch.to_radians(),
+                *period,
+                Instant::now(),
+            )),
+            _ => None,
+        }
+    }))?;
+    let (yaw, pitch) = match fake {
+        Fake::Fixed(yaw, pitch) => (yaw, pitch),
+        Fake::Sweep(yaw, pitch, period, start) => {
+            let phase = start.elapsed().as_secs_f32() / period * std::f32::consts::TAU;
+            (yaw * phase.sin(), pitch * (0.7 * phase).sin())
+        }
+    };
+    Some(Quat::from_euler(glam::EulerRot::YXZ, -yaw, pitch, 0.0) * Vec3::NEG_Z)
 }
 
 /// Direction the gaze pose looks along.
