@@ -1938,44 +1938,86 @@ impl<C: openxr_data::Compositor> Input<C> {
         }
     }
 
-    /// Projects the current eye gaze into each view and hands it to the driver
-    /// for gaze-centred density maps.
     pub fn update_fdm_gaze(&self, session_data: &SessionData, time: xr::Time) {
-        let Ok((_, views)) = session_data.session.locate_views(
-            xr::ViewConfigurationType::PRIMARY_STEREO,
-            time,
-            &session_data.view_space,
-        ) else {
-            return;
-        };
-
-        let direction = crate::fdm_gaze::fake_direction().or_else(|| {
-            let pose_data = session_data.input_data.pose_data.get()?;
-            let gaze = pose_data.gaze.as_ref()?;
-            if pose_data.gaze_space.read().unwrap().is_none() {
-                let space = gaze
-                    .create_space(&session_data.session, xr::Path::NULL, xr::Posef::IDENTITY)
-                    .ok()?;
-                *pose_data.gaze_space.write().unwrap() = Some(space);
+        *session_data.fdm_gaze.lock().unwrap() = None;
+        let invalid = [None, None];
+        let sample = (|| {
+            if matches!(
+                session_data.state,
+                xr::SessionState::STOPPING
+                    | xr::SessionState::LOSS_PENDING
+                    | xr::SessionState::EXITING
+            ) {
+                return None;
             }
-            let guard = pose_data.gaze_space.read().unwrap();
-            let location = guard
-                .as_ref()?
-                .locate(&session_data.view_space, time)
+            let (flags, views) = session_data
+                .session
+                .locate_views(
+                    xr::ViewConfigurationType::PRIMARY_STEREO,
+                    time,
+                    &session_data.view_space,
+                )
                 .ok()?;
-            let wanted = xr::SpaceLocationFlags::ORIENTATION_VALID
-                | xr::SpaceLocationFlags::ORIENTATION_TRACKED;
-            location
-                .location_flags
-                .contains(wanted)
-                .then(|| crate::fdm_gaze::pose_direction(&location.pose))
-        });
-
-        let points: Vec<_> = views
-            .iter()
-            .map(|view| direction.and_then(|d| crate::fdm_gaze::project(d, view)))
-            .collect();
-        crate::fdm_gaze::publish(&points);
+            if views.len() != 2 || !flags.contains(xr::ViewStateFlags::ORIENTATION_VALID) {
+                return None;
+            }
+            let direction = crate::fdm_gaze::fake_direction().or_else(|| {
+                let pose_data = session_data.input_data.pose_data.get()?;
+                let gaze = pose_data.gaze.as_ref()?;
+                if !gaze.is_active(&session_data.session, xr::Path::NULL).ok()? {
+                    return None;
+                }
+                let mut guard = pose_data.gaze_space.write().unwrap();
+                if guard.is_none() {
+                    *guard = Some(
+                        gaze.create_space(
+                            &session_data.session,
+                            xr::Path::NULL,
+                            xr::Posef::IDENTITY,
+                        )
+                        .ok()?,
+                    );
+                }
+                let location = guard
+                    .as_ref()?
+                    .locate(&session_data.view_space, time)
+                    .ok()?;
+                let wanted = xr::SpaceLocationFlags::ORIENTATION_VALID
+                    | xr::SpaceLocationFlags::ORIENTATION_TRACKED;
+                location
+                    .location_flags
+                    .contains(wanted)
+                    .then(|| crate::fdm_gaze::pose_direction(&location.pose))
+            })?;
+            let sample = crate::fdm_gaze::Sample {
+                direction,
+                fovs: [views[0].fov, views[1].fov],
+                display_time: time,
+                acquired: Instant::now(),
+            };
+            sample.centres()?;
+            if !crate::fdm_gaze::application_enabled() {
+                let points: Vec<_> = views
+                    .iter()
+                    .map(|view| crate::fdm_gaze::project(direction, view))
+                    .collect();
+                crate::fdm_gaze::publish(&points);
+            }
+            Some(sample)
+        })();
+        if sample.is_none() {
+            crate::fdm_gaze::publish(&invalid);
+        }
+        crate::system::foveation_trace(
+            "FoveationSample",
+            format_args!(
+                "application={} valid={} ndc={:?}",
+                crate::fdm_gaze::application_enabled(),
+                sample.is_some(),
+                sample.and_then(|sample| sample.centres())
+            ),
+        );
+        *session_data.fdm_gaze.lock().unwrap() = sample;
     }
 
     pub fn post_session_restart(&self, data: &SessionData) {

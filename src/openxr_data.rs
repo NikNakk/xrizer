@@ -492,6 +492,7 @@ pub struct SessionData {
     pub current_origin: vr::ETrackingUniverseOrigin,
 
     pub input_data: crate::input::InputSessionData,
+    pub fdm_gaze: std::sync::Mutex<Option<crate::fdm_gaze::Sample>>,
     pub comp_data: crate::compositor::CompositorSessionData,
     pub overlay_data: crate::overlay::OverlaySessionData,
     /// OpenXR requires graphics information before creating a session, but OpenVR clients don't
@@ -652,6 +653,7 @@ impl SessionData {
                 stage_space_reference,
                 stage_space_adjusted,
                 input_data: Default::default(),
+                fdm_gaze: Default::default(),
                 comp_data: Default::default(),
                 overlay_data: Default::default(),
                 current_origin,
