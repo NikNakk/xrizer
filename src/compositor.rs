@@ -40,7 +40,64 @@ pub struct Compositor {
     timing_mode: Mutex<vr::EVRCompositorTimingMode>,
     frame_state: Mutex<FrameState>,
     focused: Once,
-    stage_override: Mutex<Option<Arc<crate::stage::StageAsset>>>,
+    stage_override: Arc<Mutex<StageState>>,
+}
+
+/// A stage override loads on its own thread so the game's frame is not held
+/// up decoding the OBJ and its (8192x8192 for Alyx) texture.
+#[derive(Default)]
+struct StageState {
+    generation: u64,
+    loading: bool,
+    worker_active: bool,
+    worker: Option<std::thread::JoinHandle<()>>,
+    asset: Option<Arc<crate::stage::StageAsset>>,
+}
+
+impl StageState {
+    /// Stores a finished load unless the request was cleared or replaced since.
+    fn publish(
+        &mut self,
+        generation: u64,
+        result: Result<crate::stage::StageAsset, String>,
+    ) -> bool {
+        self.worker_active = false;
+        if self.generation != generation {
+            return false;
+        }
+        self.loading = false;
+        match result {
+            Ok(asset) => {
+                info!(
+                    "stage override ready: {:?}, {} vertices, {} triangles, texture={}x{}",
+                    asset.source_path,
+                    asset.vertices.len(),
+                    asset.indices.len() / 3,
+                    asset.texture_width,
+                    asset.texture_height,
+                );
+                self.asset = Some(Arc::new(asset));
+                true
+            }
+            Err(error) => {
+                warn!("failed to load compositor stage override: {error}");
+                false
+            }
+        }
+    }
+}
+
+impl Drop for Compositor {
+    fn drop(&mut self) {
+        let worker = {
+            let mut state = self.stage_override.lock().unwrap();
+            state.generation = state.generation.wrapping_add(1);
+            state.worker.take()
+        };
+        if let Some(worker) = worker {
+            let _ = worker.join();
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -97,7 +154,7 @@ impl Compositor {
             timing_mode: vr::EVRCompositorTimingMode::Implicit.into(),
             frame_state: FrameState::Submitted.into(),
             focused: Once::new(),
-            stage_override: Mutex::default(),
+            stage_override: Arc::default(),
         }
     }
 
@@ -345,7 +402,12 @@ impl vr::IVRCompositor029_Interface for Compositor {
         false
     }
     fn ClearStageOverride(&self) {
-        let previous = self.stage_override.lock().unwrap().take();
+        let previous = {
+            let mut state = self.stage_override.lock().unwrap();
+            state.generation = state.generation.wrapping_add(1);
+            state.loading = false;
+            state.asset.take()
+        };
         if previous.is_none() {
             return;
         }
@@ -382,13 +444,24 @@ impl vr::IVRCompositor029_Interface for Compositor {
             return vr::EVRCompositorError::None;
         }
 
-        if pchRenderModelPath.is_null() {
-            warn!("SetStageOverride_Async called with a null model path");
-            return vr::EVRCompositorError::RequestFailed;
+        {
+            let session = self.openxr.session_data.get();
+            let controller = session.comp_data.0.lock().unwrap();
+            #[macros::any_graphics(DynFrameController)]
+            fn supports_stage<G: GraphicsBackend + 'static>(ctrl: &FrameController<G>) -> bool {
+                ctrl.backend.supports_stage_rendering()
+            }
+            if !controller
+                .as_ref()
+                .is_some_and(|ctrl| ctrl.with_any_graphics::<supports_stage>(()))
+            {
+                warn!("SetStageOverride_Async: this graphics backend cannot draw stages");
+                return vr::EVRCompositorError::RequestFailed;
+            }
         }
 
-        if self.stage_override.lock().unwrap().is_some() {
-            warn!("SetStageOverride_Async called while another stage override is active");
+        if pchRenderModelPath.is_null() {
+            warn!("SetStageOverride_Async called with a null model path");
             return vr::EVRCompositorError::RequestFailed;
         }
 
@@ -438,32 +511,50 @@ impl vr::IVRCompositor029_Interface for Compositor {
             settings.greyscale,
             settings.wireframe,
         );
-        let stage = match crate::stage::StageAsset::load(&path, transform, settings) {
-            Ok(stage) => Arc::new(stage),
+        if settings.fresnel_strength != 0.0 {
+            warn!("SetStageOverride_Async: fresnel stages are not supported");
+            return vr::EVRCompositorError::RequestFailed;
+        }
+
+        let mut state = self.stage_override.lock().unwrap();
+        if state.worker_active || state.loading || state.asset.is_some() {
+            warn!("SetStageOverride_Async called while another stage override is active");
+            return vr::EVRCompositorError::RequestFailed;
+        }
+        if let Some(worker) = state.worker.take() {
+            let _ = worker.join();
+        }
+        state.generation = state.generation.wrapping_add(1);
+        let generation = state.generation;
+        state.loading = true;
+        state.worker_active = true;
+        let shared = self.stage_override.clone();
+        let input = self.input.force(|_| Input::new(self.openxr.clone()));
+        match std::thread::Builder::new()
+            .name("xrizer-stage-load".into())
+            .spawn(move || {
+                let result = crate::stage::StageAsset::load(&path, transform, settings);
+                let mut state = shared.lock().unwrap();
+                if state.publish(generation, result) {
+                    input.queue_global_event(vr::EVREventType::Compositor_StageOverrideReady);
+                }
+            }) {
+            Ok(worker) => state.worker = Some(worker),
             Err(error) => {
-                warn!("failed to load compositor stage override {path:?}: {error}");
+                state.loading = false;
+                state.worker_active = false;
+                warn!("could not start stage loader: {error}");
                 return vr::EVRCompositorError::RequestFailed;
             }
-        };
-
-        info!(
-            "stage override ready: {:?}, {} vertices, {} triangles, texture={}x{}",
-            stage.source_path,
-            stage.vertices.len(),
-            stage.indices.len() / 3,
-            stage.texture_width,
-            stage.texture_height,
-        );
-        *self.stage_override.lock().unwrap() = Some(stage);
-
-        self.input
-            .force(|_| Input::new(self.openxr.clone()))
-            .queue_global_event(vr::EVREventType::Compositor_StageOverrideReady);
+        }
 
         vr::EVRCompositorError::None
     }
     fn IsCurrentSceneFocusAppLoading(&self) -> bool {
-        let loading = self.stage_override.lock().unwrap().is_some();
+        let loading = {
+            let state = self.stage_override.lock().unwrap();
+            state.loading || state.asset.is_some()
+        };
         trace!("[alyx-comp] IsCurrentSceneFocusAppLoading -> {loading}");
         loading
     }
@@ -869,7 +960,7 @@ impl vr::IVRCompositor029_Interface for Compositor {
         let system = self.system.force(|i| System::new(self.openxr.clone(), i));
         let display_time = self.openxr.display_time.get();
         let overlays = self.overlays.get();
-        let stage = self.stage_override.lock().unwrap().clone();
+        let stage = self.stage_override.lock().unwrap().asset.clone();
 
         ctrl.with_any_graphics_mut::<end_frame>((
             &session_data,
@@ -1103,7 +1194,7 @@ impl vr::IVRCompositor029_Interface for Compositor {
             game_pose_count,
             *self.frame_state.lock().unwrap(),
             *self.timing_mode.lock().unwrap(),
-            self.stage_override.lock().unwrap().is_some()
+            self.stage_override.lock().unwrap().asset.is_some()
         );
         // This should be called every frame - we must regularly poll events
         self.openxr.poll_events();
@@ -1634,6 +1725,14 @@ impl<G: GraphicsBackend> FrameController<G> {
         let stage_requested = stage_requested && supports_stage;
         let mut stage_rendered = false;
 
+        // Alyx can request its startup stage before submitting any frame.
+        if stage_requested && self.swapchain_data.is_none() {
+            let (width, height) = system.recommended_render_target_size();
+            if let Some(info) = self.backend.stage_swapchain_info(width, height) {
+                info!("creating swapchain for stage override: {width}x{height}");
+                self.recreate_swapchain(session_data, info);
+            }
+        }
         if stage_requested {
             let stage = stage.expect("stage_requested requires a stage asset");
             if self.swapchain_data.is_none() {
@@ -2277,6 +2376,7 @@ mod tests {
             texture_rgba: vec![255; 4],
             texture_width: 1,
             texture_height: 1,
+            texture_luminance: false,
             model_transform: glam::Mat4::IDENTITY,
             settings: crate::stage::StageSettings::default(),
         };

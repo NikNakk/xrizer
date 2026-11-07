@@ -6,6 +6,7 @@ mod gl;
 #[cfg(not(target_os = "linux"))]
 mod gl_stub;
 mod vulkan;
+mod vulkan_stage;
 mod vulkan_timing;
 
 pub use d3d11::D3D11Data;
@@ -68,6 +69,16 @@ pub trait GraphicsBackend: Into<SupportedBackend> {
         bounds: vr::VRTextureBounds_t,
         image_index: usize,
     ) -> xr::Extent2Di;
+
+    /// Swapchain to create for a stage override when the application has not
+    /// submitted a frame yet; None if the backend cannot draw stages.
+    fn stage_swapchain_info(
+        &self,
+        _width: u32,
+        _height: u32,
+    ) -> Option<xr::SwapchainCreateInfo<Self::Api>> {
+        None
+    }
 
     /// Check before changing application swapchains for a stage override.
     fn supports_stage_rendering(&self) -> bool {

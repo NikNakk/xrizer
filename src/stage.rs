@@ -46,6 +46,9 @@ pub struct StageAsset {
     pub texture_rgba: Vec<u8>,
     pub texture_width: u32,
     pub texture_height: u32,
+    /// The texture is single-channel (BC4) data replicated into RGB; a backend
+    /// may upload only the red channel.
+    pub texture_luminance: bool,
     pub model_transform: Mat4,
     pub settings: StageSettings,
 }
@@ -57,6 +60,12 @@ impl StageAsset {
         settings: StageSettings,
     ) -> Result<Self, String> {
         let path = path.as_ref();
+        let model_bytes = std::fs::metadata(path)
+            .map_err(|error| error.to_string())?
+            .len();
+        if model_bytes > 32 * 1024 * 1024 {
+            return Err("stage OBJ exceeds 32 MiB limit".into());
+        }
         let load_options = tobj::LoadOptions {
             triangulate: true,
             single_index: true,
@@ -120,7 +129,9 @@ impl StageAsset {
                     .find_map(|material| material.diffuse_texture.clone())
             });
 
-        let (texture_rgba, texture_width, texture_height) = if let Some(texture_name) = texture_name
+        let (texture_rgba, texture_width, texture_height, texture_luminance) = if let Some(
+            texture_name,
+        ) = texture_name
         {
             let texture_path = path
                 .parent()
@@ -142,7 +153,7 @@ impl StageAsset {
             let mut loaded = None;
             for candidate in candidates {
                 match load_stage_texture(&candidate) {
-                    Ok((rgba, width, height)) => {
+                    Ok((rgba, width, height, luminance)) => {
                         if candidate != texture_path {
                             log::info!(
                                 "stage texture {:?} is unavailable; using {:?}",
@@ -150,32 +161,32 @@ impl StageAsset {
                                 candidate
                             );
                         }
-                        loaded = Some((candidate, rgba, width, height));
+                        loaded = Some((candidate, rgba, width, height, luminance));
                         break;
                     }
                     Err(error) => errors.push(format!("{candidate:?}: {error}")),
                 }
             }
 
-            if let Some((loaded_path, rgba, width, height)) = loaded {
+            if let Some((loaded_path, rgba, width, height, luminance)) = loaded {
                 log::info!(
                     "loaded stage texture {:?}: {}x{} RGBA",
                     loaded_path,
                     width,
                     height
                 );
-                (rgba, width, height)
+                (rgba, width, height, luminance)
             } else {
                 log::warn!(
                     "stage texture {:?} could not be decoded; tried {}. Using white compatibility texture",
                     texture_path,
                     errors.join("; ")
                 );
-                (vec![255, 255, 255, 255], 1, 1)
+                (vec![255, 255, 255, 255], 1, 1, false)
             }
         } else {
             log::warn!("stage OBJ {:?} has no diffuse texture; using white", path);
-            (vec![255, 255, 255, 255], 1, 1)
+            (vec![255, 255, 255, 255], 1, 1, false)
         };
 
         Ok(Self {
@@ -186,13 +197,14 @@ impl StageAsset {
             texture_rgba,
             texture_width,
             texture_height,
+            texture_luminance,
             model_transform,
             settings,
         })
     }
 }
 
-fn load_stage_texture(path: &Path) -> Result<(Vec<u8>, u32, u32), String> {
+fn load_stage_texture(path: &Path) -> Result<(Vec<u8>, u32, u32, bool), String> {
     if path
         .extension()
         .and_then(|extension| extension.to_str())
@@ -201,14 +213,16 @@ fn load_stage_texture(path: &Path) -> Result<(Vec<u8>, u32, u32), String> {
         return load_dds_texture(path);
     }
 
+    let (width, height) = image::image_dimensions(path).map_err(|error| error.to_string())?;
+    texture_byte_count(width, height)?;
     let image = image::open(path)
         .map_err(|error| error.to_string())?
         .to_rgba8();
     let (width, height) = image.dimensions();
-    Ok((image.into_raw(), width, height))
+    Ok((image.into_raw(), width, height, false))
 }
 
-fn load_dds_texture(path: &Path) -> Result<(Vec<u8>, u32, u32), String> {
+fn load_dds_texture(path: &Path) -> Result<(Vec<u8>, u32, u32, bool), String> {
     let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
     let mut decoder = dds::Decoder::new(file).map_err(|error| error.to_string())?;
     if !decoder.layout().is_texture() {
@@ -217,7 +231,7 @@ fn load_dds_texture(path: &Path) -> Result<(Vec<u8>, u32, u32), String> {
 
     let format = decoder.format();
     let size = decoder.main_size();
-    let mut rgba = vec![0u8; size.pixels() as usize * 4];
+    let mut rgba = vec![0u8; texture_byte_count(size.width, size.height)?];
     let view = dds::ImageViewMut::new(&mut rgba, size, dds::ColorFormat::RGBA_U8)
         .ok_or("failed to create RGBA8 view for DDS stage texture")?;
     decoder
@@ -227,8 +241,9 @@ fn load_dds_texture(path: &Path) -> Result<(Vec<u8>, u32, u32), String> {
     // BC4 is a single-channel format. Alyx's startup stage uses BC4U as a
     // greyscale/luminance texture, so replicate that channel into RGB rather
     // than exposing GPU-style (R,0,0,1) data to our ordinary RGBA shader.
-    if format == dds::Format::BC4_UNORM {
-        for pixel in rgba.chunks_exact_mut(4) {
+    let luminance = format == dds::Format::BC4_UNORM;
+    if luminance {
+        for pixel in rgba.as_chunks_mut::<4>().0 {
             let value = pixel[0];
             pixel[1] = value;
             pixel[2] = value;
@@ -242,7 +257,7 @@ fn load_dds_texture(path: &Path) -> Result<(Vec<u8>, u32, u32), String> {
         size.width,
         size.height
     );
-    Ok((rgba, size.width, size.height))
+    Ok((rgba, size.width, size.height, luminance))
 }
 
 pub fn mat4_from_hmd34(matrix: &openvr::HmdMatrix34_t) -> Mat4 {
@@ -286,4 +301,27 @@ pub fn projection_matrix(fov: openxr::Fovf, near: f32, far: f32) -> Mat4 {
         Vec4::new(m20, m21, m22, -1.0),
         Vec4::new(0.0, 0.0, m32, 0.0),
     )
+}
+
+fn texture_byte_count(width: u32, height: u32) -> Result<usize, String> {
+    let bytes = u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or("stage texture size overflow")?;
+    if width == 0 || height == 0 || width > 8192 || height > 8192 || bytes > 256 * 1024 * 1024 {
+        return Err("stage texture exceeds 8192x8192 / 256 MiB limit".into());
+    }
+    usize::try_from(bytes).map_err(|_| "stage texture cannot fit in address space".into())
+}
+
+#[cfg(test)]
+mod allocation_tests {
+    use super::*;
+    #[test]
+    fn texture_budget_accepts_alyx_bc4_extent_and_rejects_excess() {
+        assert_eq!(texture_byte_count(8192, 8192).unwrap(), 256 * 1024 * 1024);
+        assert!(texture_byte_count(8193, 1).is_err());
+        assert!(texture_byte_count(u32::MAX, u32::MAX).is_err());
+        assert!(texture_byte_count(0, 1).is_err());
+    }
 }

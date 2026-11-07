@@ -1,4 +1,7 @@
-use super::{ApplicationGpuTiming, GraphicsBackend, vulkan_timing::VulkanGpuTiming};
+use super::{
+    ApplicationGpuTiming, GraphicsBackend, vulkan_stage::StageDevice, vulkan_stage::StageRenderer,
+    vulkan_timing::VulkanGpuTiming,
+};
 use ash::vk::{self, Handle};
 use log::warn;
 use openvr as vr;
@@ -25,6 +28,7 @@ pub struct VulkanData {
     real_data: Option<RealSessionData>,
     gpu_timing_requested: bool,
     gpu_timing: Option<VulkanGpuTiming>,
+    stage: Option<StageRenderer>,
 }
 
 impl Drop for VulkanData {
@@ -33,6 +37,7 @@ impl Drop for VulkanData {
             self.device.device_wait_idle().unwrap();
         }
         drop(self.gpu_timing.take());
+        drop(self.stage.take());
         match &self.real_data {
             // Temporary session - we created these handles, so let's destroy them
             None => unsafe {
@@ -333,6 +338,72 @@ impl GraphicsBackend for VulkanData {
         }
     }
 
+    fn stage_swapchain_info(
+        &self,
+        width: u32,
+        height: u32,
+    ) -> Option<xr::SwapchainCreateInfo<Self::Api>> {
+        Some(xr::SwapchainCreateInfo {
+            create_flags: xr::SwapchainCreateFlags::EMPTY,
+            usage_flags: xr::SwapchainUsageFlags::COLOR_ATTACHMENT
+                | xr::SwapchainUsageFlags::TRANSFER_DST,
+            format: vk::Format::R8G8B8A8_SRGB.as_raw() as _,
+            sample_count: 1,
+            width,
+            height,
+            face_count: 1,
+            array_size: 2,
+            mip_count: 1,
+        })
+    }
+
+    fn supports_stage_rendering(&self) -> bool {
+        true
+    }
+
+    fn render_stage(
+        &mut self,
+        stage: &crate::stage::StageAsset,
+        views: &[xr::View; 2],
+        image_index: usize,
+        extent: xr::Extent2Di,
+    ) -> Result<(), String> {
+        let data = self
+            .real_data
+            .as_ref()
+            .ok_or("stage render before swapchain images were stored")?;
+        let format = data.format;
+        if self
+            .stage
+            .as_ref()
+            .is_none_or(|r| r.stage_id != stage.id || r.target_format != format)
+        {
+            drop(self.stage.take());
+            let ctx = StageDevice {
+                instance: &self.instance,
+                physical_device: self.physical_device,
+                device: &self.device,
+                queue: self.queue,
+                queue_family_index: self.queue_family_index,
+            };
+            let renderer = StageRenderer::new(&ctx, stage, format)?;
+            log::info!(
+                "Vulkan stage renderer ready for {:?}: format={format:?}",
+                stage.source_path
+            );
+            self.stage = Some(renderer);
+        }
+        let images = &self.real_data.as_ref().unwrap().images;
+        self.stage
+            .as_mut()
+            .unwrap()
+            .render(stage, images, image_index, views, extent)
+    }
+
+    fn clear_stage(&mut self) {
+        drop(self.stage.take());
+    }
+
     fn copy_overlay_to_swapchain(
         &mut self,
         texture: *const vr::VRVulkanTextureData_t,
@@ -535,6 +606,7 @@ impl VulkanData {
             real_data: Default::default(),
             gpu_timing_requested: std::env::var("XRIZER_VULKAN_GPU_TIMING").as_deref() == Ok("1"),
             gpu_timing: None,
+            stage: None,
         };
         if backend.gpu_timing_requested {
             backend.gpu_timing = unsafe {
@@ -686,6 +758,7 @@ impl VulkanData {
             real_data: Default::default(),
             gpu_timing_requested: std::env::var("XRIZER_VULKAN_GPU_TIMING").as_deref() == Ok("1"),
             gpu_timing: None,
+            stage: None,
         }
     }
 }
@@ -1022,7 +1095,7 @@ fn new_entry() -> ash::Entry {
 /// VK_KHR_portability_subset must have it enabled. Apps that hand xrizer their own instance and
 /// device have done this themselves; this is for the temporary session xrizer makes itself.
 #[cfg(target_os = "macos")]
-mod portability {
+pub(super) mod portability {
     use ash::vk;
     use log::{info, warn};
     use std::ffi::{CStr, CString};
