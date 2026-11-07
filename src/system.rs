@@ -384,7 +384,7 @@ impl vr::IVRSystem026_Interface for System {
         todo!()
     }
     fn AcknowledgeQuit_Exiting(&self) {
-        todo!()
+        log::debug!("Application acknowledged quit and is exiting");
     }
     fn PerformFirmwareUpdate(&self, _: vr::TrackedDeviceIndex_t) -> vr::EVRFirmwareError {
         todo!()
@@ -1207,6 +1207,18 @@ mod tests {
     use crate::{clientcore::Injector, openxr_data::OpenXrData};
     use std::ffi::CStr;
     use vr::IVRSystem022_Interface;
+
+    #[test]
+    fn quit_acknowledgement_preserves_session_state() {
+        let xr = Arc::new(OpenXrData::new(&Injector::default()).unwrap());
+        let system = System::new(xr.clone(), &Injector::default());
+        let state = xr.session_data.get().state;
+
+        system.AcknowledgeQuit_Exiting();
+        system.AcknowledgeQuit_Exiting();
+
+        assert_eq!(xr.session_data.get().state, state);
+    }
 
     #[test]
     fn unsupported_foveation_preserves_output_buffers() {
