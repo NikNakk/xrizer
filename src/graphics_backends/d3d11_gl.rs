@@ -4,12 +4,13 @@
 //! - GPU: when Mesa can export the GL texture's Metal texture
 //!   (`wglExportMetalTextureMWXR`, Zink over a Metal Vulkan driver) and the D3D11
 //!   device is DXMT (`IDXMTNativeDevice2`), the same Metal texture is imported as
-//!   D3D11, so the backend's copy is one Metal blit. `glFinish` orders GL's
-//!   rendering before it.
+//!   D3D11 (typeless, so it can be read in the swapchain's format) and copied with
+//!   one GPU operation per eye. `glFinish` orders GL's rendering before it.
 //! - CPU otherwise: the region is read back and uploaded to a staging texture.
 //!
-//! Either way the image keeps GL's bottom-to-top row order: the projection layer
-//! presents it flipped (D3D11Data::submits_bottom_up). Overlays are flipped on the CPU.
+//! GL rows run bottom to top. The GPU path copies each eye with one draw that reads
+//! rows in reverse (a Metal render pass; a blit cannot flip), or a plain blit when
+//! the application's bounds already invert it; the CPU path reverses rows itself.
 //!
 //! Every GL call runs on the submitting thread, with the application's context current.
 
@@ -23,9 +24,14 @@ use windows::Win32::Graphics::Direct3D11::{
     ID3D11Texture2D,
 };
 use windows::core::{GUID, HRESULT, Interface};
+use windows::Win32::Graphics::Direct3D::{D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, D3D_SRV_DIMENSION_TEXTURE2D};
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_READ, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE,
-    D3D11_USAGE_STAGING,
+    D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_SHADER_RESOURCE, D3D11_BUFFER_DESC,
+    D3D11_CPU_ACCESS_READ, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_RENDER_TARGET_VIEW_DESC,
+    D3D11_RENDER_TARGET_VIEW_DESC_0, D3D11_RTV_DIMENSION_TEXTURE2DARRAY,
+    D3D11_SHADER_RESOURCE_VIEW_DESC, D3D11_SHADER_RESOURCE_VIEW_DESC_0, D3D11_TEX2D_ARRAY_RTV,
+    D3D11_TEX2D_SRV, D3D11_USAGE_STAGING, D3D11_VIEWPORT, ID3D11Buffer, ID3D11PixelShader,
+    ID3D11RenderTargetView, ID3D11ShaderResourceView, ID3D11VertexShader,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC,
@@ -76,6 +82,17 @@ struct MetalTexture {
     samples: u32,
 }
 
+/// The typeless family of a DXGI format, so one texture can be read as UNORM or sRGB.
+fn typeless(format: u32) -> Option<u32> {
+    match format {
+        28 | 29 => Some(27), // R8G8B8A8
+        87 | 91 => Some(90), // B8G8R8A8
+        24 => Some(23),      // R10G10B10A2
+        10 => Some(9),       // R16G16B16A16
+        _ => None,
+    }
+}
+
 /// DXMT's IDXMTNativeDevice2 (include/dxmt_native_interop.h).
 const IID_DXMT_NATIVE_DEVICE2: GUID = GUID::from_u128(0x5a6d2e1b_b10a_4ab7_8ade_d9a64c417283);
 
@@ -111,7 +128,7 @@ impl NativeDevice {
             Height: metal.height,
             MipLevels: 1,
             ArraySize: 1,
-            Format: DXGI_FORMAT(metal.dxgi_format as i32),
+            Format: DXGI_FORMAT(typeless(metal.dxgi_format).unwrap_or(0) as i32),
             SampleDesc: DXGI_SAMPLE_DESC {
                 Count: 1,
                 Quality: 0,
@@ -145,12 +162,15 @@ impl Drop for NativeDevice {
 struct Import {
     gl: GLuint,
     mtl_texture: u64,
+    /// The texture's own DXGI format; the import is its typeless form.
+    format: u32,
     texture: ID3D11Texture2D,
 }
 
 #[derive(Default)]
 struct Gpu {
     native: Option<NativeDevice>,
+    flip: Option<FlipCopy>,
     /// Set once the GPU path is known not to work; the CPU path is used from then on.
     disabled: bool,
     imports: Vec<Import>,
@@ -322,6 +342,171 @@ fn capture(
     });
 }
 
+const FLIP_HLSL: &str = r#"
+cbuffer Region : register(b0)
+{
+    int4 region; // x, y (GL row of the region's bottom), width, height
+};
+Texture2D<float4> source : register(t0);
+
+float4 vs(uint id : SV_VertexID) : SV_Position
+{
+    float2 uv = float2((id << 1) & 2, id & 2);
+    return float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+}
+
+float4 ps(float4 position : SV_Position) : SV_Target
+{
+    int2 p = int2(position.xy);
+    // The top output row is the region's top GL row.
+    return source.Load(int3(region.x + p.x, region.y + region.w - 1 - p.y, 0));
+}
+"#;
+
+/// Copies a texture region upside down with one draw: GL rows run bottom to top.
+/// The source is read in the destination's format (it is imported typeless), so
+/// sRGB values decode and re-encode unchanged.
+struct FlipCopy {
+    vs: ID3D11VertexShader,
+    ps: ID3D11PixelShader,
+    constants: ID3D11Buffer,
+    /// (source, format) and (destination, slice) views, kept as long as the objects.
+    sources: Vec<(ID3D11Texture2D, i32, ID3D11ShaderResourceView)>,
+    targets: Vec<(ID3D11Texture2D, u32, ID3D11RenderTargetView)>,
+}
+// Owned by the D3D11 backend's device, like the rest of its state.
+unsafe impl Send for FlipCopy {}
+
+impl FlipCopy {
+    fn new(device: &ID3D11Device) -> Result<Self, String> {
+        use super::d3d11_stage::{blob_bytes, compile_shader};
+        let vs_code = compile_shader(FLIP_HLSL, "vs", "vs_5_0")?;
+        let ps_code = compile_shader(FLIP_HLSL, "ps", "ps_5_0")?;
+        let (mut vs, mut ps, mut constants) = (None, None, None);
+        let desc = D3D11_BUFFER_DESC {
+            ByteWidth: 16,
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
+            ..Default::default()
+        };
+        unsafe {
+            device
+                .CreateVertexShader(blob_bytes(&vs_code), None, Some(&mut vs))
+                .map_err(|e| format!("CreateVertexShader: {e}"))?;
+            device
+                .CreatePixelShader(blob_bytes(&ps_code), None, Some(&mut ps))
+                .map_err(|e| format!("CreatePixelShader: {e}"))?;
+            device
+                .CreateBuffer(&desc, None, Some(&mut constants))
+                .map_err(|e| format!("CreateBuffer: {e}"))?;
+        }
+        Ok(Self {
+            vs: vs.ok_or("no vertex shader")?,
+            ps: ps.ok_or("no pixel shader")?,
+            constants: constants.ok_or("no constant buffer")?,
+            sources: Vec::new(),
+            targets: Vec::new(),
+        })
+    }
+
+    fn draw(
+        &mut self,
+        device: &ID3D11Device,
+        context: &ID3D11DeviceContext,
+        src: &ID3D11Texture2D,
+        src_box: &D3D11_BOX,
+        dst: &ID3D11Texture2D,
+        dst_slice: u32,
+    ) -> Result<(), String> {
+        let mut dst_desc = D3D11_TEXTURE2D_DESC::default();
+        unsafe { dst.GetDesc(&mut dst_desc) };
+        let format = dst_desc.Format;
+
+        let srv = match self
+            .sources
+            .iter()
+            .find(|(t, f, _)| t == src && *f == format.0)
+        {
+            Some((_, _, view)) => view.clone(),
+            None => {
+                let desc = D3D11_SHADER_RESOURCE_VIEW_DESC {
+                    Format: format,
+                    ViewDimension: D3D_SRV_DIMENSION_TEXTURE2D,
+                    Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
+                        Texture2D: D3D11_TEX2D_SRV {
+                            MostDetailedMip: 0,
+                            MipLevels: 1,
+                        },
+                    },
+                };
+                let mut view = None;
+                unsafe { device.CreateShaderResourceView(src, Some(&desc), Some(&mut view)) }
+                    .map_err(|e| format!("CreateShaderResourceView(format {}): {e}", format.0))?;
+                let view = view.ok_or("no shader resource view")?;
+                // Sources replaced by the application are released with their views.
+                self.sources.retain(|(t, _, _)| t != src);
+                self.sources.push((src.clone(), format.0, view.clone()));
+                view
+            }
+        };
+        let rtv = match self
+            .targets
+            .iter()
+            .find(|(t, s, _)| t == dst && *s == dst_slice)
+        {
+            Some((_, _, view)) => view.clone(),
+            None => {
+                let desc = D3D11_RENDER_TARGET_VIEW_DESC {
+                    Format: format,
+                    ViewDimension: D3D11_RTV_DIMENSION_TEXTURE2DARRAY,
+                    Anonymous: D3D11_RENDER_TARGET_VIEW_DESC_0 {
+                        Texture2DArray: D3D11_TEX2D_ARRAY_RTV {
+                            MipSlice: 0,
+                            FirstArraySlice: dst_slice,
+                            ArraySize: 1,
+                        },
+                    },
+                };
+                let mut view = None;
+                unsafe { device.CreateRenderTargetView(dst, Some(&desc), Some(&mut view)) }
+                    .map_err(|e| format!("CreateRenderTargetView(slice {dst_slice}): {e}"))?;
+                let view = view.ok_or("no render target view")?;
+                // Swapchain images come in small sets; keep a bounded cache.
+                if self.targets.len() >= 16 {
+                    self.targets.remove(0);
+                }
+                self.targets.push((dst.clone(), dst_slice, view.clone()));
+                view
+            }
+        };
+
+        let (width, height) = (src_box.right - src_box.left, src_box.bottom - src_box.top);
+        let region = [src_box.left as i32, src_box.top as i32, width as i32, height as i32];
+        unsafe {
+            context.UpdateSubresource(&self.constants, 0, None, region.as_ptr().cast(), 0, 0);
+            context.IASetInputLayout(None);
+            context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            context.VSSetShader(&self.vs, None);
+            context.PSSetShader(&self.ps, None);
+            context.PSSetShaderResources(0, Some(&[Some(srv)]));
+            context.PSSetConstantBuffers(0, Some(&[Some(self.constants.clone())]));
+            context.RSSetViewports(Some(&[D3D11_VIEWPORT {
+                TopLeftX: 0.0,
+                TopLeftY: 0.0,
+                Width: width as f32,
+                Height: height as f32,
+                MinDepth: 0.0,
+                MaxDepth: 1.0,
+            }]));
+            context.OMSetRenderTargets(Some(&[Some(rtv)]), None);
+            context.Draw(3, 0);
+            // This device is the backend's own; leave nothing bound for its copies.
+            context.ClearState();
+        }
+        Ok(())
+    }
+}
+
 /// Copies a box of an RGBA8 texture to the CPU, for captures only: it waits for the GPU.
 fn read_back(
     device: &ID3D11Device,
@@ -450,13 +635,7 @@ impl GlSource {
     pub fn swapchain_format(&self, device: &ID3D11Device, texture: GLuint) -> u32 {
         let mut state = self.state.lock().unwrap();
         match self.gpu_import(&mut state, device, texture) {
-            Some(i) => {
-                let (texture, gl) = (&state.gpu.imports[i].texture, state.gpu.imports[i].gl);
-                let mut desc = D3D11_TEXTURE2D_DESC::default();
-                unsafe { texture.GetDesc(&mut desc) };
-                log::debug!("OpenGL texture {gl}: Metal blits, DXGI format {}", desc.Format.0);
-                desc.Format.0 as u32
-            }
+            Some(i) => state.gpu.imports[i].format,
             None => STAGING_FORMAT,
         }
     }
@@ -483,7 +662,7 @@ impl GlSource {
         {
             return Some(i);
         }
-        if metal.dxgi_format == 0 || metal.levels != 1 || metal.samples != 1 {
+        if typeless(metal.dxgi_format).is_none() || metal.levels != 1 || metal.samples != 1 {
             return disable(state, format!("unsupported texture {metal:?}"));
         }
         if state.gpu.native.is_none() {
@@ -506,6 +685,7 @@ impl GlSource {
                 state.gpu.imports.push(Import {
                     gl: texture,
                     mtl_texture: metal.mtl_texture,
+                    format: metal.dxgi_format,
                     texture: imported,
                 });
                 Some(state.gpu.imports.len() - 1)
@@ -514,64 +694,97 @@ impl GlSource {
         }
     }
 
-    /// The D3D11 texture and box to copy for this submission, in GL row order (bottom
-    /// row first) unless `flip_rows` is set, which only the CPU path can do. The texture
-    /// is owned by this source and stays valid until the next call for `eye`.
-    pub fn source(
+    /// Copies the submitted texture's region into `dst`'s array slice `dst_slice`,
+    /// upright unless the bounds invert it (`flip` false). Returns the copied extent,
+    /// or None after logging why.
+    #[allow(clippy::too_many_arguments)]
+    pub fn copy(
         &self,
         device: &ID3D11Device,
         context: &ID3D11DeviceContext,
         eye: vr::EVREye,
         texture: GLuint,
         bounds: vr::VRTextureBounds_t,
-        flip_rows: bool,
-    ) -> Option<(*mut c_void, D3D11_BOX)> {
-        if !flip_rows {
-            let started = std::time::Instant::now();
-            let mut state = self.state.lock().unwrap();
-            if let Some(i) = self.gpu_import(&mut state, device, texture) {
-                let (width, height, _) = self.gl.texture_info(texture);
-                let region = region_from_bounds(width, height, bounds);
-                // The blit runs on DXMT's queue: GL's rendering must be complete first.
-                let waiting = std::time::Instant::now();
-                unsafe { (self.gl.finish)() };
-                state.gl_wait += waiting.elapsed();
-                let staged = state.gpu.imports[i].texture.as_raw();
-                let src_box = D3D11_BOX {
-                    left: region.x as u32,
-                    top: region.y as u32,
-                    front: 0,
-                    right: (region.x + region.width) as u32,
-                    bottom: (region.y + region.height) as u32,
-                    back: 1,
-                };
-                let slot = eye as usize & 1;
-                state.eye_copies[slot] += 1;
-                let n = state.eye_copies[slot];
-                if let Some(dir) = &self.capture_dir {
-                    if n % CAPTURE_INTERVAL == 0 && n / CAPTURE_INTERVAL <= CAPTURES_PER_EYE {
-                        let eye_name = if slot == 0 { "left" } else { "right" };
-                        let texture = &state.gpu.imports[i].texture;
-                        if let Some(pixels) = read_back(device, context, texture, &src_box) {
-                            capture(
-                                dir.clone(),
-                                format!("gl-{eye_name}-{}.png", n / CAPTURE_INTERVAL),
-                                pixels,
-                                region.width as u32,
-                                region.height as u32,
-                                true,
-                            );
+        flip: bool,
+        dst: &ID3D11Texture2D,
+        dst_slice: u32,
+    ) -> Option<xr::Extent2Di> {
+        let started = std::time::Instant::now();
+        let mut state = self.state.lock().unwrap();
+        if let Some(i) = self.gpu_import(&mut state, device, texture) {
+            let (width, height, _) = self.gl.texture_info(texture);
+            let region = region_from_bounds(width, height, bounds);
+            if region.width <= 0 || region.height <= 0 {
+                return None;
+            }
+            // The copy runs on DXMT's queue: GL's rendering must be complete first.
+            let waiting = std::time::Instant::now();
+            unsafe { (self.gl.finish)() };
+            state.gl_wait += waiting.elapsed();
+            let src_box = D3D11_BOX {
+                left: region.x as u32,
+                top: region.y as u32,
+                front: 0,
+                right: (region.x + region.width) as u32,
+                bottom: (region.y + region.height) as u32,
+                back: 1,
+            };
+            let src = state.gpu.imports[i].texture.clone();
+            if flip {
+                if state.gpu.flip.is_none() {
+                    match FlipCopy::new(device) {
+                        Ok(f) => state.gpu.flip = Some(f),
+                        Err(error) => {
+                            log::warn!("no flipping copy ({error}); using CPU copies");
+                            state.gpu.disabled = true;
+                            drop(state);
+                            return self.copy(device, context, eye, texture, bounds, flip, dst, dst_slice);
                         }
                     }
                 }
-                state.copies += 1;
-                state.copy_time += started.elapsed();
-                state.copy_bytes += (region.width * region.height * 4) as usize;
-                self.report(&mut state, "Metal blit");
-                return Some((staged, src_box));
+                let flipper = state.gpu.flip.as_mut().unwrap();
+                if let Err(error) = flipper.draw(device, context, &src, &src_box, dst, dst_slice) {
+                    log::error!("OpenGL flipping copy failed: {error}");
+                    return None;
+                }
+            } else {
+                unsafe { context.CopySubresourceRegion(dst, dst_slice, 0, 0, 0, &src, 0, Some(&src_box)) };
             }
+            let slot = eye as usize & 1;
+            state.eye_copies[slot] += 1;
+            let n = state.eye_copies[slot];
+            if let Some(dir) = &self.capture_dir {
+                if n % CAPTURE_INTERVAL == 0 && n / CAPTURE_INTERVAL <= CAPTURES_PER_EYE {
+                    let eye_name = if slot == 0 { "left" } else { "right" };
+                    if let Some(pixels) = read_back(device, context, &src, &src_box) {
+                        capture(
+                            dir.clone(),
+                            format!("gl-{eye_name}-{}.png", n / CAPTURE_INTERVAL),
+                            pixels,
+                            region.width as u32,
+                            region.height as u32,
+                            flip,
+                        );
+                    }
+                }
+            }
+            state.copies += 1;
+            state.copy_time += started.elapsed();
+            state.copy_bytes += (region.width * region.height * 4) as usize;
+            self.report(&mut state, if flip { "GPU flipping copy" } else { "Metal blit" });
+            return Some(xr::Extent2Di {
+                width: region.width,
+                height: region.height,
+            });
         }
-        self.stage(device, context, eye, texture, bounds, flip_rows)
+        drop(state);
+        let (staged, src_box) = self.stage(device, context, eye, texture, bounds, flip)?;
+        let staged = std::mem::ManuallyDrop::new(unsafe { ID3D11Texture2D::from_raw(staged) });
+        unsafe { context.CopySubresourceRegion(dst, dst_slice, 0, 0, 0, &*staged, 0, Some(&src_box)) };
+        Some(xr::Extent2Di {
+            width: (src_box.right - src_box.left) as i32,
+            height: (src_box.bottom - src_box.top) as i32,
+        })
     }
 
     fn report(&self, state: &mut State, what: &str) {
@@ -767,7 +980,7 @@ impl GlSource {
                     state.pixels[..size].to_vec(),
                     width,
                     height,
-                    !flip_rows,
+                    false,
                 );
             }
         }
