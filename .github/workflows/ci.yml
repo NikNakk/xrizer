@@ -30,12 +30,12 @@ jobs:
       contents: read
     steps:
       - if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 2
           sparse-checkout: .github
       - id: changed
-        uses: tj-actions/changed-files@v45
+        uses: tj-actions/changed-files@v47
         with:
           files: ${{ env.UBUNTU_DOCKERFILE }}
       - id: name
@@ -47,20 +47,20 @@ jobs:
   ubuntu-build:
     runs-on: ubuntu-latest
     needs: check-should-build-container
-    if: ${{ needs.check-should-build-container.outputs.should-build == 'true' || inputs.forceContainerBuild }}
+    if: ${{ github.repository == 'Supreeeme/xrizer' && (needs.check-should-build-container.outputs.should-build == 'true' || inputs.forceContainerBuild) }}
     permissions:
       contents: read
       packages: write
       id-token: write
 
     steps:
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
         with:
           file: ${{ env.UBUNTU_DOCKERFILE }}
           push: true
@@ -71,7 +71,7 @@ jobs:
 
   build:
     needs: [ubuntu-build, check-should-build-container]
-    if: ${{ always() && (needs.ubuntu-build.result == 'success' || needs.ubuntu-build.result == 'skipped') }}
+    if: ${{ github.repository == 'Supreeeme/xrizer' && always() && (needs.ubuntu-build.result == 'success' || needs.ubuntu-build.result == 'skipped') }}
     runs-on: ubuntu-latest
     container:
       image: ${{ needs.check-should-build-container.outputs.container-path }}-ubuntu:latest
@@ -79,7 +79,7 @@ jobs:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
     - name: Build
       run: cargo xbuild --release --features static-openxr --verbose
     - name: Run tests
@@ -87,13 +87,51 @@ jobs:
     - name: Run tests with miri
       run: cargo +nightly miri test
     - name: Format check
-      run: cargo fmt --check
+      run: cargo +stable fmt --check
     - name: Clippy
-      run: cargo clippy --workspace --all-targets
+      run: cargo +stable clippy --workspace --all-targets
     - name: Copy to directory
       run: mkdir -p out/xrizer && cp -r -L target/release/bin out/xrizer
     - name: Upload
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: xrizer-nightly-release
         path: out
+
+
+
+  fork-build:
+    name: Linux regression (fork)
+    if: ${{ github.repository != 'Supreeeme/xrizer' }}
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@v7
+    - name: Install Linux build dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install --no-install-recommends -y \
+          cmake \
+          ninja-build \
+          clang \
+          libvulkan-dev \
+          libopenxr-dev \
+          libx11-xcb-dev \
+          glslc
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt, clippy
+    - uses: dtolnay/rust-toolchain@nightly
+      with:
+        components: miri
+    - name: Build
+      run: cargo xbuild --release --features static-openxr --verbose
+    - name: Run tests
+      run: cargo test --verbose
+    - name: Set up Miri
+      run: cargo +nightly miri setup
+    - name: Run tests with Miri
+      run: cargo +nightly miri test
+    - name: Format check
+      run: cargo +stable fmt --check
+    - name: Clippy
+      run: cargo +stable clippy --workspace --all-targets

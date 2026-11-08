@@ -13,18 +13,20 @@ mod overlayview;
 mod rendermodels;
 mod screenshots;
 mod settings;
+mod stage;
 mod system;
+mod timing;
 
 #[cfg(not(test))]
 mod error_dialog;
 
 use clientcore::ClientCore;
 use openvr as vr;
-use std::ffi::{CStr, c_char, c_void};
+use std::ffi::{CStr, CString, c_char, c_void};
 use std::sync::OnceLock;
 use std::sync::{
     Arc,
-    atomic::{AtomicU32, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
 };
 
 macro_rules! warn_unimplemented {
@@ -198,6 +200,217 @@ fn init_logging() {
     });
 }
 
+static OPENVR_API_CORE: OnceLock<Arc<ClientCore>> = OnceLock::new();
+static OPENVR_API_INITIALIZED: AtomicBool = AtomicBool::new(false);
+static OPENVR_API_TOKEN: AtomicU32 = AtomicU32::new(0);
+static OPENVR_RUNTIME_PATH: OnceLock<CString> = OnceLock::new();
+
+fn openvr_api_core() -> Option<&'static Arc<ClientCore>> {
+    Some(OPENVR_API_CORE.get_or_init(|| {
+        ClientCore::new(c"IVRClientCore_003")
+            .expect("built-in ClientCore version must be supported")
+    }))
+}
+
+fn set_init_error(out: *mut vr::EVRInitError, error: vr::EVRInitError) {
+    if let Some(out) = unsafe { out.as_mut() } {
+        *out = error;
+    }
+}
+
+fn runtime_path() -> &'static CStr {
+    OPENVR_RUNTIME_PATH
+        .get_or_init(|| {
+            let path = std::env::current_exe()
+                .ok()
+                .and_then(|path| path.parent().map(|parent| parent.to_path_buf()))
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            CString::new(path.to_string_lossy().as_bytes())
+                .unwrap_or_else(|_| CString::new(".").unwrap())
+        })
+        .as_c_str()
+}
+
+fn init_error_symbol(error: vr::EVRInitError) -> &'static CStr {
+    match error {
+        vr::EVRInitError::None => c"VRInitError_None",
+        vr::EVRInitError::Init_NotInitialized => c"VRInitError_Init_NotInitialized",
+        vr::EVRInitError::Init_FactoryNotFound => c"VRInitError_Init_FactoryNotFound",
+        vr::EVRInitError::Init_InterfaceNotFound => c"VRInitError_Init_InterfaceNotFound",
+        vr::EVRInitError::Init_InvalidInterface => c"VRInitError_Init_InvalidInterface",
+        vr::EVRInitError::Init_InvalidApplicationType => c"VRInitError_Init_InvalidApplicationType",
+        vr::EVRInitError::Init_VRServiceStartupFailed => c"VRInitError_Init_VRServiceStartupFailed",
+        _ => c"VRInitError_Unknown",
+    }
+}
+
+fn init_error_description(error: vr::EVRInitError) -> &'static CStr {
+    match error {
+        vr::EVRInitError::None => c"No Error",
+        vr::EVRInitError::Init_NotInitialized => c"Not initialized",
+        vr::EVRInitError::Init_FactoryNotFound => c"Factory not found",
+        vr::EVRInitError::Init_InterfaceNotFound => c"Interface not found",
+        vr::EVRInitError::Init_InvalidInterface => c"Invalid interface",
+        vr::EVRInitError::Init_InvalidApplicationType => c"Invalid application type",
+        vr::EVRInitError::Init_VRServiceStartupFailed => c"VR service startup failed",
+        _ => c"Unknown OpenVR initialization error",
+    }
+}
+
+/// Drop-in openvr_api.dll entry point used by current OpenVR clients.
+///
+/// # Safety
+/// `pe_error` must be null or point to writable memory and `startup_info`
+/// must be null or a valid NUL-terminated string for the duration of this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn VR_InitInternal2(
+    pe_error: *mut vr::EVRInitError,
+    application_type: vr::EVRApplicationType,
+    startup_info: *const c_char,
+) -> u32 {
+    let Some(core) = openvr_api_core() else {
+        set_init_error(pe_error, vr::EVRInitError::Init_FactoryNotFound);
+        return 0;
+    };
+
+    let error = <ClientCore as vr::IVRClientCore003_Interface>::Init(
+        core.as_ref(),
+        application_type,
+        startup_info,
+    );
+    set_init_error(pe_error, error);
+    if error != vr::EVRInitError::None {
+        return 0;
+    }
+
+    OPENVR_API_INITIALIZED.store(true, Ordering::Release);
+    OPENVR_API_TOKEN.fetch_add(1, Ordering::AcqRel) + 1
+}
+
+/// # Safety
+/// `pe_error` must be null or point to writable memory.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn VR_InitInternal(
+    pe_error: *mut vr::EVRInitError,
+    application_type: vr::EVRApplicationType,
+) -> u32 {
+    unsafe { VR_InitInternal2(pe_error, application_type, std::ptr::null()) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn VR_ShutdownInternal() {
+    if !OPENVR_API_INITIALIZED.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    if let Some(core) = OPENVR_API_CORE.get() {
+        <ClientCore as vr::IVRClientCore003_Interface>::Cleanup(core.as_ref());
+    }
+    OPENVR_API_TOKEN.fetch_add(1, Ordering::AcqRel);
+}
+
+/// # Safety
+/// `name_and_version` must point to a valid NUL-terminated string and
+/// `pe_error` must be null or point to writable memory.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn VR_GetGenericInterface(
+    name_and_version: *const c_char,
+    pe_error: *mut vr::EVRInitError,
+) -> *mut c_void {
+    if !OPENVR_API_INITIALIZED.load(Ordering::Acquire) {
+        set_init_error(pe_error, vr::EVRInitError::Init_NotInitialized);
+        return std::ptr::null_mut();
+    }
+    let Some(core) = OPENVR_API_CORE.get() else {
+        set_init_error(pe_error, vr::EVRInitError::Init_NotInitialized);
+        return std::ptr::null_mut();
+    };
+
+    <ClientCore as vr::IVRClientCore003_Interface>::GetGenericInterface(
+        core.as_ref(),
+        name_and_version,
+        pe_error,
+    )
+}
+
+/// # Safety
+/// `interface_version` must point to a valid NUL-terminated string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn VR_IsInterfaceVersionValid(interface_version: *const c_char) -> bool {
+    let Some(core) = OPENVR_API_CORE.get() else {
+        return false;
+    };
+    if !OPENVR_API_INITIALIZED.load(Ordering::Acquire) {
+        return false;
+    }
+    <ClientCore as vr::IVRClientCore003_Interface>::IsInterfaceVersionValid(
+        core.as_ref(),
+        interface_version,
+    ) == vr::EVRInitError::None
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn VR_IsHmdPresent() -> bool {
+    true
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn VR_IsRuntimeInstalled() -> bool {
+    true
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn VR_GetInitToken() -> u32 {
+    OPENVR_API_TOKEN.load(Ordering::Acquire)
+}
+
+/// # Safety
+/// `path_buffer` and `required_buffer_size` must be valid for writes when non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn VR_GetRuntimePath(
+    path_buffer: *mut c_char,
+    buffer_size: u32,
+    required_buffer_size: *mut u32,
+) -> bool {
+    let path = runtime_path().to_bytes_with_nul();
+    if let Some(required) = unsafe { required_buffer_size.as_mut() } {
+        *required = path.len() as u32;
+    }
+    if path_buffer.is_null() || buffer_size == 0 {
+        return true;
+    }
+
+    let capacity = buffer_size as usize;
+    if capacity < path.len() {
+        unsafe { *path_buffer = 0 };
+        return true;
+    }
+
+    unsafe {
+        std::ptr::copy_nonoverlapping(path.as_ptr().cast::<c_char>(), path_buffer, path.len());
+    }
+    true
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn VR_RuntimePath() -> *const c_char {
+    runtime_path().as_ptr()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn VR_GetVRInitErrorAsSymbol(error: vr::EVRInitError) -> *const c_char {
+    init_error_symbol(error).as_ptr()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn VR_GetVRInitErrorAsEnglishDescription(error: vr::EVRInitError) -> *const c_char {
+    init_error_description(error).as_ptr()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn VR_GetStringForHmdError(error: vr::EVRInitError) -> *const c_char {
+    init_error_description(error).as_ptr()
+}
+
 /// # Safety
 ///
 /// interface_name must be valid
@@ -206,41 +419,98 @@ pub unsafe extern "C" fn VRClientCoreFactory(
     interface_name: *const c_char,
     return_code: *mut i32,
 ) -> *mut c_void {
-    let interface = unsafe { CStr::from_ptr(interface_name) };
-
-    struct ClientCorePtr(*mut c_void);
-    // SAFETY: Vtables are fine to send across threads.
-    unsafe impl Send for ClientCorePtr {}
-    unsafe impl Sync for ClientCorePtr {}
-
-    static C: OnceLock<ClientCorePtr> = OnceLock::new();
-    if C.get().is_none() {
-        let ret = ClientCore::new(interface).map(|c| {
-            if let Some(ret) = unsafe { return_code.as_mut() } {
-                *ret = 0;
-            }
-            let vtable = match c.base.get().unwrap() {
-                clientcore::Vtable::V2(v) => v as *const _ as *const vr::IVRClientCore002 as _,
-                clientcore::Vtable::V3(v) => v as *const _ as *const vr::IVRClientCore003 as _,
-            };
-            // Leak it!
-            let _ = Arc::into_raw(c);
-            vtable
-        });
-
-        if let Some(c) = ret {
-            C.set(ClientCorePtr(c)).unwrap_or_else(|_| unreachable!());
+    if interface_name.is_null() {
+        if let Some(code) = unsafe { return_code.as_mut() } {
+            *code = vr::EVRInitError::Init_InvalidInterface as i32;
         }
+        return std::ptr::null_mut();
     }
-
-    C.get().map(|c| c.0).unwrap_or(std::ptr::null_mut())
+    let interface = unsafe { CStr::from_ptr(interface_name) };
+    static V2_CORE: OnceLock<Arc<ClientCore>> = OnceLock::new();
+    let core = match interface {
+        version if version == c"IVRClientCore_003" => openvr_api_core().unwrap(),
+        version if version == c"IVRClientCore_002" => V2_CORE.get_or_init(|| {
+            ClientCore::new(c"IVRClientCore_002")
+                .expect("built-in ClientCore version must be supported")
+        }),
+        _ => {
+            if let Some(code) = unsafe { return_code.as_mut() } {
+                *code = vr::EVRInitError::Init_InterfaceNotFound as i32;
+            }
+            return std::ptr::null_mut();
+        }
+    };
+    if let Some(code) = unsafe { return_code.as_mut() } {
+        *code = 0;
+    }
+    // The static Arc owns each version's vtable for the lifetime of the DLL.
+    match core.base.get().unwrap() {
+        clientcore::Vtable::V2(v) => v as *const _ as *const vr::IVRClientCore002 as _,
+        clientcore::Vtable::V3(v) => v as *const _ as *const vr::IVRClientCore003 as _,
+    }
 }
 
 /// Needed for Proton, but seems unused.
+///
+/// # Safety
+/// `return_code` must be null or point to writable memory.
 #[unsafe(no_mangle)]
-pub extern "C" fn HmdSystemFactory(
+pub unsafe extern "C" fn HmdSystemFactory(
     _interface_name: *const c_char,
-    _return_code: *mut i32,
+    return_code: *mut i32,
 ) -> *mut c_void {
-    unimplemented!()
+    if let Some(code) = unsafe { return_code.as_mut() } {
+        *code = vr::EVRInitError::Init_InterfaceNotFound as i32;
+    }
+    std::ptr::null_mut()
+}
+
+#[cfg(test)]
+mod export_tests {
+    use super::*;
+
+    #[test]
+    fn concurrent_factory_calls_keep_each_version_stable() {
+        for version in [c"IVRClientCore_002", c"IVRClientCore_003"] {
+            let barrier = std::sync::Barrier::new(16);
+            std::thread::scope(|scope| {
+                let calls: Vec<_> = (0..16)
+                    .map(|_| {
+                        let barrier = &barrier;
+                        scope.spawn(move || {
+                            barrier.wait();
+                            let mut error = -1;
+                            let pointer =
+                                unsafe { VRClientCoreFactory(version.as_ptr(), &mut error) };
+                            assert_eq!(error, 0);
+                            assert!(!pointer.is_null());
+                            pointer as usize
+                        })
+                    })
+                    .collect();
+                let pointers: Vec<_> = calls.into_iter().map(|call| call.join().unwrap()).collect();
+                assert!(pointers.iter().all(|pointer| *pointer == pointers[0]));
+            });
+        }
+        let v2 =
+            unsafe { VRClientCoreFactory(c"IVRClientCore_002".as_ptr(), std::ptr::null_mut()) };
+        let v3 =
+            unsafe { VRClientCoreFactory(c"IVRClientCore_003".as_ptr(), std::ptr::null_mut()) };
+        assert_ne!(v2, v3);
+        let mut error = 0;
+        assert!(unsafe { VRClientCoreFactory(c"unsupported".as_ptr(), &mut error) }.is_null());
+        assert_eq!(error, vr::EVRInitError::Init_InterfaceNotFound as i32);
+    }
+
+    #[test]
+    fn runtime_path_short_buffer_reports_required_size() {
+        let mut required = 0;
+        let mut short = [1 as c_char; 1];
+        assert!(unsafe { VR_GetRuntimePath(short.as_mut_ptr(), 1, &mut required) });
+        assert_eq!(short[0], 0);
+        assert_eq!(required as usize, runtime_path().to_bytes_with_nul().len());
+        let mut full = vec![0 as c_char; required as usize];
+        assert!(unsafe { VR_GetRuntimePath(full.as_mut_ptr(), required, &mut required) });
+        assert_eq!(unsafe { CStr::from_ptr(full.as_ptr()) }, runtime_path());
+    }
 }

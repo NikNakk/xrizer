@@ -1,5 +1,4 @@
 use crate::{
-    AtomicF64,
     clientcore::{Injected, Injector},
     graphics_backends::{GraphicsBackend, SupportedBackend, supported_backends_enum},
     input::Input,
@@ -12,7 +11,7 @@ use crate::{
 use log::{debug, info, trace, warn};
 use openvr as vr;
 use openxr as xr;
-use std::mem::offset_of;
+use std::mem::{offset_of, size_of};
 use std::sync::{
     Arc, Mutex, Once,
     atomic::{AtomicU32, Ordering},
@@ -40,6 +39,54 @@ pub struct Compositor {
     timing_mode: Mutex<vr::EVRCompositorTimingMode>,
     frame_state: Mutex<FrameState>,
     focused: Once,
+    stage_override: Arc<Mutex<StageState>>,
+    temporary_backend: std::sync::atomic::AtomicBool,
+}
+
+#[derive(Default)]
+struct StageState {
+    generation: u64,
+    loading: bool,
+    worker_active: bool,
+    worker: Option<std::thread::JoinHandle<()>>,
+    asset: Option<Arc<crate::stage::StageAsset>>,
+}
+
+impl StageState {
+    fn publish(
+        &mut self,
+        generation: u64,
+        result: Result<crate::stage::StageAsset, String>,
+    ) -> bool {
+        self.worker_active = false;
+        if self.generation != generation {
+            return false;
+        }
+        self.loading = false;
+        match result {
+            Ok(asset) => {
+                self.asset = Some(Arc::new(asset));
+                true
+            }
+            Err(error) => {
+                warn!("failed to load stage override: {error}");
+                false
+            }
+        }
+    }
+}
+
+impl Drop for Compositor {
+    fn drop(&mut self) {
+        let worker = {
+            let mut state = self.stage_override.lock().unwrap();
+            state.generation = state.generation.wrapping_add(1);
+            state.worker.take()
+        };
+        if let Some(worker) = worker {
+            let _ = worker.join();
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -67,10 +114,14 @@ impl FrameState {
     }
 }
 
+fn valid_timing_size(size: usize) -> bool {
+    size >= offset_of!(vr::Compositor_FrameTiming, m_HmdPose) + size_of::<vr::TrackedDevicePose_t>()
+}
+
 struct FrameMetrics {
     system_start: Instant,
     index: AtomicU32,
-    time: AtomicF64,
+    history: Mutex<crate::timing::FrameHistory>,
 }
 
 struct TempBackendData<G: GraphicsBackend> {
@@ -81,7 +132,7 @@ supported_backends_enum!(enum AnyTempBackendData: TempBackendData);
 
 impl Compositor {
     pub fn new(openxr: Arc<OpenXrData<Self>>, injector: &Injector) -> Self {
-        Self {
+        let compositor = Self {
             vtables: Default::default(),
             openxr,
             input: injector.inject(),
@@ -91,12 +142,28 @@ impl Compositor {
             metrics: FrameMetrics {
                 system_start: Instant::now(),
                 index: 0.into(),
-                time: 0.0.into(),
+                history: Mutex::default(),
             },
             timing_mode: vr::EVRCompositorTimingMode::Implicit.into(),
             frame_state: FrameState::Submitted.into(),
             focused: Once::new(),
+            stage_override: Arc::default(),
+            temporary_backend: false.into(),
+        };
+        #[cfg(all(target_os = "windows", not(test)))]
+        if let Some((backend, waiter, stream)) = compositor.openxr.take_initial_d3d11() {
+            let session = compositor.openxr.session_data.get();
+            let controller = FrameController::new(
+                &session,
+                waiter,
+                stream.try_into().unwrap_or_else(|_| unreachable!()),
+                backend,
+                None,
+            );
+            *session.comp_data.0.lock().unwrap() = Some(controller.into());
+            compositor.temporary_backend.store(true, Ordering::Relaxed);
         }
+        compositor
     }
 
     fn maybe_wait_frame(&self, session_data: &SessionData) {
@@ -114,11 +181,14 @@ impl Compositor {
         #[macros::any_graphics(DynFrameController)]
         fn wait_frame<G: GraphicsBackend + 'static>(
             ctrl: &mut FrameController<G>,
-        ) -> (xr::Time, i64) {
+        ) -> Option<(xr::Time, i64)> {
             ctrl.wait_frame()
         }
 
-        let (display_time, display_period) = ctrl.with_any_graphics_mut::<wait_frame>(());
+        let Some((display_time, display_period)) = ctrl.with_any_graphics_mut::<wait_frame>(())
+        else {
+            return;
+        };
         self.openxr.display_time.set(display_time);
         self.openxr
             .display_period_nanos
@@ -143,11 +213,17 @@ impl Compositor {
         };
 
         #[macros::any_graphics(DynFrameController)]
-        fn begin_frame<G: GraphicsBackend + 'static>(ctrl: &mut FrameController<G>) {
-            ctrl.begin_frame()
+        fn begin_frame<G: GraphicsBackend + 'static>(ctrl: &mut FrameController<G>, index: u32) {
+            ctrl.begin_frame(index)
         }
 
-        ctrl.with_any_graphics_mut::<begin_frame>(());
+        ctrl.with_any_graphics_mut::<begin_frame>(self.metrics.index.load(Ordering::Relaxed));
+        #[macros::any_graphics(DynFrameController)]
+        fn requires_gpu<G: GraphicsBackend + 'static>(_: &FrameController<G>) -> bool {
+            G::requires_gpu_timing()
+        }
+        self.metrics.history.lock().unwrap().requires_gpu =
+            ctrl.with_any_graphics::<requires_gpu>(());
     }
 
     pub fn initialize_real_session(
@@ -184,6 +260,7 @@ impl Compositor {
 
         info!("Creating real backend for texture type {:?}", texture.eType);
         self.openxr.restart_session();
+        self.temporary_backend.store(false, Ordering::Release);
         Ok(())
     }
 }
@@ -328,19 +405,147 @@ impl vr::IVRCompositor029_Interface for Compositor {
         crate::warn_unimplemented!("GetCompositorBenchmarkResults");
         false
     }
-    fn ClearStageOverride(&self) {}
+    fn ClearStageOverride(&self) {
+        let previous = {
+            let mut state = self.stage_override.lock().unwrap();
+            state.generation = state.generation.wrapping_add(1);
+            state.loading = false;
+            state.asset.take()
+        };
+        if previous.is_none() {
+            return;
+        }
+
+        let session_data = self.openxr.session_data.get();
+        #[macros::any_graphics(DynFrameController)]
+        fn clear_stage<G: GraphicsBackend + 'static>(ctrl: &mut FrameController<G>) {
+            ctrl.backend.clear_stage();
+        }
+        session_data
+            .comp_data
+            .0
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .for_each(|ctrl| ctrl.with_any_graphics_mut::<clear_stage>(()));
+
+        info!("cleared compositor stage override");
+    }
+
     fn SetStageOverride_Async(
         &self,
-        _pchRenderModelPath: *const std::ffi::c_char,
-        _pTransform: *const vr::HmdMatrix34_t,
-        _pRenderSettings: *const vr::Compositor_StageRenderSettings,
-        _nSizeOfRenderSettings: u32,
+        pchRenderModelPath: *const std::ffi::c_char,
+        pTransform: *const vr::HmdMatrix34_t,
+        pRenderSettings: *const vr::Compositor_StageRenderSettings,
+        nSizeOfRenderSettings: u32,
     ) -> vr::EVRCompositorError {
-        crate::warn_unimplemented!("SetStageOverride_Async");
+        {
+            let session = self.openxr.session_data.get();
+            let controller = session.comp_data.0.lock().unwrap();
+            #[macros::any_graphics(DynFrameController)]
+            fn supports_stage<G: GraphicsBackend + 'static>(ctrl: &FrameController<G>) -> bool {
+                ctrl.frame_error.is_none() && ctrl.backend.stage_swapchain_info(1, 1).is_some()
+            }
+            if !controller
+                .as_ref()
+                .is_some_and(|ctrl| ctrl.with_any_graphics::<supports_stage>(()))
+            {
+                return vr::EVRCompositorError::RequestFailed;
+            }
+        }
+        if pchRenderModelPath.is_null() {
+            warn!("SetStageOverride_Async called with a null model path");
+            return vr::EVRCompositorError::RequestFailed;
+        }
+
+        let path = unsafe { std::ffi::CStr::from_ptr(pchRenderModelPath) }
+            .to_string_lossy()
+            .into_owned();
+        let transform = unsafe { pTransform.as_ref() }
+            .map(crate::stage::mat4_from_hmd34)
+            .unwrap_or(glam::Mat4::IDENTITY);
+
+        let settings = if !pRenderSettings.is_null()
+            && nSizeOfRenderSettings as usize >= size_of::<vr::Compositor_StageRenderSettings>()
+        {
+            let settings = unsafe { &*pRenderSettings };
+            crate::stage::StageSettings {
+                primary_color: [
+                    settings.m_PrimaryColor.r,
+                    settings.m_PrimaryColor.g,
+                    settings.m_PrimaryColor.b,
+                    settings.m_PrimaryColor.a,
+                ],
+                secondary_color: [
+                    settings.m_SecondaryColor.r,
+                    settings.m_SecondaryColor.g,
+                    settings.m_SecondaryColor.b,
+                    settings.m_SecondaryColor.a,
+                ],
+                vignette_inner_radius: settings.m_flVignetteInnerRadius,
+                vignette_outer_radius: settings.m_flVignetteOuterRadius,
+                fresnel_strength: settings.m_flFresnelStrength,
+                backface_culling: settings.m_bBackfaceCulling,
+                greyscale: settings.m_bGreyscale,
+                wireframe: settings.m_bWireframe,
+            }
+        } else {
+            crate::stage::StageSettings::default()
+        };
+
+        if settings.fresnel_strength != 0.0 {
+            return vr::EVRCompositorError::RequestFailed;
+        }
+
+        info!(
+            "loading compositor stage override {path:?}; settings: primary={:?} secondary={:?} vignette=({:.3},{:.3}) fresnel={:.3} cull={} greyscale={} wireframe={}",
+            settings.primary_color,
+            settings.secondary_color,
+            settings.vignette_inner_radius,
+            settings.vignette_outer_radius,
+            settings.fresnel_strength,
+            settings.backface_culling,
+            settings.greyscale,
+            settings.wireframe,
+        );
+        let mut state = self.stage_override.lock().unwrap();
+        if state.worker_active || state.loading || state.asset.is_some() {
+            return vr::EVRCompositorError::RequestFailed;
+        }
+        if let Some(worker) = state.worker.take() {
+            let _ = worker.join();
+        }
+        state.generation = state.generation.wrapping_add(1);
+        let generation = state.generation;
+        state.loading = true;
+        state.worker_active = true;
+        let shared = self.stage_override.clone();
+        let input = self.input.force(|_| Input::new(self.openxr.clone()));
+        match std::thread::Builder::new()
+            .name("xrizer-stage-load".into())
+            .spawn(move || {
+                let result = crate::stage::StageAsset::load(&path, transform, settings);
+                let mut state = shared.lock().unwrap();
+                if state.publish(generation, result) {
+                    input.queue_global_event(vr::EVREventType::Compositor_StageOverrideReady);
+                }
+            }) {
+            Ok(worker) => state.worker = Some(worker),
+            Err(error) => {
+                state.loading = false;
+                state.worker_active = false;
+                warn!("could not start stage loader: {error}");
+                return vr::EVRCompositorError::RequestFailed;
+            }
+        }
+
         vr::EVRCompositorError::None
     }
     fn IsCurrentSceneFocusAppLoading(&self) -> bool {
-        false
+        let state = self.stage_override.lock().unwrap();
+        let loading = state.loading || state.asset.is_some();
+        trace!("[alyx-comp] IsCurrentSceneFocusAppLoading -> {loading}");
+        loading
     }
     fn IsMotionSmoothingSupported(&self) -> bool {
         todo!()
@@ -430,6 +635,8 @@ impl vr::IVRCompositor029_Interface for Compositor {
         vr::EVRCompositorError::IncompatibleVersion
     }
     fn SuspendRendering(&self, bSuspend: bool) {
+        trace!("SuspendRendering({bSuspend})");
+
         #[macros::any_graphics(DynFrameController)]
         fn set_suspend_render<G: GraphicsBackend + 'static>(
             ctrl: &mut FrameController<G>,
@@ -438,6 +645,7 @@ impl vr::IVRCompositor029_Interface for Compositor {
             ctrl.app_suspend_render = app_suspend_render;
         }
 
+        let effective_suspend = bSuspend;
         self.openxr
             .session_data
             .get()
@@ -446,7 +654,7 @@ impl vr::IVRCompositor029_Interface for Compositor {
             .lock()
             .unwrap()
             .iter_mut()
-            .for_each(|ctrl| ctrl.with_any_graphics_mut::<set_suspend_render>(bSuspend));
+            .for_each(|ctrl| ctrl.with_any_graphics_mut::<set_suspend_render>(effective_suspend));
     }
     fn ForceReconnectProcess(&self) {
         todo!()
@@ -538,7 +746,8 @@ impl vr::IVRCompositor029_Interface for Compositor {
     fn GetCurrentGridAlpha(&self) -> f32 {
         0.0
     }
-    fn FadeGrid(&self, _fSeconds: f32, bFadeGridIn: bool) {
+    fn FadeGrid(&self, f_seconds: f32, bFadeGridIn: bool) {
+        info!("[alyx-comp] FadeGrid seconds={f_seconds:.3} fade_in={bFadeGridIn}");
         #[macros::any_graphics(DynFrameController)]
         fn set_fade_grid<G: GraphicsBackend + 'static>(
             ctrl: &mut FrameController<G>,
@@ -582,66 +791,40 @@ impl vr::IVRCompositor029_Interface for Compositor {
         crate::warn_unimplemented!("GetFrameTimeRemaining");
         0.0
     }
-    fn GetFrameTimings(&self, _pTiming: *mut vr::Compositor_FrameTiming, _nFrames: u32) -> u32 {
-        todo!()
+    fn GetFrameTimings(&self, timing: *mut vr::Compositor_FrameTiming, count: u32) -> u32 {
+        if timing.is_null() || !timing.is_aligned() || count == 0 {
+            return 0;
+        }
+        let size = unsafe { (&raw const (*timing).m_nSize).read() } as usize;
+        if !valid_timing_size(size) {
+            return 0;
+        }
+        let frames = self.metrics.history.lock().unwrap().latest(count);
+        for (index, frame) in frames.iter().enumerate() {
+            unsafe {
+                crate::timing::write_record(
+                    timing.cast::<u8>().add(index * size).cast(),
+                    size,
+                    frame,
+                );
+            }
+        }
+        frames.len() as u32
     }
-    fn GetFrameTiming(&self, timing: *mut vr::Compositor_FrameTiming, _frames_ago: u32) -> bool {
+    fn GetFrameTiming(&self, timing: *mut vr::Compositor_FrameTiming, frames_ago: u32) -> bool {
         if timing.is_null() || !timing.is_aligned() {
             return false;
         }
-
         let size = unsafe { (&raw const (*timing).m_nSize).read() } as usize;
-        fn ptr_size<T>(_: *const T) -> usize {
-            std::mem::size_of::<T>()
-        }
-        if size
-            < offset_of!(vr::Compositor_FrameTiming, m_HmdPose)
-                + ptr_size(unsafe { &raw const (*timing).m_HmdPose })
-        {
+        if !valid_timing_size(size) {
             return false;
         }
-        // We're using raw pointers here because the Compositor_FrameTiming struct can be a
-        // varaible size, so we don't want to create a reference to a struct with an incorrect
-        // (to us) size, because that would be Undefined Behavior.
-        macro_rules! set {
-            ($member:ident, $value:expr) => {{
-                let ptr = &raw mut (*timing).$member;
-                ptr.write_unaligned($value)
-            }};
-        }
-
+        let Some(frame) = self.metrics.history.lock().unwrap().get(frames_ago) else {
+            return false;
+        };
         unsafe {
-            // TODO: These values are copy/pasted from OpenComposite, determine if real values are
-            // necessary/better
-            set!(m_nFrameIndex, self.metrics.index.load(Ordering::Relaxed));
-            set!(m_nNumFramePresents, 1);
-            set!(m_nNumMisPresented, 0);
-            set!(m_nReprojectionFlags, 0);
-            set!(m_flSystemTimeInSeconds, self.metrics.time.load());
-            set!(m_flPreSubmitGpuMs, 8.0);
-            set!(m_flPostSubmitGpuMs, 1.0);
-            set!(m_flTotalRenderGpuMs, 9.0);
-
-            set!(m_flCompositorRenderGpuMs, 1.5);
-            set!(m_flCompositorRenderCpuMs, 3.0);
-            set!(m_flCompositorIdleCpuMs, 0.1);
-
-            set!(
-                m_flClientFrameIntervalMs,
-                1000.0 / self.openxr.get_refresh_rate()
-            );
-            set!(m_flPresentCallCpuMs, 0.0);
-            set!(m_flWaitForPresentCpuMs, 0.0);
-            set!(m_flSubmitFrameMs, 0.0);
-
-            set!(m_flWaitGetPosesCalledMs, 0.0);
-            set!(m_flNewPosesReadyMs, 0.0);
-            set!(m_flNewFrameReadyMs, 0.0); // second call to IVRCompositor::Submit
-            set!(m_flCompositorUpdateStartMs, 0.0);
-            set!(m_flCompositorUpdateEndMs, 0.0);
-            set!(m_flCompositorRenderStartMs, 0.0);
+            crate::timing::write_record(timing, size, &frame);
         }
-
         true
     }
     fn PostPresentHandoff(&self) {
@@ -652,11 +835,15 @@ impl vr::IVRCompositor029_Interface for Compositor {
             system: &System,
             display_time: xr::Time,
             overlays: Option<&OverlayMan>,
+            stage: Option<&crate::stage::StageAsset>,
         ) where
+            for<'a> &'a openxr_data::GraphicalSession:
+                TryInto<&'a openxr_data::Session<G::Api>, Error: std::fmt::Display>,
             for<'b> &'b crate::overlay::AnySwapchainMap:
                 TryInto<&'b crate::overlay::SwapchainMap<G::Api>, Error: std::fmt::Display>,
+            <G::Api as xr::Graphics>::Format: PartialEq + std::fmt::Debug,
         {
-            ctrl.end_frame(session_data, system, display_time, overlays)
+            ctrl.end_frame(session_data, system, display_time, overlays, stage)
         }
 
         let session_data = self.openxr.session_data.get();
@@ -674,12 +861,15 @@ impl vr::IVRCompositor029_Interface for Compositor {
         let system = self.system.force(|i| System::new(self.openxr.clone(), i));
         let display_time = self.openxr.display_time.get();
         let overlays = self.overlays.get();
+        let stage = self.stage_override.lock().unwrap().asset.clone();
 
+        let compositor_started = Instant::now();
         ctrl.with_any_graphics_mut::<end_frame>((
             &session_data,
             &system,
             display_time,
             overlays.as_deref(),
+            stage.as_deref(),
         ));
 
         self.frame_state
@@ -687,10 +877,19 @@ impl vr::IVRCompositor029_Interface for Compositor {
             .unwrap()
             .advance_to(FrameState::Submitted);
 
-        self.metrics.index.fetch_add(1, Ordering::Relaxed);
+        #[macros::any_graphics(DynFrameController)]
+        fn gpu_timings<G: GraphicsBackend + 'static>(
+            ctrl: &mut FrameController<G>,
+        ) -> Vec<crate::graphics_backends::GpuTiming> {
+            ctrl.backend.poll_gpu_timings()
+        }
+        let gpu = ctrl.with_any_graphics_mut::<gpu_timings>(());
         self.metrics
-            .time
-            .store(self.metrics.system_start.elapsed().as_secs_f64());
+            .history
+            .lock()
+            .unwrap()
+            .complete(compositor_started.elapsed().as_secs_f32() * 1000.0, gpu);
+        self.metrics.index.fetch_add(1, Ordering::Relaxed);
         #[cfg(feature = "tracing")]
         {
             tracy_client::frame_mark();
@@ -730,6 +929,7 @@ impl vr::IVRCompositor029_Interface for Compositor {
         bounds: *const vr::VRTextureBounds_t,
         submit_flags: vr::EVRSubmitFlags,
     ) -> vr::EVRCompositorError {
+        let submit_started = Instant::now();
         let bounds = unsafe { bounds.as_ref() }
             .copied()
             .unwrap_or(vr::VRTextureBounds_t {
@@ -745,14 +945,34 @@ impl vr::IVRCompositor029_Interface for Compositor {
         }
 
         let Some(texture) = (unsafe { texture.as_ref() }) else {
+            trace!("[alyx-comp] Submit eye={eye:?} -> InvalidTexture (null texture)");
             return vr::EVRCompositorError::InvalidTexture;
         };
 
+        trace!(
+            "[alyx-comp] Submit eye={eye:?} type={:?} colorspace={:?} flags={submit_flags:?} bounds=({:.4},{:.4})-({:.4},{:.4}) focused={}",
+            texture.eType,
+            texture.eColorSpace,
+            bounds.uMin,
+            bounds.vMin,
+            bounds.uMax,
+            bounds.vMax,
+            self.focused.is_completed()
+        );
+
         if !self.focused.is_completed() {
+            trace!("[alyx-comp] Submit eye={eye:?} -> DoNotHaveFocus");
             return vr::EVRCompositorError::DoNotHaveFocus;
         }
 
         let mut session_lock = self.openxr.session_data.get();
+        if self.temporary_backend.load(Ordering::Acquire) {
+            drop(session_lock);
+            if let Err(error) = self.initialize_real_session(texture, bounds) {
+                return error;
+            }
+            session_lock = self.openxr.session_data.get();
+        }
         let mut frame_lock = session_lock.comp_data.0.lock().unwrap();
 
         let ctrl = match frame_lock.as_mut() {
@@ -805,8 +1025,18 @@ impl vr::IVRCompositor029_Interface for Compositor {
             bounds,
             submit_flags,
         )) {
+            trace!("[alyx-comp] Submit eye={eye:?} -> {e:?}");
             return e;
         }
+        #[macros::any_graphics(DynFrameController)]
+        fn stereo_complete<G: GraphicsBackend + 'static>(ctrl: &FrameController<G>) -> bool {
+            ctrl.eyes_submitted.iter().all(Option::is_some)
+        }
+        self.metrics.history.lock().unwrap().submit(
+            submit_started.elapsed().as_secs_f32() * 1000.0,
+            ctrl.with_any_graphics::<stereo_complete>(()),
+        );
+        trace!("[alyx-comp] Submit eye={eye:?} -> None");
         vr::EVRCompositorError::None
     }
 
@@ -874,7 +1104,16 @@ impl vr::IVRCompositor029_Interface for Compositor {
         game_pose_array: *mut vr::TrackedDevicePose_t,
         game_pose_count: u32,
     ) -> vr::EVRCompositorError {
+        let called = Instant::now();
         tracy_span!("WaitGetPoses impl");
+        trace!(
+            "[alyx-comp] WaitGetPoses render_poses={} game_poses={} frame_state={:?} timing={:?} stage_active={}",
+            render_pose_count,
+            game_pose_count,
+            *self.frame_state.lock().unwrap(),
+            *self.timing_mode.lock().unwrap(),
+            (self.stage_override.lock().unwrap().asset.is_some())
+        );
         // This should be called every frame - we must regularly poll events
         self.openxr.poll_events();
         self.focused.call_once(|| {});
@@ -900,6 +1139,20 @@ impl vr::IVRCompositor029_Interface for Compositor {
                 self.maybe_begin_frame(&session_data);
             }
         }
+        {
+            let session = self.openxr.session_data.get();
+            let controller = session.comp_data.0.lock().unwrap();
+            #[macros::any_graphics(DynFrameController)]
+            fn failed<G: GraphicsBackend + 'static>(ctrl: &FrameController<G>) -> bool {
+                ctrl.frame_error.is_some()
+            }
+            if controller
+                .as_ref()
+                .is_some_and(|ctrl| ctrl.with_any_graphics::<failed>(()))
+            {
+                return vr::EVRCompositorError::RequestFailed;
+            }
+        }
         if let Some(system) = self.system.get() {
             system.reset_views();
         }
@@ -907,6 +1160,18 @@ impl vr::IVRCompositor029_Interface for Compositor {
             input.frame_start_update();
         }
 
+        let pose = self
+            .input
+            .get()
+            .and_then(|input| input.get_device_pose(0, None))
+            .unwrap_or_default();
+        self.metrics.history.lock().unwrap().begin(
+            self.metrics.index.load(Ordering::Relaxed),
+            called,
+            Instant::now(),
+            self.metrics.system_start,
+            pose,
+        );
         self.GetLastPoses(
             render_pose_array,
             render_pose_count,
@@ -1031,6 +1296,7 @@ struct FrameController<G: GraphicsBackend> {
     swapchain_data: Option<SwapchainData<G::Api>>,
     image_index: usize,
     image_acquired: bool,
+    frame_error: Option<xr::sys::Result>,
     should_render: bool,
     app_suspend_render: bool,
     app_fade_grid: bool,
@@ -1040,12 +1306,17 @@ struct FrameController<G: GraphicsBackend> {
 }
 supported_backends_enum!(enum DynFrameController: FrameController);
 
+type InitializedSwapchain<G> = (
+    xr::Swapchain<<G as GraphicsBackend>::Api>,
+    <<G as GraphicsBackend>::Api as xr::Graphics>::Format,
+);
+
 impl<G: GraphicsBackend> FrameController<G> {
     fn init_swapchain(
         session_data: &SessionData,
         create_info: &mut xr::SwapchainCreateInfo<G::Api>,
         backend: &mut G,
-    ) -> (xr::Swapchain<G::Api>, <G::Api as xr::Graphics>::Format)
+    ) -> xr::Result<InitializedSwapchain<G>>
     where
         for<'a> &'a openxr_data::GraphicalSession:
             TryInto<&'a openxr_data::Session<G::Api>, Error: std::fmt::Display>,
@@ -1059,25 +1330,10 @@ impl<G: GraphicsBackend> FrameController<G> {
         );
 
         let initial_format = create_info.format;
-        session_data.check_format::<G>(create_info);
+        session_data.check_format::<G>(create_info)?;
 
-        let swapchain = session_data
-            .create_swapchain(create_info)
-            .unwrap_or_else(|err| {
-                panic!(
-                    "Failed to create swapchain: {err} (info: {:#?})",
-                    [
-                        ("create_flags", format!("{:?}", create_info.create_flags)),
-                        ("width", create_info.width.to_string()),
-                        ("height", create_info.height.to_string()),
-                        ("sample_count", create_info.sample_count.to_string())
-                    ]
-                )
-            });
-
-        let images = swapchain
-            .enumerate_images()
-            .expect("Failed to enumerate swapchain images");
+        let swapchain = session_data.create_swapchain(create_info)?;
+        let images = swapchain.enumerate_images()?;
 
         backend.store_swapchain_images(images, create_info.format);
         debug!(
@@ -1085,7 +1341,7 @@ impl<G: GraphicsBackend> FrameController<G> {
             create_info.width, create_info.height, create_info.format
         );
 
-        (swapchain, initial_format)
+        Ok((swapchain, initial_format))
     }
 
     fn new(
@@ -1100,16 +1356,24 @@ impl<G: GraphicsBackend> FrameController<G> {
             TryInto<&'a openxr_data::Session<G::Api>, Error: std::fmt::Display>,
         <G::Api as xr::Graphics>::Format: PartialEq + std::fmt::Debug,
     {
+        let mut frame_error = None;
         let swapchain_data = if let Some(mut info) = create_info {
-            is_valid_swapchain_info(&info).then(|| {
-                let (swapchain, initial_format) =
-                    Self::init_swapchain(session_data, &mut info, &mut backend);
-                SwapchainData {
-                    swapchain,
-                    info,
-                    initial_format,
+            if !is_valid_swapchain_info(&info) {
+                None
+            } else {
+                match Self::init_swapchain(session_data, &mut info, &mut backend) {
+                    Ok((swapchain, initial_format)) => Some(SwapchainData {
+                        swapchain,
+                        info,
+                        initial_format,
+                    }),
+                    Err(error) => {
+                        frame_error = Some(error);
+                        warn!("failed compositor swapchain creation: {error}");
+                        None
+                    }
                 }
-            })
+            }
         } else {
             None
         };
@@ -1120,6 +1384,7 @@ impl<G: GraphicsBackend> FrameController<G> {
             swapchain_data,
             image_index: 0,
             image_acquired: false,
+            frame_error,
             should_render: false,
             app_suspend_render: false,
             app_fade_grid: false,
@@ -1138,8 +1403,17 @@ impl<G: GraphicsBackend> FrameController<G> {
             TryInto<&'a openxr_data::Session<G::Api>, Error: std::fmt::Display>,
         <G::Api as xr::Graphics>::Format: PartialEq + std::fmt::Debug,
     {
+        if self.frame_error.is_some() || !self.release_acquired_image() {
+            return;
+        }
         let (swapchain, initial_format) =
-            Self::init_swapchain(session_data, &mut create_info, &mut self.backend);
+            match Self::init_swapchain(session_data, &mut create_info, &mut self.backend) {
+                Ok(value) => value,
+                Err(error) => {
+                    self.runtime_error(error);
+                    return;
+                }
+            };
 
         self.swapchain_data = Some(SwapchainData {
             swapchain,
@@ -1150,59 +1424,104 @@ impl<G: GraphicsBackend> FrameController<G> {
         self.eyes_submitted = Default::default();
     }
 
-    fn acquire_swapchain_image(&mut self) {
-        let swapchain = &mut self
-            .swapchain_data
-            .as_mut()
-            .expect("Can't acquire swapchain image with no swapchain!")
-            .swapchain;
-
-        self.image_index = swapchain
-            .acquire_image()
-            .expect("Failed to acquire swapchain image") as usize;
-
-        trace!("waiting image");
-        {
-            tracy_span!("wait swapchain image");
-            swapchain
-                .wait_image(xr::Duration::INFINITE)
-                .expect("Failed to wait for swapchain image");
+    fn runtime_error(&mut self, error: xr::sys::Result) -> bool {
+        if self.frame_error.is_none() {
+            warn!("retiring failed compositor frame: {error}");
         }
-
-        self.image_acquired = true;
+        self.frame_error = Some(error);
+        false
     }
 
-    fn wait_frame(&mut self) -> (xr::Time, i64) {
-        let frame_state = {
-            tracy_span!("wait frame");
-            self.waiter.wait().unwrap()
+    fn release_acquired_image(&mut self) -> bool {
+        if self.frame_error.is_some() {
+            return false;
+        }
+        if !self.image_acquired {
+            return true;
+        }
+        let Some(data) = self.swapchain_data.as_mut() else {
+            return self.runtime_error(xr::sys::Result::ERROR_CALL_ORDER_INVALID);
         };
-        self.should_render = frame_state.should_render && !self.app_suspend_render;
-        (
+        let result = unsafe {
+            (data.swapchain.instance().fp().release_swapchain_image)(
+                data.swapchain.as_raw(),
+                std::ptr::null(),
+            )
+        };
+        if result != xr::sys::Result::SUCCESS {
+            return self.runtime_error(result);
+        }
+        self.image_acquired = false;
+        true
+    }
+
+    fn acquire_swapchain_image(&mut self) -> bool {
+        if self.frame_error.is_some() {
+            return false;
+        }
+        let Some(data) = self.swapchain_data.as_mut() else {
+            return self.runtime_error(xr::sys::Result::ERROR_CALL_ORDER_INVALID);
+        };
+        let index = match data.swapchain.acquire_image() {
+            Ok(index) => index,
+            Err(error) => return self.runtime_error(error),
+        };
+        self.image_index = index as usize;
+        self.image_acquired = true;
+        // The Rust wrapper treats positive TIMEOUT_EXPIRED as a successful wait.
+        // Use the raw wait/release pair so only actual readiness permits reuse.
+        let info = xr::sys::SwapchainImageWaitInfo {
+            ty: xr::sys::SwapchainImageWaitInfo::TYPE,
+            next: std::ptr::null(),
+            timeout: xr::Duration::from_nanos(500_000_000),
+        };
+        let result = unsafe {
+            (data.swapchain.instance().fp().wait_swapchain_image)(data.swapchain.as_raw(), &info)
+        };
+        if result != xr::sys::Result::SUCCESS {
+            return self.runtime_error(result);
+        }
+        true
+    }
+
+    fn wait_frame(&mut self) -> Option<(xr::Time, i64)> {
+        if self.frame_error.is_some() {
+            return None;
+        }
+        let frame_state = match self.waiter.wait() {
+            Ok(state) => state,
+            Err(error) => {
+                self.runtime_error(error);
+                return None;
+            }
+        };
+        // SuspendRendering stops application projection submissions, but the compositor
+        // still has work to do: stage overrides and loading environments must remain head-tracked.
+        self.should_render = frame_state.should_render;
+        trace!(
+            "[alyx-comp] xrWaitFrame should_render={} predicted_time={} predicted_period_ns={}",
+            frame_state.should_render,
+            frame_state.predicted_display_time.as_nanos(),
+            frame_state.predicted_display_period.as_nanos()
+        );
+        Some((
             frame_state.predicted_display_time,
             frame_state.predicted_display_period.as_nanos(),
-        )
+        ))
     }
 
-    fn begin_frame(&mut self) {
-        if self.image_acquired {
-            tracy_span!("release old swapchain image");
-            self.swapchain_data
-                .as_mut()
-                .expect("Image is acquired, yet we have no swapchain?")
-                .swapchain
-                .release_image()
-                .unwrap();
+    fn begin_frame(&mut self, index: u32) {
+        if self.frame_error.is_some() || !self.release_acquired_image() {
+            return;
         }
-
-        if self.swapchain_data.is_some() {
-            self.acquire_swapchain_image();
+        if self.swapchain_data.is_some() && !self.acquire_swapchain_image() {
+            return;
         }
-
-        {
-            tracy_span!("begin frame");
-            self.stream.begin().expect("Couldn't begin frame");
+        if let Err(error) = self.stream.begin() {
+            self.runtime_error(error);
+            return;
         }
+        self.backend.begin_gpu_timing(index);
         self.eyes_submitted = [None; 2];
         self.submitting_null = false;
         trace!("frame begin");
@@ -1223,12 +1542,27 @@ impl<G: GraphicsBackend> FrameController<G> {
             TryInto<&'b openxr_data::Session<G::Api>, Error: std::fmt::Display>,
         <G::Api as xr::Graphics>::Format: PartialEq + std::fmt::Debug,
     {
+        if self.frame_error.is_some() {
+            return Err(vr::EVRCompositorError::RequestFailed);
+        }
+        trace!(
+            "[alyx-comp] submit_impl eye={eye:?} should_render={} suspended={} fade_grid={} image_acquired={} eye_ready={:?}",
+            self.should_render,
+            self.app_suspend_render,
+            self.app_fade_grid,
+            self.image_acquired,
+            self.eyes_submitted
+                .iter()
+                .map(Option::is_some)
+                .collect::<Vec<_>>()
+        );
+
         // No Man's Sky does this.
         if self.eyes_submitted[eye as usize].is_some() {
             return Err(vr::EVRCompositorError::AlreadySubmitted);
         }
 
-        self.eyes_submitted[eye as usize] = if self.should_render {
+        self.eyes_submitted[eye as usize] = if self.should_render && !self.app_suspend_render {
             // Make sure our image dimensions haven't changed.
             let new_info = self
                 .backend
@@ -1246,6 +1580,9 @@ impl<G: GraphicsBackend> FrameController<G> {
                     }) {
                         info!("recreating swapchain (for {eye:?})");
                         self.recreate_swapchain(session_data, new_info);
+                        if self.frame_error.is_some() {
+                            return SubmittedEye::default();
+                        }
                     }
 
                     SubmittedEye {
@@ -1269,14 +1606,25 @@ impl<G: GraphicsBackend> FrameController<G> {
             Some(Default::default())
         };
 
-        trace!("submitted {eye:?}");
+        trace!(
+            "[alyx-comp] submitted eye={eye:?} eye_ready={:?} projection_copy_enabled={}",
+            self.eyes_submitted
+                .iter()
+                .map(Option::is_some)
+                .collect::<Vec<_>>(),
+            self.should_render && !self.app_suspend_render
+        );
+        if self.frame_error.is_some() {
+            return Err(vr::EVRCompositorError::RequestFailed);
+        }
         if self.eyes_submitted.iter().all(|eye| eye.is_some()) {
-            let mut swapchain_data = self.swapchain_data.as_mut();
-            if let Some(data) = &mut swapchain_data {
-                trace!("releasing image");
-                data.swapchain.release_image().unwrap();
-            }
-            self.image_acquired = false;
+            self.backend.finish_gpu_timing();
+        }
+        if self.eyes_submitted.iter().all(|eye| eye.is_some())
+            && !self.app_suspend_render
+            && !self.release_acquired_image()
+        {
+            return Err(vr::EVRCompositorError::RequestFailed);
         }
 
         Ok(())
@@ -1288,16 +1636,179 @@ impl<G: GraphicsBackend> FrameController<G> {
         system: &System,
         display_time: xr::Time,
         overlays: Option<&OverlayMan>,
+        stage: Option<&crate::stage::StageAsset>,
     ) where
+        for<'a> &'a openxr_data::GraphicalSession:
+            TryInto<&'a openxr_data::Session<G::Api>, Error: std::fmt::Display>,
         for<'b> &'b crate::overlay::AnySwapchainMap:
             TryInto<&'b crate::overlay::SwapchainMap<G::Api>, Error: std::fmt::Display>,
+        <G::Api as xr::Graphics>::Format: PartialEq + std::fmt::Debug,
     {
+        if self.frame_error.is_some() {
+            return;
+        }
         let mut proj_layer_views = Vec::new();
+        trace!(
+            "[alyx-comp] end_frame begin should_render={} suspended={} fade_grid={} stage_active={} eye_ready={:?} submitting_null={} image_acquired={}",
+            self.should_render,
+            self.app_suspend_render,
+            self.app_fade_grid,
+            stage.is_some(),
+            self.eyes_submitted
+                .iter()
+                .map(Option::is_some)
+                .collect::<Vec<_>>(),
+            self.submitting_null,
+            self.image_acquired
+        );
 
-        if self.should_render
-            && !self.submitting_null
-            && self.eyes_submitted.iter().all(|eye| eye.is_some())
+        // If the application is suspended and there is no stage we can draw this
+        // frame, release the image before creating any projection views that borrow
+        // the swapchain.
+        if self.app_suspend_render
+            && (!self.should_render || stage.is_none())
+            && self.image_acquired
+            && !self.release_acquired_image()
         {
+            return;
+        }
+
+        let application_projection_ready = self.should_render
+            && !self.app_suspend_render
+            && !self.submitting_null
+            && self.eyes_submitted.iter().all(|eye| eye.is_some());
+        let stage_requested = self.should_render
+            && stage.is_some()
+            && (self.app_suspend_render || self.app_fade_grid);
+        let mut stage_rendered = false;
+
+        if stage_requested && self.swapchain_data.is_none() {
+            let (width, height) = system.recommended_render_target_size();
+            if let Some(info) = self.backend.stage_swapchain_info(width, height) {
+                self.recreate_swapchain(session_data, info);
+                if self.frame_error.is_some() {
+                    return;
+                }
+            }
+        }
+        if stage_requested {
+            let stage = stage.expect("stage_requested requires a stage asset");
+            if self.swapchain_data.is_none() {
+                warn!("stage override is active but no compositor swapchain exists yet");
+            } else {
+                let (recommended_width, recommended_height) =
+                    system.recommended_render_target_size();
+                let needs_recreate = self.swapchain_data.as_ref().is_some_and(|data| {
+                    data.info.width != recommended_width
+                        || data.info.height != recommended_height
+                        || data.info.array_size != 2
+                        || data.info.sample_count != 1
+                });
+
+                if needs_recreate {
+                    if self.image_acquired && !self.release_acquired_image() {
+                        return;
+                    }
+
+                    let current_info = &self
+                        .swapchain_data
+                        .as_ref()
+                        .expect("stage swapchain disappeared")
+                        .info;
+                    let stage_info = xr::SwapchainCreateInfo {
+                        create_flags: current_info.create_flags,
+                        usage_flags: current_info.usage_flags
+                            | xr::SwapchainUsageFlags::COLOR_ATTACHMENT
+                            | xr::SwapchainUsageFlags::TRANSFER_DST,
+                        format: current_info.format,
+                        sample_count: 1,
+                        width: recommended_width,
+                        height: recommended_height,
+                        face_count: current_info.face_count,
+                        array_size: 2,
+                        mip_count: current_info.mip_count,
+                    };
+
+                    info!(
+                        "recreating swapchain for stage override: {}x{}",
+                        recommended_width, recommended_height
+                    );
+                    self.recreate_swapchain(session_data, stage_info);
+                    if self.frame_error.is_some() {
+                        return;
+                    }
+                } else if !self.image_acquired && !self.acquire_swapchain_image() {
+                    return;
+                }
+
+                let crate::system::ViewData { flags, views } =
+                    system.get_views(session_data.current_origin_as_reference_space());
+                let extent = xr::Extent2Di {
+                    width: recommended_width as i32,
+                    height: recommended_height as i32,
+                };
+
+                match self
+                    .backend
+                    .render_stage(stage, &views, self.image_index, extent)
+                {
+                    Ok(()) => {
+                        if self.image_acquired && !self.release_acquired_image() {
+                            return;
+                        }
+
+                        let swapchain_data = self
+                            .swapchain_data
+                            .as_ref()
+                            .expect("stage swapchain disappeared after render");
+                        proj_layer_views = views
+                            .into_iter()
+                            .enumerate()
+                            .map(|(eye_index, view)| {
+                                let pose = xr::Posef {
+                                    orientation: if flags
+                                        .contains(xr::ViewStateFlags::ORIENTATION_VALID)
+                                    {
+                                        view.pose.orientation
+                                    } else {
+                                        xr::Quaternionf::IDENTITY
+                                    },
+                                    position: if flags.contains(xr::ViewStateFlags::POSITION_VALID)
+                                    {
+                                        view.pose.position
+                                    } else {
+                                        xr::Vector3f::default()
+                                    },
+                                };
+
+                                let sub_image = xr::SwapchainSubImage::new()
+                                    .swapchain(&swapchain_data.swapchain)
+                                    .image_array_index(eye_index as u32)
+                                    .image_rect(xr::Rect2Di {
+                                        extent,
+                                        offset: xr::Offset2Di::default(),
+                                    });
+
+                                xr::CompositionLayerProjectionView::new()
+                                    .fov(view.fov)
+                                    .pose(pose)
+                                    .sub_image(sub_image)
+                            })
+                            .collect();
+                        stage_rendered = true;
+                        trace!("stage override projection rendered");
+                    }
+                    Err(error) => {
+                        warn!("failed to render stage override: {error}");
+                        if self.image_acquired && !self.release_acquired_image() {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
+        if !stage_rendered && application_projection_ready {
             let swapchain_data = self
                 .swapchain_data
                 .as_ref()
@@ -1350,7 +1861,14 @@ impl<G: GraphicsBackend> FrameController<G> {
 
         let mut proj_layer = None;
         if !proj_layer_views.is_empty() {
-            trace!("projection layer present");
+            trace!(
+                "{} projection layer present",
+                if stage_rendered {
+                    "stage"
+                } else {
+                    "application"
+                }
+            );
             proj_layer = Some(
                 xr::CompositionLayerProjection::new()
                     .space(session_data.tracking_space())
@@ -1359,18 +1877,45 @@ impl<G: GraphicsBackend> FrameController<G> {
         }
 
         let mut layers: Vec<&xr::CompositionLayerBase<_>> = Vec::new();
-        if let Some(l) = proj_layer.as_ref() {
-            layers.push(l);
+        if let Some(layer) = proj_layer.as_ref() {
+            layers.push(layer);
         }
+
         let overlay_layers;
         if let Some(overlay_man) = overlays {
-            overlay_layers = overlay_man.get_layers(session_data, self.app_fade_grid);
+            // A stage override replaces SteamVR's grid/environment. Do not put the
+            // equirect loading skybox in front of the stage projection.
+            let render_skybox = self.app_fade_grid && !stage_rendered;
+
+            overlay_layers = overlay_man.get_layers(session_data, render_skybox);
             layers.extend(overlay_layers.iter().map(Deref::deref));
         }
 
-        self.stream
-            .end(display_time, xr::EnvironmentBlendMode::OPAQUE, &layers)
-            .unwrap();
+        trace!(
+            "[alyx-comp] xrEndFrame layers={} projection={} projection_source={} app_projection_ready={} stage_requested={} stage_rendered={} suspended={} fade_grid={}",
+            layers.len(),
+            proj_layer.is_some(),
+            if stage_rendered {
+                "stage"
+            } else if proj_layer.is_some() {
+                "application"
+            } else {
+                "none"
+            },
+            application_projection_ready,
+            stage_requested,
+            stage_rendered,
+            self.app_suspend_render,
+            self.app_fade_grid
+        );
+
+        self.backend.finish_gpu_timing();
+        let result = self
+            .stream
+            .end(display_time, xr::EnvironmentBlendMode::OPAQUE, &layers);
+        if let Err(error) = result {
+            self.runtime_error(error);
+        }
 
         trace!("frame submitted");
     }
@@ -1737,12 +2282,22 @@ mod tests {
         assert_eq!(f.submit(vr::EVREye::Left), None);
         assert_eq!(f.submit(vr::EVREye::Right), None);
 
+        f.comp.PostPresentHandoff();
+
         let mut timing = MaybeUninit::new(vr::Compositor_FrameTiming::default());
         unsafe {
             (&raw mut (*timing.as_mut_ptr()).m_nSize)
                 .write(std::mem::size_of::<vr::Compositor_FrameTiming>() as u32);
         }
         assert!(f.comp.GetFrameTiming(timing.as_mut_ptr(), 1));
+        let snapshot = unsafe { timing.assume_init() };
+        assert_eq!(snapshot.m_flCompositorRenderGpuMs, 0.0);
+        assert_eq!(snapshot.m_flTotalRenderGpuMs, 0.0);
+        assert!(snapshot.m_flNewPosesReadyMs >= 0.0);
+        let mut range = [vr::Compositor_FrameTiming::default(); 4];
+        range[0].m_nSize = size_of::<vr::Compositor_FrameTiming>() as u32;
+        assert_eq!(f.comp.GetFrameTimings(range.as_mut_ptr(), 4), 1);
+        assert_eq!(range[0].m_nFrameIndex, snapshot.m_nFrameIndex);
         let small_size = std::mem::offset_of!(vr::Compositor_FrameTiming, m_HmdPose)
             + std::mem::size_of::<vr::TrackedDevicePose_t>();
         unsafe {
@@ -1841,6 +2396,100 @@ mod tests {
             },
             "device exts",
         );
+    }
+
+    #[test]
+    fn cleared_stage_worker_cannot_publish_a_stale_ready_event() {
+        let mut state = StageState {
+            generation: 2,
+            loading: true,
+            worker_active: true,
+            ..Default::default()
+        };
+        // Clear advances the generation; the old worker must still retire but
+        // cannot publish either an asset or readiness for the replacement.
+        state.generation = 3;
+        state.loading = false;
+        let stale = crate::stage::StageAsset {
+            id: 1,
+            source_path: "stale".into(),
+            vertices: Vec::new(),
+            indices: Vec::new(),
+            texture_rgba: vec![255; 4],
+            texture_width: 1,
+            texture_height: 1,
+            model_transform: glam::Mat4::IDENTITY,
+            settings: crate::stage::StageSettings::default(),
+        };
+        assert!(!state.publish(2, Ok(stale)));
+        assert!(!state.worker_active);
+        assert!(!state.loading);
+        assert!(state.asset.is_none());
+    }
+
+    #[test]
+    fn release_failure_stops_submission_without_reusing_image() {
+        let f = Fixture::new();
+        f.ensure_real_session(false);
+        let raw = {
+            let session = f.comp.openxr.session_data.get();
+            let controller = session.comp_data.0.lock().unwrap();
+            let DynFrameController::Fake(controller) = controller.as_ref().unwrap() else {
+                panic!("expected fake controller");
+            };
+            controller
+                .swapchain_data
+                .as_ref()
+                .unwrap()
+                .swapchain
+                .as_raw()
+        };
+        fakexr::set_swapchain_results(
+            raw,
+            xr::sys::Result::SUCCESS,
+            xr::sys::Result::ERROR_SESSION_LOST,
+        );
+        assert_eq!(f.submit(vr::EVREye::Left), None);
+        assert_eq!(f.submit(vr::EVREye::Right), RequestFailed);
+        let ownership = fakexr::swapchain_ownership(raw);
+        assert!(ownership.0);
+        assert_eq!(f.wait_get_poses(), RequestFailed);
+        assert_eq!(f.submit(vr::EVREye::Left), RequestFailed);
+        assert_eq!(fakexr::swapchain_ownership(raw), ownership);
+    }
+
+    #[test]
+    fn wait_timeout_and_error_never_make_an_image_reusable() {
+        for error in [
+            xr::sys::Result::TIMEOUT_EXPIRED,
+            xr::sys::Result::ERROR_RUNTIME_FAILURE,
+        ] {
+            let f = Fixture::new();
+            f.ensure_real_session(false);
+            {
+                let session = f.comp.openxr.session_data.get();
+                let mut controller = session.comp_data.0.lock().unwrap();
+                let DynFrameController::Fake(controller) = controller.as_mut().unwrap() else {
+                    panic!("expected fake controller");
+                };
+                assert!(controller.release_acquired_image());
+                let raw = controller
+                    .swapchain_data
+                    .as_ref()
+                    .unwrap()
+                    .swapchain
+                    .as_raw();
+                fakexr::set_swapchain_results(raw, error, xr::sys::Result::SUCCESS);
+                assert!(!controller.acquire_swapchain_image());
+                assert_eq!(controller.frame_error, Some(error));
+                let ownership = fakexr::swapchain_ownership(raw);
+                assert!(ownership.0);
+                assert!(!controller.release_acquired_image());
+                assert!(!controller.acquire_swapchain_image());
+                assert_eq!(fakexr::swapchain_ownership(raw), ownership);
+            }
+            assert_eq!(f.submit(vr::EVREye::Left), RequestFailed);
+        }
     }
 
     #[test]
