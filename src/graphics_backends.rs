@@ -1,6 +1,8 @@
 mod d3d11;
 #[cfg(target_os = "windows")]
 mod d3d11_stage;
+#[cfg(target_os = "windows")]
+mod d3d11_timing;
 #[cfg(target_os = "linux")]
 mod gl;
 #[cfg(not(target_os = "linux"))]
@@ -28,7 +30,24 @@ pub struct ApplicationGpuTiming {
     pub pre_submit_gpu_ms: f32,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct GpuTiming {
+    pub frame: u32,
+    pub milliseconds: f64,
+}
+
 pub trait GraphicsBackend: Into<SupportedBackend> {
+    fn supports_format_conversion() -> bool {
+        true
+    }
+    fn requires_gpu_timing() -> bool {
+        false
+    }
+    fn begin_gpu_timing(&mut self, _frame: u32) {}
+    fn finish_gpu_timing(&mut self) {}
+    fn poll_gpu_timings(&mut self) -> Vec<GpuTiming> {
+        Vec::new()
+    }
     type Api: xr::Graphics + 'static;
     type OpenVrTexture: Copy;
     type NiceFormat: std::fmt::Debug;
@@ -82,7 +101,7 @@ pub trait GraphicsBackend: Into<SupportedBackend> {
 
     /// Check before changing application swapchains for a stage override.
     fn supports_stage_rendering(&self) -> bool {
-        false
+        self.stage_swapchain_info(1, 1).is_some()
     }
 
     fn render_stage(

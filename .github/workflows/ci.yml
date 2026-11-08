@@ -8,7 +8,7 @@ on:
         type: boolean
         required: false
   push:
-    branches: [ "main", "release-ci" ]
+    branches: [ "main", "release-ci", "integration" ]
   pull_request:
     branches: [ "main" ]
 
@@ -87,9 +87,9 @@ jobs:
     - name: Run tests with miri
       run: cargo +nightly miri test
     - name: Format check
-      run: cargo fmt --check
+      run: cargo +stable fmt --check
     - name: Clippy
-      run: cargo clippy --workspace --all-targets
+      run: cargo +stable clippy --workspace --all-targets
     - name: Copy to directory
       run: mkdir -p out/xrizer && cp -r -L target/release/bin out/xrizer
     - name: Upload

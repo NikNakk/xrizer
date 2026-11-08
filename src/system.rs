@@ -686,10 +686,25 @@ impl vr::IVRSystem026_Interface for System {
                 // something to even get the game to recognize the HMD's location. However, the value
                 // itself doesn't appear to be that important.
                 vr::ETrackedDeviceProperty::SerialNumber_String
-                | vr::ETrackedDeviceProperty::ManufacturerName_String
                 | vr::ETrackedDeviceProperty::ControllerType_String => {
                     Some(CString::new("<unknown>").unwrap())
                 }
+                // OpenXR does not name a manufacturer: report the runtime and system
+                // names, as SteamVR drivers built on OpenXR runtimes do.
+                vr::ETrackedDeviceProperty::ManufacturerName_String => Some(
+                    self.openxr
+                        .instance
+                        .properties()
+                        .ok()
+                        .and_then(|p| CString::new(p.runtime_name).ok())
+                        .unwrap_or_else(|| CString::new("<unknown>").unwrap()),
+                ),
+                vr::ETrackedDeviceProperty::ModelNumber_String => self
+                    .openxr
+                    .instance
+                    .system_properties(self.openxr.system_id)
+                    .ok()
+                    .and_then(|p| CString::new(p.system_name).ok()),
                 _ => None,
             },
             _ => self
@@ -828,6 +843,9 @@ impl vr::IVRSystem026_Interface for System {
             return 0.0;
         }
 
+        if let Some(error) = unsafe { error.as_mut() } {
+            *error = vr::ETrackedPropertyError::Success;
+        }
         match prop {
             vr::ETrackedDeviceProperty::UserIpdMeters_Float => {
                 let views = self.get_views(xr::ReferenceSpaceType::VIEW).views;
@@ -1206,6 +1224,7 @@ mod tests {
     use super::*;
     use crate::{clientcore::Injector, openxr_data::OpenXrData};
     use std::ffi::CStr;
+    use std::sync::atomic::Ordering;
     use vr::IVRSystem022_Interface;
 
     #[test]
@@ -1303,6 +1322,23 @@ mod tests {
     }
 
     #[test]
+    fn display_frequency_is_a_rate() {
+        let xr = Arc::new(OpenXrData::new(&Injector::default()).unwrap());
+        let system = System::new(xr.clone(), &Injector::default());
+        xr.display_period_nanos.store(8_333_333, Ordering::Relaxed);
+
+        // Callers such as Half-Life: Alyx treat an untouched error as a failure.
+        let mut err = vr::ETrackedPropertyError::UnknownProperty;
+        let rate = system.GetFloatTrackedDeviceProperty(
+            vr::k_unTrackedDeviceIndex_Hmd,
+            vr::ETrackedDeviceProperty::DisplayFrequency_Float,
+            &mut err,
+        );
+        assert_eq!(err, vr::ETrackedPropertyError::Success);
+        assert!((rate - 120.0).abs() < 0.01, "{rate}");
+    }
+
+    #[test]
     fn unity_required_properties() {
         let xr = Arc::new(OpenXrData::new(&Injector::default()).unwrap());
         let injector = Injector::default();
@@ -1341,6 +1377,7 @@ mod tests {
 
         test_prop(vr::ETrackedDeviceProperty::SerialNumber_String);
         test_prop(vr::ETrackedDeviceProperty::ManufacturerName_String);
+        test_prop(vr::ETrackedDeviceProperty::ModelNumber_String);
         test_prop(vr::ETrackedDeviceProperty::ControllerType_String);
     }
 }

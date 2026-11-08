@@ -818,8 +818,10 @@ fn action_origins_match_pose_and_skeleton_hands() {
     f.load_actions(c"actions.json");
     f.set_interaction_profile::<Knuckles>(LeftHand);
     f.set_interaction_profile::<Knuckles>(RightHand);
-    f.input.openxr.poll_events();
-    f.input.openxr.poll_events();
+    f.sync(vr::VRActiveActionSet_t {
+        ulActionSet: set,
+        ..Default::default()
+    });
 
     let get_origins = |action| {
         let mut origins = [vr::k_ulInvalidInputValueHandle; 2];
@@ -1285,4 +1287,30 @@ fn application_gaze_manifest_requires_synced_pose_set() {
     let data = f.input.openxr.session_data.get();
     f.input.update_fdm_gaze(&data, xr::Time::from_nanos(42));
     assert!(data.fdm_gaze.lock().unwrap().is_some());
+}
+
+#[test]
+fn binding_query_with_session_restart_pending() {
+    let f = Fixture::new();
+    f.load_actions(c"actions.json");
+    let handle = f.get_action_handle(c"/actions/set1/in/boolact");
+    let session = f.input.openxr.session_data.get();
+    let barrier = Barrier::new(2);
+    std::thread::scope(|scope| {
+        let writer = scope.spawn(|| {
+            barrier.wait();
+            f.input.openxr.restart_session();
+        });
+        barrier.wait();
+        // Keep our read guard while the restart queues its exclusive guard.
+        // A second read would wait behind that writer, which needs our guard.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        f.input.state_from_bindings(&session, handle, 0);
+        f.input
+            .state_from_bindings(&session, handle, f.input.left_hand_key.0.as_ffi());
+        f.input
+            .state_from_bindings(&session, handle, f.input.right_hand_key.0.as_ffi());
+        drop(session);
+        writer.join().unwrap();
+    });
 }

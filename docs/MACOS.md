@@ -57,10 +57,9 @@ by Metal. Whether a Metal backend is worth adding comes afterwards.
 
 Unchanged: input, the compositor and everything else. They are platform-neutral Rust.
 
-Three input tests (`action_origins_match_pose_and_skeleton_hands`,
-`non_hand_restriction_activates_only_secondary_set_for_hands`,
-`restricted_action_set_activates_secondary_set_for_other_hand`) fail on Linux on
-`windows-openxr-d3d11` before this branch too. The macOS workflow skips them.
+The `integration` branch joins this work with `windows-openxr-d3d11`. With the
+Windows input changes in, the whole library test suite passes on macOS and the
+workflow no longer skips any tests.
 
 ## Build
 

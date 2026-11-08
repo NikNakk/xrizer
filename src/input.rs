@@ -16,7 +16,7 @@ use skeletal::FingerState;
 use skeletal::SkeletalInputActionData;
 
 use crate::input::devices::ProfileData;
-use crate::input::profiles::{RunWithProfile, knuckles::Knuckles};
+use crate::input::profiles::RunWithProfile;
 use crate::{
     AtomicF32,
     openxr_data::{self, Hand, OpenXrData, SessionData},
@@ -121,7 +121,7 @@ impl<C: openxr_data::Compositor> Input<C> {
             .set(pose_data)
             .unwrap_or_else(|_| panic!("PoseData already setup"));
 
-        let input = Self {
+        Self {
             openxr,
             vtables: Default::default(),
             input_source_map: RwLock::new(map),
@@ -141,14 +141,7 @@ impl<C: openxr_data::Compositor> Input<C> {
             alyx_diagnostic_markers: Mutex::default(),
             alyx_diagnostic_last_sample: Mutex::default(),
             loading_actions: false.into(),
-        };
-
-        if input.fake_controllers_enabled() {
-            let data = input.openxr.session_data.get();
-            input.ensure_fake_controllers(&data);
         }
-
-        input
     }
 
     fn get_subaction_path(&self, hand: Hand) -> xr::Path {
@@ -158,23 +151,17 @@ impl<C: openxr_data::Compositor> Input<C> {
         }
     }
 
-    fn fake_controllers_enabled(&self) -> bool {
-        std::env::var("XRIZER_FAKE_CONTROLLERS")
-            .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
-    }
-
     fn alyx_input_diagnostics_enabled(&self) -> bool {
-        std::env::var("XRIZER_ALYX_INPUT_DIAGNOSTICS")
-            .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+        log::log_enabled!(log::Level::Trace)
     }
 
-    fn alyx_diagnostic_once(&self, marker: impl Into<String>) -> bool {
+    fn alyx_diagnostic_once(&self, marker: impl FnOnce() -> String) -> bool {
         self.alyx_input_diagnostics_enabled()
             && self
                 .alyx_diagnostic_markers
                 .lock()
                 .unwrap()
-                .insert(marker.into())
+                .insert(marker())
     }
 
     fn alyx_diagnostic_sample(&self, key: &str) -> bool {
@@ -203,49 +190,6 @@ impl<C: openxr_data::Compositor> Input<C> {
         )
     }
 
-    fn fake_controller_profile_path(&self) -> xr::Path {
-        self.openxr
-            .instance
-            .string_to_path(Knuckles::profile_path())
-            .expect("failed to create fake Knuckles interaction profile path")
-    }
-
-    fn ensure_fake_controllers(&self, session_data: &SessionData) {
-        if !self.fake_controllers_enabled() {
-            return;
-        }
-
-        let profile_path = self.fake_controller_profile_path();
-        let mut devices = session_data.input_data.devices.write().unwrap();
-
-        for hand in [Hand::Left, Hand::Right] {
-            if let Some(controller) = devices.get_controller_mut(hand) {
-                controller.profile_path = profile_path;
-                controller.profile_data = Some(ProfileData::new::<Knuckles>());
-                controller.connected = true;
-                continue;
-            }
-
-            let mut device = TrackedDevice::new(
-                TrackedDeviceType::Controller {
-                    hand,
-                    hand_tracker: None,
-                    skeleton_cache: Mutex::new(Default::default()),
-                },
-                Some(profile_path),
-                Some(ProfileData::new::<Knuckles>()),
-            );
-            device.connected = true;
-            let index = devices.push_device(device).unwrap_or_else(|error| {
-                panic!("failed to create fake {hand:?} controller: {error:?}")
-            });
-            info!(
-                "created fake OpenVR {hand:?} controller at tracked-device index {index} using {}",
-                Knuckles::profile_path()
-            );
-        }
-    }
-
     fn effective_interaction_profile(
         &self,
         session_data: &SessionData,
@@ -255,11 +199,7 @@ impl<C: openxr_data::Compositor> Input<C> {
             .session
             .current_interaction_profile(subaction)
             .ok()?;
-        if profile == xr::Path::NULL && self.fake_controllers_enabled() {
-            Some(self.fake_controller_profile_path())
-        } else {
-            Some(profile)
-        }
+        Some(profile)
     }
 
     fn subaction_path_from_handle(&self, handle: vr::VRInputValueHandle_t) -> Option<xr::Path> {
@@ -276,19 +216,21 @@ impl<C: openxr_data::Compositor> Input<C> {
 
     fn state_from_bindings_left_right(
         &self,
+        session: &SessionData,
         action: vr::VRActionHandle_t,
     ) -> Option<(xr::ActionState<bool>, vr::VRInputValueHandle_t)> {
         debug_assert!(self.left_hand_key.0.as_ffi() != 0);
         debug_assert!(self.right_hand_key.0.as_ffi() != 0);
-        let left_state = self.state_from_bindings(action, self.left_hand_key.0.as_ffi());
+        let left_state = self.state_from_bindings(session, action, self.left_hand_key.0.as_ffi());
 
         match left_state {
-            None => self.state_from_bindings(action, self.right_hand_key.0.as_ffi()),
+            None => self.state_from_bindings(session, action, self.right_hand_key.0.as_ffi()),
             Some((left, _)) => {
                 if left.is_active && left.current_state {
                     return left_state;
                 }
-                let right_state = self.state_from_bindings(action, self.right_hand_key.0.as_ffi());
+                let right_state =
+                    self.state_from_bindings(session, action, self.right_hand_key.0.as_ffi());
                 match right_state {
                     None => left_state,
                     Some((right, _)) => {
@@ -307,20 +249,22 @@ impl<C: openxr_data::Compositor> Input<C> {
 
     fn state_from_bindings(
         &self,
+        session: &SessionData,
         action: vr::VRActionHandle_t,
         restrict_to_device: vr::VRInputValueHandle_t,
     ) -> Option<(xr::ActionState<bool>, vr::VRInputValueHandle_t)> {
         let subaction = self.subaction_path_from_handle(restrict_to_device)?;
         if subaction == xr::Path::NULL {
-            return self.state_from_bindings_left_right(action);
+            return self.state_from_bindings_left_right(session, action);
         }
 
-        let session = self.openxr.session_data.get();
+        // Reuse the caller's session guard: a nested read can deadlock when
+        // the compositor queues a writer to replace the graphics session.
         let LoadedActions::Manifest(loaded_actions) = session.input_data.actions.get()? else {
             return None;
         };
 
-        let interaction_profile = self.effective_interaction_profile(&session, subaction)?;
+        let interaction_profile = self.effective_interaction_profile(session, subaction)?;
         let bindings = loaded_actions
             .try_get_bindings(action, interaction_profile)
             .ok()?;
@@ -329,7 +273,7 @@ impl<C: openxr_data::Compositor> Input<C> {
         let mut best_state: Option<xr::ActionState<bool>> = None;
 
         for x in bindings.iter() {
-            let Ok(Some(state)) = x.state(&session, extra_data, subaction) else {
+            let Ok(Some(state)) = x.state(session, extra_data, subaction) else {
                 continue;
             };
 
@@ -662,9 +606,13 @@ impl<C: openxr_data::Compositor> vr::IVRInput011_Interface for Input<C> {
             }
         }
 
-        let action_path = self.action_path(action_handle);
-        if self.alyx_diagnostic_once(format!("origins:{action_path}")) {
-            info!(
+        let action_path = if self.alyx_input_diagnostics_enabled() {
+            self.action_path(action_handle)
+        } else {
+            Default::default()
+        };
+        if self.alyx_diagnostic_once(|| format!("origins:{action_path}")) {
+            trace!(
                 "[alyx-input] origins action={action_path} returned={:?}",
                 &output[..next]
             );
@@ -745,14 +693,15 @@ impl<C: openxr_data::Compositor> vr::IVRInput011_Interface for Input<C> {
 
         self.get_bone_summary_from_hand_tracking(&session_data, summary_type, data, *hand);
 
-        let action_path = self.action_path(action_handle);
-
-        if self.alyx_diagnostic_sample(&format!("summary:{action_path}")) {
-            info!(
-                "[alyx-input] skeletal-sample \
-                action={action_path} hand={hand:?} \
-                type={summary_type:?} curls={:?} splays={:?}",
-                data.flFingerCurl, data.flFingerSplay,
+        let action_path = if self.alyx_input_diagnostics_enabled() {
+            self.action_path(action_handle)
+        } else {
+            Default::default()
+        };
+        if self.alyx_diagnostic_once(|| format!("skeletal-summary:{action_path}")) {
+            trace!(
+                "[alyx-input] skeletal-summary action={action_path} hand={hand:?} type={summary_type:?} curls={:?} splays={:?}",
+                data.flFingerCurl, data.flFingerSplay
             );
         }
         vr::EVRInputError::None
@@ -909,19 +858,21 @@ impl<C: openxr_data::Compositor> vr::IVRInput011_Interface for Input<C> {
         let active = pose_data
             .grip
             .is_active(&data.session, xr::Path::NULL)
-            .unwrap()
-            || self.fake_controllers_enabled();
+            .unwrap();
         unsafe {
             std::ptr::addr_of_mut!((*action_data).bActive).write(active);
             std::ptr::addr_of_mut!((*action_data).activeOrigin).write(origin);
         }
-        let action_path = self.action_path(action);
-
-        if self.alyx_diagnostic_sample(&format!("skeletal-active:{action_path}")) {
-            info!(
-                "[alyx-input] skeletal-state \
-                action={action_path} hand={hand:?} \
-                active={active} origin={origin}"
+        let action_path = if self.alyx_input_diagnostics_enabled() {
+            self.action_path(action)
+        } else {
+            Default::default()
+        };
+        if self.alyx_diagnostic_once(|| format!("skeletal-action:{action_path}")) {
+            let index = self.get_controller_device_index(hand);
+            trace!(
+                "[alyx-input] skeletal-action action={action_path} hand={hand:?} device={index:?} active={active} active_origin={origin} tracking_level={:?}",
+                vr::EVRSkeletalTrackingLevel::Partial
             );
         }
         vr::EVRInputError::None
@@ -1070,8 +1021,13 @@ impl<C: openxr_data::Compositor> vr::IVRInput011_Interface for Input<C> {
             });
         }
 
-        let action_path = self.action_path(action);
-        if self.alyx_diagnostic_once(format!("pose:{action_path}:{restrict_to_device}:{hand:?}")) {
+        let action_path = if self.alyx_input_diagnostics_enabled() {
+            self.action_path(action)
+        } else {
+            Default::default()
+        };
+        if self.alyx_diagnostic_once(|| format!("pose:{action_path}:{restrict_to_device}:{hand:?}"))
+        {
             let index = self.get_controller_device_index(hand);
             let profile = {
                 let session_data = self.openxr.session_data.get();
@@ -1116,7 +1072,7 @@ impl<C: openxr_data::Compositor> vr::IVRInput011_Interface for Input<C> {
             let position = pose.mDeviceToAbsoluteTracking.m[0][3];
             let position_y = pose.mDeviceToAbsoluteTracking.m[1][3];
             let position_z = pose.mDeviceToAbsoluteTracking.m[2][3];
-            info!(
+            trace!(
                 "[alyx-input] pose action={action_path} restrict={restrict_to_device} hand={hand:?} device={index:?} connected={} role={:?} profile={profile} controller_type={:?} render_model={:?} registered_type={:?} tracking_system={:?} active=true active_origin={active_origin} valid={} tracking={:?} position=({position:.3},{position_y:.3},{position_z:.3})",
                 index.is_some_and(|index| self.is_device_connected(index)),
                 vr::ETrackedControllerRole::from(hand),
@@ -1167,14 +1123,14 @@ impl<C: openxr_data::Compositor> vr::IVRInput011_Interface for Input<C> {
         let subaction_path = get_subaction_path!(self, restrict_to_device, action_data);
 
         let mut active_hand = restrict_to_device;
-        let (mut state, delta) = match action {
+        let (state, delta) = match action {
             ActionData::Vector1 { action, last_value } => {
                 let mut state = action.state(&session_data.session, subaction_path).unwrap();
 
                 // It's generally not clear how SteamVR handles float actions with multiple bindings;
                 //   so emulate OpenXR, which takes maximum among active actions
                 if let Some((binding_state, binding_source)) =
-                    self.state_from_bindings(handle, restrict_to_device)
+                    self.state_from_bindings(&session_data, handle, restrict_to_device)
                     && binding_state.is_active
                     && (binding_state.current_state && state.current_state != 1.0
                         || !state.is_active)
@@ -1219,13 +1175,6 @@ impl<C: openxr_data::Compositor> vr::IVRInput011_Interface for Input<C> {
             }
             _ => return vr::EVRInputError::WrongType,
         };
-
-        if self.fake_controllers_enabled() && !state.is_active {
-            state.is_active = true;
-            if active_hand == vr::k_ulInvalidInputValueHandle {
-                active_hand = self.left_hand_key.0.as_ffi();
-            }
-        }
 
         *out.value = vr::InputAnalogActionData_t {
             bActive: state.is_active,
@@ -1282,21 +1231,12 @@ impl<C: openxr_data::Compositor> vr::IVRInput011_Interface for Input<C> {
 
         let mut active_hand = restrict_to_device;
         if let Some((binding_state, binding_source)) =
-            self.state_from_bindings(handle, restrict_to_device)
+            self.state_from_bindings(&session_data, handle, restrict_to_device)
             && binding_state.is_active
             && (binding_state.current_state && !state.current_state || !state.is_active)
         {
             state = binding_state;
             active_hand = binding_source;
-        }
-
-        if self.fake_controllers_enabled() && !state.is_active {
-            state.is_active = true;
-            state.current_state = false;
-            state.changed_since_last_sync = false;
-            if active_hand == vr::k_ulInvalidInputValueHandle {
-                active_hand = self.left_hand_key.0.as_ffi();
-            }
         }
 
         *out.value = vr::InputDigitalActionData_t {
@@ -1308,8 +1248,12 @@ impl<C: openxr_data::Compositor> vr::IVRInput011_Interface for Input<C> {
         };
 
         if self.alyx_input_diagnostics_enabled() && state.changed_since_last_sync {
-            let action_path = self.action_path(handle);
-            info!(
+            let action_path = if self.alyx_input_diagnostics_enabled() {
+                self.action_path(handle)
+            } else {
+                Default::default()
+            };
+            trace!(
                 "[alyx-input] digital-edge action={action_path} restrict={restrict_to_device} active={} state={} origin={active_hand}",
                 state.is_active, state.current_state,
             );
@@ -1407,11 +1351,13 @@ impl<C: openxr_data::Compositor> vr::IVRInput011_Interface for Input<C> {
                     ));
                 }
 
-                if self.alyx_diagnostic_once(format!(
-                    "active-set:{}:{}:{}",
-                    set.ulActionSet, set.ulRestrictedToDevice, set.ulSecondaryActionSet
-                )) {
-                    info!(
+                if self.alyx_diagnostic_once(|| {
+                    format!(
+                        "active-set:{}:{}:{}",
+                        set.ulActionSet, set.ulRestrictedToDevice, set.ulSecondaryActionSet
+                    )
+                }) {
+                    trace!(
                         "[alyx-input] active-set primary={} restrict_handle={} restrict_path={restricted_path:?} restrict_source={restricted_source:?} secondary_handle={}",
                         name.unwrap(),
                         set.ulRestrictedToDevice,
@@ -1762,12 +1708,7 @@ impl<C: openxr_data::Compositor> Input<C> {
                 .session
                 .current_interaction_profile(subaction_path)
                 .unwrap();
-            let profile_path =
-                if runtime_profile_path == xr::Path::NULL && self.fake_controllers_enabled() {
-                    self.fake_controller_profile_path()
-                } else {
-                    runtime_profile_path
-                };
+            let profile_path = runtime_profile_path;
 
             if let Some(controller) = controller.as_mut() {
                 controller.profile_path = profile_path;
@@ -2032,7 +1973,6 @@ impl<C: openxr_data::Compositor> Input<C> {
                 self.openxr.enabled_extensions.ext_eye_gaze_interaction,
             ))
             .unwrap_or_else(|_| panic!("PoseData already setup"));
-        self.ensure_fake_controllers(data);
         if let Some(path) = self.loaded_actions_path.get() {
             let _ = self.load_action_manifest(data, path);
         }
@@ -2066,8 +2006,8 @@ impl<C: openxr_data::Compositor> Input<C> {
                     if current { "" } else { "not " }
                 );
 
-                if self.alyx_diagnostic_once(format!("device-event:{i}:{current}")) {
-                    info!(
+                if self.alyx_diagnostic_once(|| format!("device-event:{i}:{current}")) {
+                    trace!(
                         "[alyx-input] device-event device={i} type={:?} event={:?}",
                         device.get_type(),
                         if current {
