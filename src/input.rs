@@ -185,10 +185,10 @@ impl<C: openxr_data::Compositor> Input<C> {
         let now = Instant::now();
         let mut samples = self.alyx_diagnostic_last_sample.lock().unwrap();
 
-        if let Some(last) = samples.get(key) {
-            if now.duration_since(*last) < Duration::from_millis(100) {
-                return false;
-            }
+        if let Some(last) = samples.get(key)
+            && now.duration_since(*last) < Duration::from_millis(100)
+        {
+            return false;
         }
 
         samples.insert(key.to_owned(), now);
