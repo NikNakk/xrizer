@@ -34,9 +34,8 @@ pub trait GraphicsBackend: Into<SupportedBackend> {
     fn requires_gpu_timing() -> bool {
         false
     }
-    /// Whether copied images keep OpenGL's bottom-to-top row order, so the projection
-    /// layer must present them flipped.
-    fn submits_bottom_up(&self) -> bool {
+    /// Whether copies already apply inverted bounds, so the layer must not be flipped.
+    fn copies_apply_inverted_bounds(&self) -> bool {
         false
     }
     fn begin_gpu_timing(&mut self, _frame: u32) {}

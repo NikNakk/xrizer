@@ -1595,7 +1595,7 @@ impl<G: GraphicsBackend> FrameController<G> {
                             submit_flags,
                         ),
                         flip_vertically: bounds.vertically_flipped()
-                            != self.backend.submits_bottom_up(),
+                            && !self.backend.copies_apply_inverted_bounds(),
                     }
                 })
                 .or_else(|| {

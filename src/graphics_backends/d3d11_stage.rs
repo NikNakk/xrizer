@@ -513,7 +513,7 @@ fn create_buffer(
     Ok(buffer)
 }
 
-fn compile_shader(source: &str, entry: &str, target: &str) -> Result<ID3DBlob, String> {
+pub(super) fn compile_shader(source: &str, entry: &str, target: &str) -> Result<ID3DBlob, String> {
     let entry = std::ffi::CString::new(entry).map_err(|e| e.to_string())?;
     let target = std::ffi::CString::new(target).map_err(|e| e.to_string())?;
     let source_name = s!("xrizer-stage.hlsl");
@@ -549,7 +549,7 @@ fn compile_shader(source: &str, entry: &str, target: &str) -> Result<ID3DBlob, S
     code.ok_or_else(|| format!("D3DCompile({entry:?}) returned no bytecode"))
 }
 
-fn blob_bytes(blob: &ID3DBlob) -> &[u8] {
+pub(super) fn blob_bytes(blob: &ID3DBlob) -> &[u8] {
     unsafe {
         std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize())
     }
