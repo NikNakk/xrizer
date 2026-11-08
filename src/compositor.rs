@@ -733,7 +733,7 @@ impl vr::IVRCompositor029_Interface for Compositor {
         true
     }
     fn GetLastFrameRenderer(&self) -> u32 {
-        todo!()
+        0
     }
     fn GetCurrentSceneFocusProcess(&self) -> u32 {
         todo!()
@@ -2939,6 +2939,28 @@ mod tests {
         assert_eq!(f.wait_get_poses(), None);
 
         f.check_frame_state(fakexr::FrameState::Waited);
+    }
+
+    #[test]
+    fn explicit_timing_submit_without_begun_frame() {
+        let f = Fixture::new();
+        f.comp.SetExplicitTimingMode(
+            vr::EVRCompositorTimingMode::Explicit_ApplicationPerformsPostPresentHandoff,
+        );
+
+        // The first Submit restarts the session while no frame has been begun, so the new swapchain has no acquired image when both eyes have been submitted
+        assert_eq!(f.wait_get_poses(), None);
+        assert_eq!(f.submit(vr::EVREye::Left), None);
+        assert_eq!(f.submit(vr::EVREye::Right), None);
+
+        // The next frame should proceed as usual
+        assert_eq!(f.wait_get_poses(), None);
+        assert_eq!(f.comp.SubmitExplicitTimingData(), None);
+        f.check_frame_state(fakexr::FrameState::Begun);
+        assert_eq!(f.submit(vr::EVREye::Left), None);
+        assert_eq!(f.submit(vr::EVREye::Right), None);
+        f.comp.PostPresentHandoff();
+        f.check_frame_state(fakexr::FrameState::Ended);
     }
 
     #[test]

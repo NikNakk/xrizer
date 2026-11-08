@@ -129,7 +129,7 @@ fn load_macos_openxr_loader() -> xr::Entry {
         )
         .collect();
     for path in &candidates {
-        match unsafe { xr::Entry::load_from(std::path::Path::new(path)) } {
+        match unsafe { xr::Entry::load_from(std::path::Path::new(path), &()) } {
             Ok(entry) => {
                 info!("OpenXR: loaded {path}");
                 return entry;
@@ -148,20 +148,23 @@ fn make_version() -> u32 {
 
 impl<C: Compositor> OpenXrData<C> {
     pub fn new(injector: &Injector) -> Result<Self, InitError> {
+        let platform_info = ();
+
         #[cfg(all(not(test), feature = "static-openxr"))]
-        let entry = xr::Entry::linked();
+        let entry = xr::Entry::linked(&platform_info).expect("Failed to linked OpenXR loader");
 
         #[cfg(all(not(test), not(feature = "static-openxr"), not(target_os = "macos")))]
-        let entry = unsafe { xr::Entry::load() }
+        let entry = unsafe { xr::Entry::load(&platform_info) }
             .expect("Failed to load OpenXR loader — is libopenxr-loader installed?");
 
         #[cfg(all(not(test), not(feature = "static-openxr"), target_os = "macos"))]
         let entry = load_macos_openxr_loader();
 
         #[cfg(test)]
-        let entry =
-            unsafe { xr::Entry::from_get_instance_proc_addr(fakexr::get_instance_proc_addr) }
-                .unwrap();
+        let entry = unsafe {
+            xr::Entry::from_get_instance_proc_addr(fakexr::get_instance_proc_addr, &platform_info)
+        }
+        .unwrap();
 
         let supported_exts = entry
             .enumerate_extensions()
@@ -190,6 +193,8 @@ impl<C: Compositor> OpenXrData<C> {
                 crate::fdm_gaze::warn_unsupported();
             }
         }
+        exts.ext_view_configuration_views_change =
+            supported_exts.ext_view_configuration_views_change;
 
         // Extension that enables simple full body tracking support via generic tracked devices.
         // Available only in the Monado OpenXR runtime.
@@ -213,6 +218,7 @@ impl<C: Compositor> OpenXrData<C> {
                 },
                 &exts,
                 &[],
+                &platform_info,
             )
             .map_err(InitError::InstanceCreationFailed)?;
 
