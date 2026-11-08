@@ -95,33 +95,32 @@ mod platform {
             Some(data)
         }
 
-        /// The D3D11 texture and box to copy for a submitted texture: OpenGL textures
-        /// are first staged into D3D11.
-        fn source(
+        /// Copies an OpenGL texture (`self.gl`) upright into slice `slice` of `dst`,
+        /// unless its bounds are inverted.
+        fn copy_gl(
             &self,
+            gl: &GlSource,
             eye: vr::EVREye,
             texture: *mut c_void,
             bounds: vr::VRTextureBounds_t,
-            flip_gl_rows: bool,
-        ) -> Option<(ManuallyDrop<ID3D11Texture2D>, D3D11_BOX, xr::Extent2Di)> {
-            if let Some(gl) = &self.gl {
-                let (staging, src_box) = gl.source(
-                    &self.device,
-                    &self.context,
-                    eye,
-                    texture as usize as u32,
-                    bounds,
-                    flip_gl_rows,
-                )?;
-                let extent = xr::Extent2Di {
-                    width: (src_box.right - src_box.left) as i32,
-                    height: (src_box.bottom - src_box.top) as i32,
-                };
-                return Some((Self::borrow_texture(staging), src_box, extent));
-            }
-            let src_desc = Self::texture_desc(texture);
-            let (src_box, extent) = Self::rect_from_bounds(&src_desc, bounds);
-            Some((Self::borrow_texture(texture), src_box, extent))
+            dst: usize,
+            slice: u32,
+        ) -> xr::Extent2Di {
+            let dst = Self::borrow_texture(dst as *mut c_void);
+            gl.copy(
+                &self.device,
+                &self.context,
+                eye,
+                texture as usize as u32,
+                bounds,
+                bounds.vMin <= bounds.vMax,
+                &dst,
+                slice,
+            )
+            .unwrap_or(xr::Extent2Di {
+                width: 0,
+                height: 0,
+            })
         }
 
         fn borrow_texture(handle: *mut c_void) -> ManuallyDrop<ID3D11Texture2D> {
@@ -184,7 +183,7 @@ mod platform {
         fn requires_gpu_timing() -> bool {
             true
         }
-        fn submits_bottom_up(&self) -> bool {
+        fn copies_apply_inverted_bounds(&self) -> bool {
             self.gl.is_some()
         }
         fn begin_gpu_timing(&mut self, frame: u32) {
@@ -287,13 +286,12 @@ mod platform {
                 };
             };
 
-            let zero = xr::Extent2Di {
-                width: 0,
-                height: 0,
-            };
-            let Some((src, src_box, extent)) = self.source(eye, texture, bounds, false) else {
-                return zero;
-            };
+            if let Some(gl) = &self.gl {
+                return self.copy_gl(gl, eye, texture, bounds, dst, eye as u32);
+            }
+            let src_desc = Self::texture_desc(texture);
+            let (src_box, extent) = Self::rect_from_bounds(&src_desc, bounds);
+            let src = Self::borrow_texture(texture);
             let dst = Self::borrow_texture(dst as *mut c_void);
 
             unsafe {
@@ -325,17 +323,12 @@ mod platform {
                 };
             };
 
-            let zero = xr::Extent2Di {
-                width: 0,
-                height: 0,
-            };
-            // Overlays have no flipped layer: GL rows are reversed on the CPU.
-            let flip = bounds.vMin <= bounds.vMax;
-            let Some((src, src_box, extent)) =
-                self.source(vr::EVREye::Left, texture, bounds, flip)
-            else {
-                return zero;
-            };
+            if let Some(gl) = &self.gl {
+                return self.copy_gl(gl, vr::EVREye::Left, texture, bounds, dst, 0);
+            }
+            let src_desc = Self::texture_desc(texture);
+            let (src_box, extent) = Self::rect_from_bounds(&src_desc, bounds);
+            let src = Self::borrow_texture(texture);
             let dst = Self::borrow_texture(dst as *mut c_void);
 
             unsafe {
