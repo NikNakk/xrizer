@@ -4,6 +4,7 @@ use openxr as xr;
 
 #[cfg(target_os = "windows")]
 mod platform {
+    use super::super::d3d11_gl::GlSource;
     use super::super::d3d11_stage::StageRenderer;
     use super::super::d3d11_timing::GpuTimer;
     use super::*;
@@ -23,6 +24,8 @@ mod platform {
         images: Vec<usize>,
         stage_renderer: Option<StageRenderer>,
         timings: GpuTimer,
+        /// Set when the application submits OpenGL textures (names, not D3D11 pointers).
+        gl: Option<GlSource>,
     }
 
     impl D3D11Data {
@@ -44,6 +47,7 @@ mod platform {
                     context,
                     images: Vec::new(),
                     stage_renderer: None,
+                    gl: None,
                 })
             }
         }
@@ -77,8 +81,47 @@ mod platform {
                     context,
                     images: Vec::new(),
                     stage_renderer: None,
+                    gl: None,
                 })
             }
+        }
+
+        /// A D3D11 session fed by OpenGL textures. Called from Submit, where the
+        /// application's GL context is current.
+        pub fn new_for_gl() -> Option<Self> {
+            let gl = GlSource::new()?;
+            let mut data = Self::new_temporary()?;
+            data.gl = Some(gl);
+            Some(data)
+        }
+
+        /// The D3D11 texture and box to copy for a submitted texture: OpenGL textures
+        /// are first staged into D3D11.
+        fn source(
+            &self,
+            eye: vr::EVREye,
+            texture: *mut c_void,
+            bounds: vr::VRTextureBounds_t,
+            flip_gl_rows: bool,
+        ) -> Option<(ManuallyDrop<ID3D11Texture2D>, D3D11_BOX, xr::Extent2Di)> {
+            if let Some(gl) = &self.gl {
+                let (staging, src_box) = gl.source(
+                    &self.device,
+                    &self.context,
+                    eye,
+                    texture as usize as u32,
+                    bounds,
+                    flip_gl_rows,
+                )?;
+                let extent = xr::Extent2Di {
+                    width: (src_box.right - src_box.left) as i32,
+                    height: (src_box.bottom - src_box.top) as i32,
+                };
+                return Some((Self::borrow_texture(staging), src_box, extent));
+            }
+            let src_desc = Self::texture_desc(texture);
+            let (src_box, extent) = Self::rect_from_bounds(&src_desc, bounds);
+            Some((Self::borrow_texture(texture), src_box, extent))
         }
 
         fn borrow_texture(handle: *mut c_void) -> ManuallyDrop<ID3D11Texture2D> {
@@ -141,6 +184,9 @@ mod platform {
         fn requires_gpu_timing() -> bool {
             true
         }
+        fn submits_bottom_up(&self) -> bool {
+            self.gl.is_some()
+        }
         fn begin_gpu_timing(&mut self, frame: u32) {
             self.timings.begin(frame);
         }
@@ -168,6 +214,10 @@ mod platform {
             if texture.handle.is_null() {
                 return None;
             }
+            // An OpenGL texture name; only a D3D11Data made by new_for_gl receives these.
+            if texture.eType == vr::ETextureType::OpenGL {
+                return Some(texture.handle);
+            }
             let desc = Self::texture_desc(texture.handle);
             // Resolving MSAA and choosing an array source require separate paths.
             if desc.SampleDesc.Count != 1 || desc.ArraySize != 1 {
@@ -182,15 +232,25 @@ mod platform {
             bounds: vr::VRTextureBounds_t,
             color_space: vr::EColorSpace,
         ) -> xr::SwapchainCreateInfo<Self::Api> {
-            let desc = Self::texture_desc(texture);
-            let (_, extent) = Self::rect_from_bounds(&desc, bounds);
+            let (extent, format, samples) = match &self.gl {
+                Some(gl) => (
+                    gl.extent(texture as usize as u32, bounds),
+                    gl.swapchain_format(&self.device, texture as usize as u32),
+                    1,
+                ),
+                None => {
+                    let desc = Self::texture_desc(texture);
+                    let (_, extent) = Self::rect_from_bounds(&desc, bounds);
+                    (extent, desc.Format.0 as u32, desc.SampleDesc.Count)
+                }
+            };
 
             xr::SwapchainCreateInfo {
                 create_flags: xr::SwapchainCreateFlags::EMPTY,
                 usage_flags: xr::SwapchainUsageFlags::COLOR_ATTACHMENT
                     | xr::SwapchainUsageFlags::TRANSFER_DST,
-                format: color_format(desc.Format.0 as u32, color_space).unwrap_or(0),
-                sample_count: desc.SampleDesc.Count.max(1),
+                format: color_format(format, color_space).unwrap_or(0),
+                sample_count: samples.max(1),
                 width: extent.width.max(1) as u32,
                 height: extent.height.max(1) as u32,
                 face_count: 1,
@@ -227,9 +287,13 @@ mod platform {
                 };
             };
 
-            let src_desc = Self::texture_desc(texture);
-            let (src_box, extent) = Self::rect_from_bounds(&src_desc, bounds);
-            let src = Self::borrow_texture(texture);
+            let zero = xr::Extent2Di {
+                width: 0,
+                height: 0,
+            };
+            let Some((src, src_box, extent)) = self.source(eye, texture, bounds, false) else {
+                return zero;
+            };
             let dst = Self::borrow_texture(dst as *mut c_void);
 
             unsafe {
@@ -261,9 +325,17 @@ mod platform {
                 };
             };
 
-            let src_desc = Self::texture_desc(texture);
-            let (src_box, extent) = Self::rect_from_bounds(&src_desc, bounds);
-            let src = Self::borrow_texture(texture);
+            let zero = xr::Extent2Di {
+                width: 0,
+                height: 0,
+            };
+            // Overlays have no flipped layer: GL rows are reversed on the CPU.
+            let flip = bounds.vMin <= bounds.vMax;
+            let Some((src, src_box, extent)) =
+                self.source(vr::EVREye::Left, texture, bounds, flip)
+            else {
+                return zero;
+            };
             let dst = Self::borrow_texture(dst as *mut c_void);
 
             unsafe {

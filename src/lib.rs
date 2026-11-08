@@ -128,7 +128,10 @@ fn init_logging() {
                 }
             }
 
-            let state_dir = std::env::var("XDG_STATE_HOME")
+            // Wine does not pass XDG_* variables to Windows programs, so a launcher sets
+            // XRIZER_STATE_HOME there.
+            let state_dir = std::env::var("XRIZER_STATE_HOME")
+                .or_else(|_| std::env::var("XDG_STATE_HOME"))
                 .or_else(|_| std::env::var("HOME").map(|h| h + "/.local/state"));
 
             if let Ok(state) = state_dir {
