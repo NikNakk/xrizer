@@ -1594,7 +1594,8 @@ impl<G: GraphicsBackend> FrameController<G> {
                             self.image_index,
                             submit_flags,
                         ),
-                        flip_vertically: bounds.vertically_flipped(),
+                        flip_vertically: bounds.vertically_flipped()
+                            != self.backend.submits_bottom_up(),
                     }
                 })
                 .or_else(|| {

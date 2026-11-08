@@ -5,6 +5,8 @@ use openxr as xr;
 pub struct GlData;
 
 impl GlData {
+    // Windows stages OpenGL textures through D3D11 instead (d3d11_gl.rs).
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     pub(crate) fn new() -> Option<Self> {
         None
     }
