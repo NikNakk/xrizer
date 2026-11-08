@@ -2,7 +2,7 @@ name: macOS
 
 on:
   push:
-    branches: [ "claude/macos-port", "macos" ]
+    branches: [ "macos-native", "macos-stage", "macos" ]
   pull_request:
     branches: [ "main" ]
   workflow_dispatch:
@@ -17,10 +17,10 @@ env:
 jobs:
   macos:
     name: macOS arm64
-    runs-on: macos-14
+    runs-on: macos-15
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install dependencies
         run: brew install shaderc vulkan-headers vulkan-loader molten-vk
@@ -53,7 +53,7 @@ jobs:
         run: tools/macos/build-probe.sh target/release/vulkan_submit_probe
 
       - name: Upload macOS runtime
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: xrizer-macos-arm64
           if-no-files-found: error

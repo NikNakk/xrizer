@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-24.04
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install cross-build dependencies
         run: |
@@ -86,7 +86,7 @@ jobs:
           done
 
       - name: Upload Windows runtime
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: xrizer-windows-x64-gnu
           if-no-files-found: error
