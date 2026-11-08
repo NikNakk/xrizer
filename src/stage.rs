@@ -228,7 +228,7 @@ fn load_dds_texture(path: &Path) -> Result<(Vec<u8>, u32, u32), String> {
     // greyscale/luminance texture, so replicate that channel into RGB rather
     // than exposing GPU-style (R,0,0,1) data to our ordinary RGBA shader.
     if format == dds::Format::BC4_UNORM {
-        for pixel in rgba.chunks_exact_mut(4) {
+        for pixel in rgba.as_chunks_mut::<4>().0 {
             let value = pixel[0];
             pixel[1] = value;
             pixel[2] = value;

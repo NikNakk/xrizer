@@ -528,7 +528,9 @@ fn request_display_refresh_rate(instance: &xr::Instance, session: &xr::Session<x
         return;
     };
     if instance.exts().fb_display_refresh_rate.is_none() {
-        warn!("XRIZER_DISPLAY_REFRESH_RATE={rate} ignored: XR_FB_display_refresh_rate is not enabled");
+        warn!(
+            "XRIZER_DISPLAY_REFRESH_RATE={rate} ignored: XR_FB_display_refresh_rate is not enabled"
+        );
         return;
     }
     let before = session.get_display_refresh_rate().ok();
