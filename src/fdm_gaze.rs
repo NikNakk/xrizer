@@ -85,7 +85,7 @@ fn kk_set_gaze() -> Option<SetGaze> {
         return Some(unsafe { std::mem::transmute::<usize, SetGaze>(f) });
     }
     // Retry now and then: the driver may load after the first frames.
-    if ATTEMPTS.fetch_add(1, Ordering::Relaxed) % 90 != 0 {
+    if !ATTEMPTS.fetch_add(1, Ordering::Relaxed).is_multiple_of(90) {
         return None;
     }
     let found = find_kk_set_gaze();
@@ -146,7 +146,7 @@ pub fn publish(points: &[Option<(f32, f32)>]) {
 
     static FRAMES: AtomicU32 = AtomicU32::new(0);
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed);
-    if std::env::var_os("XRIZER_FDM_GAZE_LOG").is_some() && frame % 90 == 0 {
+    if std::env::var_os("XRIZER_FDM_GAZE_LOG").is_some() && frame.is_multiple_of(90) {
         info!("FDM gaze: {points:?}");
     }
 }
