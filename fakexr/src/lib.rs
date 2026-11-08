@@ -1094,7 +1094,10 @@ extern "system" fn create_action_space(
 
 fn write_name<const N: usize>(dest: &mut [c_char; N], name: &str) {
     dest.fill(0);
-    for (d, s) in dest.iter_mut().zip(&name.as_bytes()[..name.len().min(N - 1)]) {
+    for (d, s) in dest
+        .iter_mut()
+        .zip(&name.as_bytes()[..name.len().min(N - 1)])
+    {
         *d = *s as c_char;
     }
 }
