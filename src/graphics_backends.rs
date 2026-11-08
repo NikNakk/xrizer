@@ -1,5 +1,7 @@
 mod d3d11;
 #[cfg(target_os = "windows")]
+mod d3d11_gl;
+#[cfg(target_os = "windows")]
 mod d3d11_stage;
 #[cfg(target_os = "windows")]
 mod d3d11_timing;
@@ -30,6 +32,11 @@ pub trait GraphicsBackend: Into<SupportedBackend> {
         true
     }
     fn requires_gpu_timing() -> bool {
+        false
+    }
+    /// Whether copied images keep OpenGL's bottom-to-top row order, so the projection
+    /// layer must present them flipped.
+    fn submits_bottom_up(&self) -> bool {
         false
     }
     fn begin_gpu_timing(&mut self, _frame: u32) {}
@@ -162,7 +169,7 @@ impl SupportedBackend {
         match texture_type {
             vr::ETextureType::DirectX => cfg!(target_os = "windows"),
             vr::ETextureType::Vulkan => true,
-            vr::ETextureType::OpenGL => cfg!(target_os = "linux"),
+            vr::ETextureType::OpenGL => cfg!(any(target_os = "linux", target_os = "windows")),
             #[cfg(test)]
             vr::ETextureType::Reserved => true,
             _ => false,
@@ -176,6 +183,10 @@ impl SupportedBackend {
                 let vk_texture = unsafe { &*(texture.handle as *const vr::VRVulkanTextureData_t) };
                 Some(Self::Vulkan(VulkanData::new(vk_texture)))
             }
+            // Windows: a D3D11 session fed by CPU copies of the GL texture.
+            #[cfg(target_os = "windows")]
+            vr::ETextureType::OpenGL => D3D11Data::new_for_gl().map(Self::D3D11),
+            #[cfg(not(target_os = "windows"))]
             vr::ETextureType::OpenGL => GlData::new().map(Self::OpenGL),
             #[cfg(test)]
             vr::ETextureType::Reserved => Some(Self::Fake(
