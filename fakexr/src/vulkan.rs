@@ -40,10 +40,11 @@ pub unsafe extern "system" fn get_instance_proc_addr(
     let name = unsafe { CStr::from_ptr(name) };
 
     if instance.is_null() {
-        get_fn![name => CreateInstance]
+        get_fn![name => CreateInstance, EnumerateInstanceExtensionProperties]
     } else {
         get_fn![name =>
             GetPhysicalDeviceQueueFamilyProperties,
+            EnumerateDeviceExtensionProperties,
             CreateDevice,
             GetDeviceProcAddr,
             GetDeviceQueue,
@@ -81,6 +82,26 @@ impl Device {
         let val = unsafe { *debug };
         val == Device::DEBUG_VAL
     }
+}
+
+// No extensions: xrizer's macOS portability setup asks, and needs none from the fake.
+extern "system" fn enumerate_instance_extension_properties(
+    _: *const c_char,
+    count: *mut u32,
+    _: *mut vk::ExtensionProperties,
+) -> vk::Result {
+    unsafe { *count = 0 };
+    vk::Result::SUCCESS
+}
+
+extern "system" fn enumerate_device_extension_properties(
+    _: vk::PhysicalDevice,
+    _: *const c_char,
+    count: *mut u32,
+    _: *mut vk::ExtensionProperties,
+) -> vk::Result {
+    unsafe { *count = 0 };
+    vk::Result::SUCCESS
 }
 
 extern "system" fn create_instance(

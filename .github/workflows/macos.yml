@@ -40,11 +40,7 @@ jobs:
 
       # The three input tests also fail on Linux on this branch (see docs/MACOS.md).
       - name: Run tests
-        run: |
-          cargo test -p xrizer --lib -- \
-            --skip input::tests::action_origins_match_pose_and_skeleton_hands \
-            --skip input::tests::non_hand_restriction_activates_only_secondary_set_for_hands \
-            --skip input::tests::restricted_action_set_activates_secondary_set_for_other_hand
+        run: cargo test -p xrizer --lib
 
       - name: Clippy
         run: cargo clippy -p xrizer --all-targets
