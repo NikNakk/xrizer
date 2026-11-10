@@ -118,6 +118,8 @@ jobs:
           libx11-xcb-dev \
           glslc
     - uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt, clippy
     - uses: dtolnay/rust-toolchain@nightly
       with:
         components: miri
@@ -130,6 +132,6 @@ jobs:
     - name: Run tests with Miri
       run: cargo +nightly miri test
     - name: Format check
-      run: cargo fmt --check
+      run: cargo +stable fmt --check
     - name: Clippy
-      run: cargo clippy --workspace --all-targets
+      run: cargo +stable clippy --workspace --all-targets
