@@ -14,17 +14,14 @@
 //!
 //! Every GL call runs on the submitting thread, with the application's context current.
 
-use std::ffi::{c_void, CStr};
+use std::ffi::{CStr, c_void};
 use std::sync::Mutex;
 
 use openvr as vr;
 use openxr as xr;
-use windows::Win32::Graphics::Direct3D11::{
-    D3D11_BOX, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, ID3D11Device, ID3D11DeviceContext,
-    ID3D11Texture2D,
+use windows::Win32::Graphics::Direct3D::{
+    D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, D3D_SRV_DIMENSION_TEXTURE2D,
 };
-use windows::core::{GUID, HRESULT, Interface};
-use windows::Win32::Graphics::Direct3D::{D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, D3D_SRV_DIMENSION_TEXTURE2D};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_SHADER_RESOURCE, D3D11_BUFFER_DESC,
     D3D11_CPU_ACCESS_READ, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_RENDER_TARGET_VIEW_DESC,
@@ -33,9 +30,14 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_TEX2D_SRV, D3D11_USAGE_STAGING, D3D11_VIEWPORT, ID3D11Buffer, ID3D11PixelShader,
     ID3D11RenderTargetView, ID3D11ShaderResourceView, ID3D11VertexShader,
 };
+use windows::Win32::Graphics::Direct3D11::{
+    D3D11_BOX, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, ID3D11Device, ID3D11DeviceContext,
+    ID3D11Texture2D,
+};
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC,
 };
+use windows::core::{GUID, HRESULT, Interface};
 
 /// DXGI_FORMAT_R8G8B8A8_UNORM: GL textures are always read back as 8-bit RGBA.
 pub const STAGING_FORMAT: u32 = 28;
@@ -481,7 +483,12 @@ impl FlipCopy {
         };
 
         let (width, height) = (src_box.right - src_box.left, src_box.bottom - src_box.top);
-        let region = [src_box.left as i32, src_box.top as i32, width as i32, height as i32];
+        let region = [
+            src_box.left as i32,
+            src_box.top as i32,
+            width as i32,
+            height as i32,
+        ];
         unsafe {
             context.UpdateSubresource(&self.constants, 0, None, region.as_ptr().cast(), 0, 0);
             context.IASetInputLayout(None);
@@ -531,11 +538,15 @@ fn read_back(
     };
     unsafe {
         let mut staging = None;
-        device.CreateTexture2D(&desc, None, Some(&mut staging)).ok()?;
+        device
+            .CreateTexture2D(&desc, None, Some(&mut staging))
+            .ok()?;
         let staging = staging?;
         context.CopySubresourceRegion(&staging, 0, 0, 0, 0, texture, 0, Some(src_box));
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-        context.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped)).ok()?;
+        context
+            .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+            .ok()?;
         let row_bytes = width as usize * 4;
         let mut pixels = vec![0u8; row_bytes * height as usize];
         for row in 0..height as usize {
@@ -587,7 +598,11 @@ impl GlSource {
         unsafe { (gl.gen_framebuffers)(1, &mut fbo) };
         log::info!(
             "OpenGL submissions go through D3D11; Mesa Metal export {}",
-            if gl.export_metal.is_some() { "available" } else { "unavailable: CPU copies" }
+            if gl.export_metal.is_some() {
+                "available"
+            } else {
+                "unavailable: CPU copies"
+            }
         );
         let capture_dir = std::env::var_os("XRIZER_GL_CAPTURE").map(std::path::PathBuf::from);
         if let Some(dir) = &capture_dir {
@@ -642,7 +657,12 @@ impl GlSource {
 
     /// The imported D3D11 texture for a GL texture's current Metal texture, as an index
     /// into `state.gpu.imports`, or None when the GPU path is unavailable.
-    fn gpu_import(&self, state: &mut State, device: &ID3D11Device, texture: GLuint) -> Option<usize> {
+    fn gpu_import(
+        &self,
+        state: &mut State,
+        device: &ID3D11Device,
+        texture: GLuint,
+    ) -> Option<usize> {
         if state.gpu.disabled {
             return None;
         }
@@ -738,7 +758,8 @@ impl GlSource {
                             log::warn!("no flipping copy ({error}); using CPU copies");
                             state.gpu.disabled = true;
                             drop(state);
-                            return self.copy(device, context, eye, texture, bounds, flip, dst, dst_slice);
+                            return self
+                                .copy(device, context, eye, texture, bounds, flip, dst, dst_slice);
                         }
                     }
                 }
@@ -748,7 +769,9 @@ impl GlSource {
                     return None;
                 }
             } else {
-                unsafe { context.CopySubresourceRegion(dst, dst_slice, 0, 0, 0, &src, 0, Some(&src_box)) };
+                unsafe {
+                    context.CopySubresourceRegion(dst, dst_slice, 0, 0, 0, &src, 0, Some(&src_box))
+                };
             }
             let slot = eye as usize & 1;
             state.eye_copies[slot] += 1;
@@ -771,7 +794,14 @@ impl GlSource {
             state.copies += 1;
             state.copy_time += started.elapsed();
             state.copy_bytes += (region.width * region.height * 4) as usize;
-            self.report(&mut state, if flip { "GPU flipping copy" } else { "Metal blit" });
+            self.report(
+                &mut state,
+                if flip {
+                    "GPU flipping copy"
+                } else {
+                    "Metal blit"
+                },
+            );
             return Some(xr::Extent2Di {
                 width: region.width,
                 height: region.height,
@@ -780,7 +810,9 @@ impl GlSource {
         drop(state);
         let (staged, src_box) = self.stage(device, context, eye, texture, bounds, flip)?;
         let staged = std::mem::ManuallyDrop::new(unsafe { ID3D11Texture2D::from_raw(staged) });
-        unsafe { context.CopySubresourceRegion(dst, dst_slice, 0, 0, 0, &*staged, 0, Some(&src_box)) };
+        unsafe {
+            context.CopySubresourceRegion(dst, dst_slice, 0, 0, 0, &*staged, 0, Some(&src_box))
+        };
         Some(xr::Extent2Di {
             width: (src_box.right - src_box.left) as i32,
             height: (src_box.bottom - src_box.top) as i32,
@@ -790,13 +822,20 @@ impl GlSource {
     fn report(&self, state: &mut State, what: &str) {
         if state.copies == 450 {
             let per_copy = |d: std::time::Duration| d.as_secs_f64() * 1000.0 / state.copies as f64;
-            let elapsed = state.window_start.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
+            let elapsed = state
+                .window_start
+                .map(|t| t.elapsed().as_secs_f64())
+                .unwrap_or(0.0);
             log::info!(
                 "OpenGL {what}: {:.2} ms per eye ({:.2} ms waiting for the application's GL work), {:.1} MB per eye, {:.1} frames/s over {} copies; {} application GL errors cleared",
                 per_copy(state.copy_time),
                 per_copy(state.gl_wait),
                 state.copy_bytes as f64 / state.copies as f64 / 1e6,
-                if elapsed > 0.0 { state.copies as f64 / 2.0 / elapsed } else { 0.0 },
+                if elapsed > 0.0 {
+                    state.copies as f64 / 2.0 / elapsed
+                } else {
+                    0.0
+                },
                 state.copies,
                 state.app_errors
             );
@@ -903,7 +942,13 @@ impl GlSource {
                 (gl.bind_buffer)(GL_PIXEL_PACK_BUFFER, previous_pack_buffer);
             }
             (gl.read_buffer)(previous_read_buffer as GLenum);
-            (gl.framebuffer_texture_2d)(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+            (gl.framebuffer_texture_2d)(
+                GL_READ_FRAMEBUFFER,
+                GL_COLOR_ATTACHMENT0,
+                GL_TEXTURE_2D,
+                0,
+                0,
+            );
             (gl.bind_framebuffer)(GL_READ_FRAMEBUFFER, previous_fbo);
             check("restoring state");
             let ok = complete == GL_FRAMEBUFFER_COMPLETE && failed.is_none();
