@@ -7,6 +7,28 @@ use std::collections::HashSet;
 use std::ffi::{CString, c_char};
 use std::sync::{LazyLock, Mutex};
 
+// Some applications submit VK_QUEUE_FAMILY_IGNORED instead of their queue family.
+// Recover only when there is exactly one possible queue, and verify its identity.
+// Probing other, potentially uncreated queues with vkGetDeviceQueue is invalid.
+fn resolve_queue_family_index(
+    families: &[vk::QueueFamilyProperties],
+    hint: u32,
+    submitted_queue: vk::Queue,
+    mut get_queue: impl FnMut(u32, u32) -> vk::Queue,
+) -> Option<u32> {
+    if families.get(hint as usize).is_some() {
+        return Some(hint);
+    }
+    if families.len() == 1
+        && families[0].queue_count == 1
+        && families[0].queue_flags.contains(vk::QueueFlags::GRAPHICS)
+        && get_queue(0, 0) == submitted_queue
+    {
+        return Some(0);
+    }
+    None
+}
+
 struct RealSessionData {
     images: Vec<vk::Image>,
     format: vk::Format,
@@ -503,13 +525,30 @@ impl VulkanData {
             )
         };
 
+        let physical_device = vk::PhysicalDevice::from_raw(data.m_pPhysicalDevice as _);
+        let queue = vk::Queue::from_raw(data.m_pQueue as _);
+        let families =
+            unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
+        let queue_family_index = resolve_queue_family_index(
+            &families, data.m_nQueueFamilyIndex, queue,
+            |family, index| unsafe { device.get_device_queue(family, index) },
+        ).unwrap_or_else(|| panic!(
+            "Invalid Vulkan queue-family index {} ({} families); submitted queue cannot be identified safely",
+            data.m_nQueueFamilyIndex, families.len()
+        ));
+        if queue_family_index != data.m_nQueueFamilyIndex {
+            warn!(
+                "Application supplied Vulkan queue-family index {}; recovered family {} by matching its sole queue",
+                data.m_nQueueFamilyIndex, queue_family_index
+            );
+        }
         Self {
             _entry: entry,
             instance,
-            physical_device: vk::PhysicalDevice::from_raw(data.m_pPhysicalDevice as _),
+            physical_device,
             device,
-            queue: vk::Queue::from_raw(data.m_pQueue as _),
-            queue_family_index: data.m_nQueueFamilyIndex,
+            queue,
+            queue_family_index,
             real_data: Default::default(),
         }
     }
@@ -1022,5 +1061,52 @@ mod portability {
             }
         }
         panic!("No Vulkan library found (tried {candidates:?}); set XRIZER_VULKAN_LIBRARY")
+    }
+}
+
+#[cfg(test)]
+mod queue_family_recovery_tests {
+    use super::*;
+    #[test]
+    fn recover_only_an_unambiguous_matching_queue() {
+        let family = vk::QueueFamilyProperties {
+            queue_flags: vk::QueueFlags::GRAPHICS,
+            queue_count: 1,
+            ..Default::default()
+        };
+        let queue = vk::Queue::from_raw(7);
+        assert_eq!(
+            resolve_queue_family_index(&[family], u32::MAX, queue, |f, i| {
+                assert_eq!((f, i), (0, 0));
+                queue
+            }),
+            Some(0)
+        );
+        assert_eq!(
+            resolve_queue_family_index(&[family], u32::MAX, queue, |_, _| vk::Queue::from_raw(8)),
+            None
+        );
+        assert_eq!(
+            resolve_queue_family_index(&[family, family], u32::MAX, queue, |_, _| panic!(
+                "must not probe uncreated queues"
+            )),
+            None
+        );
+        let multiple = vk::QueueFamilyProperties {
+            queue_count: 2,
+            ..family
+        };
+        assert_eq!(
+            resolve_queue_family_index(&[multiple], u32::MAX, queue, |_, _| panic!(
+                "must not probe uncreated queues"
+            )),
+            None
+        );
+        assert_eq!(
+            resolve_queue_family_index(&[family], 0, queue, |_, _| panic!(
+                "valid hint needs no recovery"
+            )),
+            Some(0)
+        );
     }
 }
