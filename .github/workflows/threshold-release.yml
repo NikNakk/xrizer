@@ -19,7 +19,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include: [{"platform": "macos-arm64", "os": "macos-15", "role": "openvr-runtime"}, {"platform": "windows-x86_64", "os": "macos-15-intel", "role": "openvr-runtime"}]
+        include: [{"platform": "macos-arm64", "os": "macos-26", "role": "openvr-runtime"}, {"platform": "windows-x86_64", "os": "ubuntu-24.04", "role": "openvr-runtime"}]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 180
     env:
@@ -60,7 +60,9 @@ jobs:
           python3 scripts/threshold-release/package.py package --component "$COMPONENT" --version "$VERSION" \
             --platform "$PLATFORM" --role "$ROLE" --prefix "$PREFIX" --output dist
           if [[ "$COMPONENT" == monado ]]; then cp .threshold-build/build-tag "dist/build-tag-$PLATFORM.txt"; fi
+      # Public Steam payload uploads remain held while client/SDK terms are reviewed.
       - uses: actions/upload-artifact@v7
+        if: env.COMPONENT != 'macos-wine-xr'
         with:
           name: threshold-${{ matrix.platform }}
           path: dist/*
@@ -68,7 +70,7 @@ jobs:
           retention-days: 7
   publish:
     needs: build
-    if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
+    if: ('xrizer' != 'macos-wine-xr') && (github.ref_type == 'tag' || github.event_name == 'workflow_dispatch')
     runs-on: macos-15
     permissions:
       contents: write

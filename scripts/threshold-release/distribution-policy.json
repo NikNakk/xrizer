@@ -1,0 +1,6 @@
+{
+  "schema": "threshold-xr/distribution-policy-1",
+  "excluded_names": ["lsteamclient.dll", "lsteamclient.so", "steamclient.dll", "steamclient64.dll", "steamclient.dylib", "libsteam_api.dylib", "steam_api.dll", "steam_api64.dll", "steam.exe", "steam_osx"],
+  "excluded_directories": ["steamworks_sdk", "Steam.app", "CrossOver.app", "Wine Devel.app"],
+  "reason": "Public releases exclude proprietary client binaries and Steamworks-derived payloads whose redistribution rights have not been established. External local components must not be uploaded by the release workflow."
+}

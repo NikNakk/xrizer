@@ -60,6 +60,9 @@ def relocate(root):
     root = root.resolve()
     queue = [p for p in root.rglob('*') if macho(p)]
     processed = set()
+    originals = {}
+    for path in queue:
+        originals.setdefault(path.name, []).append((path, digest(path)))
     while queue:
         binary = queue.pop()
         if binary in processed:
@@ -92,9 +95,10 @@ def relocate(root):
             else:
                 if '.framework/' in str(source):
                     raise ValueError(f'External framework needs explicit packaging: {source}')
-                target = root / 'lib' / source.name
+                matches = [p for p, sha in originals.get(source.name, []) if sha == digest(source)]
+                target = matches[0] if len(matches) == 1 else root / 'lib' / source.name
                 target.parent.mkdir(parents=True, exist_ok=True)
-                if target.exists() and digest(target) != digest(source):
+                if not matches and target.exists() and digest(target) != digest(source):
                     raise ValueError(f'Dylib name collision: {source}')
                 if not target.exists():
                     shutil.copy2(source, target)
@@ -143,18 +147,32 @@ def relative_manifests(root):
             path.write_text(json.dumps(value, indent=2) + '\n')
 
 
+def public_distribution_check(root):
+    policy_path = Path(__file__).with_name('distribution-policy.json')
+    if not policy_path.is_file():
+        raise ValueError('Missing public distribution policy')
+    policy = json.loads(policy_path.read_text())
+    denied = {name.lower() for name in policy['excluded_names']}
+    for path in Path(root).rglob('*'):
+        parts = [part.lower() for part in path.relative_to(root).parts]
+        if path.name.lower() in denied or any(any(part.startswith(name.lower()) for name in policy['excluded_directories']) for part in parts):
+            raise ValueError(f'Excluded from public release pending distribution review: {path.relative_to(root)}')
+
+
 def package(component, version, platform, role, prefix, output):
     if component not in REPOSITORIES or not TOKEN.fullmatch(version) or platform not in PLATFORMS:
         raise ValueError('Unsupported component, version or platform')
     prefix, output = Path(prefix).resolve(), Path(output).resolve()
     if not prefix.is_dir() or output.is_relative_to(prefix):
         raise ValueError('Prefix must exist and output must be outside it')
+    public_distribution_check(prefix)
     validate_tree(prefix)
     if not any(p.is_file() and not p.is_symlink() for p in prefix.rglob('*')):
         raise ValueError('Empty artifact')
     if platform.startswith('macos-'):
         relocate(prefix)
     relative_manifests(prefix)
+    public_distribution_check(prefix)
     validate_tree(prefix)
     output.mkdir(parents=True, exist_ok=True)
     name = f'{component}-{version}-{platform}.tar.xz'
