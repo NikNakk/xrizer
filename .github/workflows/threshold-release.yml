@@ -1,0 +1,128 @@
+name: Threshold release
+on:
+  push:
+    tags: ['threshold-*']
+    branches: ['codex/threshold-releases']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (without threshold-); must be a new version'
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: threshold-release-${{ github.ref }}-${{ inputs.version }}
+  cancel-in-progress: false
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include: [{"platform": "macos-arm64", "os": "macos-15", "role": "openvr-runtime"}, {"platform": "windows-x86_64", "os": "macos-15-intel", "role": "openvr-runtime"}]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    env:
+      COMPONENT: 'xrizer'
+      PLATFORM: ${{ matrix.platform }}
+      DISPATCH_VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          submodules: recursive
+      - name: Validate release identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then VERSION=${GITHUB_REF_NAME#threshold-};
+          elif [[ -n "$DISPATCH_VERSION" ]]; then VERSION=$DISPATCH_VERSION;
+          else VERSION="ci-${GITHUB_SHA:0:12}"; fi
+          export VERSION
+          python3 - <<'PY'
+          import os, re
+          from pathlib import Path
+          import sys
+          sys.path.insert(0, 'scripts/threshold-release')
+          from package import REPOSITORIES
+          assert re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,159}', os.environ['VERSION']), 'Invalid version'
+          assert REPOSITORIES[os.environ['COMPONENT']] == os.environ['GITHUB_REPOSITORY'], 'Wrong fork'
+          with open(os.environ['GITHUB_ENV'], 'a') as stream:
+              stream.write('VERSION=' + os.environ['VERSION'] + '\n')
+              stream.write('PREFIX=' + os.environ['RUNNER_TEMP'] + '/threshold-prefix\n')
+          PY
+      - name: Build isolated release prefix
+        run: bash scripts/threshold-release/build.sh
+      - name: Package relocatable artifact
+        env:
+          ROLE: ${{ matrix.role }}
+        run: |
+          python3 scripts/threshold-release/package.py package --component "$COMPONENT" --version "$VERSION" \
+            --platform "$PLATFORM" --role "$ROLE" --prefix "$PREFIX" --output dist
+          if [[ "$COMPONENT" == monado ]]; then cp .threshold-build/build-tag "dist/build-tag-$PLATFORM.txt"; fi
+      - uses: actions/upload-artifact@v7
+        with:
+          name: threshold-${{ matrix.platform }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+  publish:
+    needs: build
+    if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
+    runs-on: macos-15
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      COMPONENT: 'xrizer'
+      DISPATCH_VERSION: ${{ inputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: threshold-*
+          merge-multiple: true
+          path: dist
+      - name: Create complete release manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then VERSION=${GITHUB_REF_NAME#threshold-}; else VERSION=$DISPATCH_VERSION; fi
+          export VERSION
+          python3 - <<'PY'
+          import os, sys
+          from pathlib import Path
+          sys.path.insert(0, 'scripts/threshold-release')
+          from package import manifest
+          tags = [p.read_text() for p in Path('dist').glob('build-tag-*.txt')]
+          if os.environ['COMPONENT'] == 'monado':
+              assert len(tags) == 2 and len(set(tags)) == 1, 'Monado build tags differ'
+          manifest(os.environ['COMPONENT'], os.environ['VERSION'], os.environ['GITHUB_SHA'],
+                   os.environ['GITHUB_SERVER_URL'] + '/' + os.environ['GITHUB_REPOSITORY'] + '/actions/runs/' + os.environ['GITHUB_RUN_ID'],
+                   list(Path('dist').glob('*.json')), 'dist', tags[0] if tags else None)
+          with open(os.environ['GITHUB_ENV'], 'a') as stream:
+              stream.write('VERSION=' + os.environ['VERSION'] + '\n')
+          PY
+      - uses: actions/attest@v4
+        with:
+          subject-path: |
+            dist/*.tar.xz
+            dist/threshold-release.json
+      - name: Publish new release
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="threshold-$VERSION"
+          # Refuse to change an existing release or an existing tag's source commit.
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo 'Release already exists; choose a new version.' >&2; exit 1
+          fi
+          existing=$(git rev-list -n 1 "$tag" 2>/dev/null || true)
+          [[ -z "$existing" || "$existing" == "$GITHUB_SHA" ]]
+          gh release create "$tag" dist/*.tar.xz dist/threshold-release.json \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "$COMPONENT $VERSION" \
+            --prerelease --notes "Experimental Threshold XR dependency build. Provenance is in threshold-release.json."
