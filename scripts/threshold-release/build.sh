@@ -11,7 +11,14 @@ done
 if [[ "$PLATFORM" == macos-arm64 ]]; then expected_arch=arm64; else expected_arch=x86_64; fi
 [[ "$(uname -m)" == "$expected_arch" ]] || { echo "Wrong runner architecture" >&2; exit 1; }
 export MACOSX_DEPLOYMENT_TARGET=14.0
-brew install cmake ninja pkgconf
+if [[ "$(uname -s)" == Darwin ]]; then
+  brew install cmake ninja pkgconf
+elif [[ "$COMPONENT" == xrizer && "$PLATFORM" == windows-x86_64 ]]; then
+  sudo apt-get update
+  sudo apt-get install --no-install-recommends -y cmake ninja-build pkg-config mingw-w64 glslc clang libclang-dev
+else
+  echo "Unsupported build host" >&2; exit 2
+fi
 clone_input() {
   local url=$1 ref=$2 destination=$3
   git clone --depth 1 --branch "$ref" "$url" "$destination"
@@ -50,10 +57,12 @@ monado)
 xrizer)
   rustup update stable --no-self-update
   rustup override set stable
-  brew install shaderc vulkan-headers vulkan-loader molten-vk
+  if [[ "$(uname -s)" == Darwin ]]; then
+    brew install shaderc vulkan-headers vulkan-loader molten-vk
+  fi
   export XRIZER_VERSION="$VERSION"
   if [[ "$PLATFORM" == windows-x86_64 ]]; then
-    brew install mingw-w64
+    if [[ "$(uname -s)" == Darwin ]]; then brew install mingw-w64; fi
     rustup target add x86_64-pc-windows-gnu
     cargo xbuild --locked --release --target x86_64-pc-windows-gnu --no-default-features
     cp target/x86_64-pc-windows-gnu/release/openvr_api.dll "$PREFIX/"
@@ -67,10 +76,11 @@ xrizer)
   test -f xrizer.vrdrivermanifest && cp xrizer.vrdrivermanifest "$PREFIX/" || true
   ;;
 kosmickrisp)
-  brew install meson bison flex molten-vk vulkan-headers
+  brew install meson bison flex molten-vk vulkan-headers llvm spirv-llvm-translator spirv-tools
   python3 -m venv "$work/venv"
   "$work/venv/bin/pip" install mako pyyaml packaging
-  export PATH="$work/venv/bin:$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$PATH"
+  export PKG_CONFIG_PATH="$(brew --prefix spirv-llvm-translator)/lib/pkgconfig:$(brew --prefix spirv-tools)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+  export PATH="$(brew --prefix llvm)/bin:$work/venv/bin:$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$PATH"
   meson setup "$work/build" --prefix "$PREFIX" --buildtype release -Dplatforms=macos \
     -Dvulkan-drivers=kosmickrisp -Dgallium-drivers= -Dopengl=false -Dzstd=disabled --prefer-static
   meson compile -C "$work/build"
@@ -126,26 +136,23 @@ dxmt)
   fi
   ;;
 macos-wine-xr)
-  clone_input https://github.com/NikNakk/dxmt.git macos-xr-native-sharing "$work/dxmt"
-  clone_input https://github.com/KhronosGroup/OpenXR-SDK.git release-1.1.63 "$work/openxr"
-  options=(-DCMAKE_BUILD_TYPE=Release -DDXMT_INCLUDE_DIR="$work/dxmt/include" -DOPENXR_INCLUDE_DIR="$work/openxr/include")
   if [[ "$PLATFORM" == windows-x86_64 ]]; then
     brew install mingw-w64
-    options+=(-DCMAKE_SYSTEM_NAME=Windows -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc -DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++)
-    target=macos_wine_xr_openxr
-  else target=macos_wine_xr_host; fi
-  cmake -S . -B "$work/build" -G Ninja "${options[@]}"
-  cmake --build "$work/build" --target "$target" --parallel 3
-  if [[ "$PLATFORM" == windows-x86_64 ]]; then
-    cp "$work/build/macos_wine_xr_openxr.dll" "$PREFIX/"
-    cp "$work/build/macos_wine_xr_openxr.json" "$PREFIX/"
+    clone_input https://github.com/KhronosGroup/OpenXR-SDK.git release-1.1.63 "$work/openxr"
+    cmake -S "$work/openxr" -B "$work/loader" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_SYSTEM_NAME=Windows -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc \
+      -DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++ -DBUILD_TESTS=OFF -DBUILD_API_LAYERS=OFF \
+      -DBUILD_LOADER=ON -DDYNAMIC_LOADER=ON -DBUILD_WITH_SYSTEM_JSONCPP=OFF \
+      -DCMAKE_SHARED_LINKER_FLAGS='-static-libgcc -static-libstdc++'
+    cmake --build "$work/loader" --target openxr_loader --parallel 3
+    loader=$(find "$work/loader" -name '*openxr_loader.dll' -print -quit)
+    test -n "$loader"
+    cp "$loader" "$PREFIX/openxr_loader.dll"
+    for license in "$work/openxr"/LICENSE*; do test ! -f "$license" || cp "$license" "$PREFIX/licenses/"; done
   else
-    cp "$work/build/macos_wine_xr_host" "$PREFIX/bin/"
-    cp -R scripts tools "$PREFIX/"
-    clang -O2 -arch arm64 -arch x86_64 -dynamiclib -install_name @rpath/libmwxr_steam_compat_gate.dylib \
-      src/macos/steam_compat_gate.c src/macos/steam_ui_patch.c src/macos/steam_restart.c \
-      src/macos/steam_live_mapping.c -o "$PREFIX/lib/libmwxr_steam_compat_gate.dylib"
-    clang -O2 -arch arm64 src/macos/steam_play_launcher.c -o "$PREFIX/bin/steam-play"
+    # No Wine/Steamworks-derived bridge is built or distributed by this recipe.
+    zsh scripts/package-steam-play.zsh "$work/steam-play"
+    cp -R "$work/steam-play/." "$PREFIX/"
   fi
   ;;
 *) echo "Unsupported component: $COMPONENT" >&2; exit 2 ;;
