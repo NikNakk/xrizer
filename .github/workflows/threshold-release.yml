@@ -70,7 +70,7 @@ jobs:
           retention-days: 7
   publish:
     needs: build
-    if: ('xrizer' != 'macos-wine-xr') && (github.ref_type == 'tag' || github.event_name == 'workflow_dispatch')
+    if: github.repository != 'NikNakk/macos-wine-xr'
     runs-on: macos-15
     permissions:
       contents: write
@@ -93,7 +93,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [[ "$GITHUB_REF_TYPE" == tag ]]; then VERSION=${GITHUB_REF_NAME#threshold-}; else VERSION=$DISPATCH_VERSION; fi
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then VERSION=${GITHUB_REF_NAME#threshold-};
+          elif [[ -n "$DISPATCH_VERSION" ]]; then VERSION=$DISPATCH_VERSION;
+          else VERSION="ci-${GITHUB_SHA:0:12}"; fi
           export VERSION
           python3 - <<'PY'
           import os, sys
@@ -127,4 +129,6 @@ jobs:
           [[ -z "$existing" || "$existing" == "$GITHUB_SHA" ]]
           gh release create "$tag" dist/*.tar.xz dist/threshold-release.json \
             --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "$COMPONENT $VERSION" \
-            --prerelease --notes "Experimental Threshold XR dependency build. Provenance is in threshold-release.json."
+            --draft --prerelease --notes "Experimental Threshold XR dependency build. Provenance is in threshold-release.json."
+          # Publish only after the complete asset set has uploaded successfully.
+          gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false
