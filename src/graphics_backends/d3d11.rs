@@ -1,0 +1,552 @@
+use super::GraphicsBackend;
+use openvr as vr;
+use openxr as xr;
+
+#[cfg(target_os = "windows")]
+mod platform {
+    use super::super::d3d11_gl::GlSource;
+    use super::super::d3d11_stage::StageRenderer;
+    use super::super::d3d11_timing::GpuTimer;
+    use super::*;
+    use std::ffi::c_void;
+    use std::mem::ManuallyDrop;
+    use windows::Win32::Foundation::HMODULE;
+    use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
+    use windows::Win32::Graphics::Direct3D11::{
+        D3D11_BOX, D3D11_CREATE_DEVICE_FLAG, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
+        D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
+    };
+    use windows::core::Interface;
+
+    pub struct D3D11Data {
+        device: ID3D11Device,
+        context: ID3D11DeviceContext,
+        images: Vec<usize>,
+        stage_renderer: Option<StageRenderer>,
+        timings: GpuTimer,
+        /// Set when the application submits OpenGL textures (names, not D3D11 pointers).
+        gl: Option<GlSource>,
+    }
+
+    impl D3D11Data {
+        pub fn new(texture: &vr::Texture_t) -> Option<Self> {
+            if texture.handle.is_null() {
+                return None;
+            }
+
+            unsafe {
+                let texture = ManuallyDrop::new(ID3D11Texture2D::from_raw(texture.handle));
+                let device = texture.GetDevice().ok()?;
+
+                let context = device.GetImmediateContext().ok()?;
+
+                let timings = GpuTimer::new(&device, &context);
+                Some(Self {
+                    timings,
+                    device,
+                    context,
+                    images: Vec::new(),
+                    stage_renderer: None,
+                    gl: None,
+                })
+            }
+        }
+
+        pub fn new_temporary() -> Option<Self> {
+            unsafe {
+                let mut device = None;
+                let mut context = None;
+                if D3D11CreateDevice(
+                    None,
+                    D3D_DRIVER_TYPE_HARDWARE,
+                    HMODULE::default(),
+                    D3D11_CREATE_DEVICE_FLAG(0),
+                    None,
+                    D3D11_SDK_VERSION,
+                    Some(&mut device),
+                    None,
+                    Some(&mut context),
+                )
+                .is_err()
+                {
+                    return None;
+                }
+
+                let device = device?;
+                let context = context?;
+                let timings = GpuTimer::new(&device, &context);
+                Some(Self {
+                    timings,
+                    device,
+                    context,
+                    images: Vec::new(),
+                    stage_renderer: None,
+                    gl: None,
+                })
+            }
+        }
+
+        /// A D3D11 session fed by OpenGL textures. Called from Submit, where the
+        /// application's GL context is current.
+        pub fn new_for_gl() -> Option<Self> {
+            let gl = GlSource::new()?;
+            let mut data = Self::new_temporary()?;
+            data.gl = Some(gl);
+            Some(data)
+        }
+
+        /// Copies an OpenGL texture (`self.gl`) upright into slice `slice` of `dst`,
+        /// unless its bounds are inverted.
+        fn copy_gl(
+            &self,
+            gl: &GlSource,
+            eye: vr::EVREye,
+            texture: *mut c_void,
+            bounds: vr::VRTextureBounds_t,
+            dst: usize,
+            slice: u32,
+        ) -> xr::Extent2Di {
+            let dst = Self::borrow_texture(dst as *mut c_void);
+            gl.copy(
+                &self.device,
+                &self.context,
+                eye,
+                texture as usize as u32,
+                bounds,
+                bounds.vMin <= bounds.vMax,
+                &dst,
+                slice,
+            )
+            .unwrap_or(xr::Extent2Di {
+                width: 0,
+                height: 0,
+            })
+        }
+
+        fn borrow_texture(handle: *mut c_void) -> ManuallyDrop<ID3D11Texture2D> {
+            unsafe { ManuallyDrop::new(ID3D11Texture2D::from_raw(handle)) }
+        }
+
+        fn texture_desc(handle: *mut c_void) -> D3D11_TEXTURE2D_DESC {
+            let texture = Self::borrow_texture(handle);
+            let mut desc = D3D11_TEXTURE2D_DESC::default();
+            unsafe { texture.GetDesc(&mut desc) };
+            desc
+        }
+
+        fn rect_from_bounds(
+            desc: &D3D11_TEXTURE2D_DESC,
+            bounds: vr::VRTextureBounds_t,
+        ) -> (D3D11_BOX, xr::Extent2Di) {
+            let x0 = (bounds.uMin * desc.Width as f32).round() as i32;
+            let x1 = (bounds.uMax * desc.Width as f32).round() as i32;
+            let y0 = (bounds.vMin * desc.Height as f32).round() as i32;
+            let y1 = (bounds.vMax * desc.Height as f32).round() as i32;
+
+            let left = x0.min(x1).max(0) as u32;
+            let right = x0.max(x1).clamp(0, desc.Width as i32) as u32;
+            let top = y0.min(y1).max(0) as u32;
+            let bottom = y0.max(y1).clamp(0, desc.Height as i32) as u32;
+
+            (
+                D3D11_BOX {
+                    left,
+                    top,
+                    front: 0,
+                    right,
+                    bottom,
+                    back: 1,
+                },
+                xr::Extent2Di {
+                    width: right.saturating_sub(left) as i32,
+                    height: bottom.saturating_sub(top) as i32,
+                },
+            )
+        }
+    }
+
+    fn color_format(format: u32, color: vr::EColorSpace) -> Option<u32> {
+        // Auto means gamma for 8-bit component formats and linear otherwise.
+        let gamma = color != vr::EColorSpace::Linear;
+        match format {
+            27..=29 => Some(if gamma { 29 } else { 28 }),
+            87 | 90 | 91 => Some(if gamma { 91 } else { 87 }),
+            10 if color != vr::EColorSpace::Gamma => Some(10),
+            _ => None,
+        }
+    }
+
+    impl GraphicsBackend for D3D11Data {
+        fn supports_format_conversion() -> bool {
+            false
+        }
+        fn requires_gpu_timing() -> bool {
+            true
+        }
+        fn copies_apply_inverted_bounds(&self) -> bool {
+            self.gl.is_some()
+        }
+        fn begin_gpu_timing(&mut self, frame: u32) {
+            self.timings.begin(frame);
+        }
+        fn finish_gpu_timing(&mut self) {
+            self.timings.finish();
+        }
+        fn poll_gpu_timings(&mut self) -> Vec<super::super::GpuTiming> {
+            self.timings.poll()
+        }
+        type Api = xr::D3D11;
+        type OpenVrTexture = *mut c_void;
+        type NiceFormat = u32;
+
+        fn to_nice_format(format: u32) -> Self::NiceFormat {
+            format
+        }
+
+        fn session_create_info(&self) -> <Self::Api as xr::Graphics>::SessionCreateInfo {
+            xr::d3d::SessionCreateInfoD3D11 {
+                device: self.device.as_raw() as _,
+            }
+        }
+
+        fn get_texture(texture: &vr::Texture_t) -> Option<Self::OpenVrTexture> {
+            if texture.handle.is_null() {
+                return None;
+            }
+            // An OpenGL texture name; only a D3D11Data made by new_for_gl receives these.
+            if texture.eType == vr::ETextureType::OpenGL {
+                return Some(texture.handle);
+            }
+            let desc = Self::texture_desc(texture.handle);
+            // Resolving MSAA requires a separate path. A texture array is accepted, as
+            // SteamVR does for single-pass stereo: each eye reads its own slice.
+            if desc.SampleDesc.Count != 1 || desc.ArraySize == 0 {
+                static REPORTED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    log::warn!(
+                        "Unsupported D3D11 texture: {}x{} format={} samples={} array={}",
+                        desc.Width,
+                        desc.Height,
+                        desc.Format.0,
+                        desc.SampleDesc.Count,
+                        desc.ArraySize
+                    );
+                }
+                return None;
+            }
+            Some(texture.handle)
+        }
+
+        fn swapchain_info_for_texture(
+            &self,
+            texture: Self::OpenVrTexture,
+            bounds: vr::VRTextureBounds_t,
+            color_space: vr::EColorSpace,
+        ) -> xr::SwapchainCreateInfo<Self::Api> {
+            let (extent, format, samples) = match &self.gl {
+                Some(gl) => (
+                    gl.extent(texture as usize as u32, bounds),
+                    gl.swapchain_format(&self.device, texture as usize as u32),
+                    1,
+                ),
+                None => {
+                    let desc = Self::texture_desc(texture);
+                    let (_, extent) = Self::rect_from_bounds(&desc, bounds);
+                    (extent, desc.Format.0 as u32, desc.SampleDesc.Count)
+                }
+            };
+
+            xr::SwapchainCreateInfo {
+                create_flags: xr::SwapchainCreateFlags::EMPTY,
+                usage_flags: xr::SwapchainUsageFlags::COLOR_ATTACHMENT
+                    | xr::SwapchainUsageFlags::TRANSFER_DST,
+                format: color_format(format, color_space).unwrap_or(0),
+                sample_count: samples.max(1),
+                width: extent.width.max(1) as u32,
+                height: extent.height.max(1) as u32,
+                face_count: 1,
+                array_size: 2,
+                mip_count: 1,
+            }
+        }
+
+        fn store_swapchain_images(
+            &mut self,
+            images: Vec<<Self::Api as xr::Graphics>::SwapchainImage>,
+            format: u32,
+        ) {
+            if let Some(renderer) = self.stage_renderer.as_mut() {
+                renderer.reset_images();
+            }
+            self.images = images.into_iter().map(|image| image as usize).collect();
+            let _ = format;
+        }
+
+        fn copy_texture_to_swapchain(
+            &self,
+            eye: vr::EVREye,
+            texture: Self::OpenVrTexture,
+            _color_space: vr::EColorSpace,
+            bounds: vr::VRTextureBounds_t,
+            image_index: usize,
+            _submit_flags: vr::EVRSubmitFlags,
+        ) -> xr::Extent2Di {
+            let Some(&dst) = self.images.get(image_index) else {
+                return xr::Extent2Di {
+                    width: 0,
+                    height: 0,
+                };
+            };
+
+            if let Some(gl) = &self.gl {
+                return self.copy_gl(gl, eye, texture, bounds, dst, eye as u32);
+            }
+            let src_desc = Self::texture_desc(texture);
+            let (src_box, extent) = Self::rect_from_bounds(&src_desc, bounds);
+            let src = Self::borrow_texture(texture);
+            let dst = Self::borrow_texture(dst as *mut c_void);
+            // Single-pass stereo submits one array for both eyes: left in slice 0,
+            // right in slice 1 (D3D11CalcSubresource for mip 0). Otherwise slice 0.
+            let src_subresource = if src_desc.ArraySize > 1 {
+                (eye as u32).min(src_desc.ArraySize - 1) * src_desc.MipLevels.max(1)
+            } else {
+                0
+            };
+
+            unsafe {
+                self.context.CopySubresourceRegion(
+                    &*dst,
+                    eye as u32,
+                    0,
+                    0,
+                    0,
+                    &*src,
+                    src_subresource,
+                    Some(&src_box),
+                );
+            }
+
+            extent
+        }
+
+        fn copy_overlay_to_swapchain(
+            &mut self,
+            texture: Self::OpenVrTexture,
+            bounds: vr::VRTextureBounds_t,
+            image_index: usize,
+        ) -> xr::Extent2Di {
+            let Some(&dst) = self.images.get(image_index) else {
+                return xr::Extent2Di {
+                    width: 0,
+                    height: 0,
+                };
+            };
+
+            if let Some(gl) = &self.gl {
+                return self.copy_gl(gl, vr::EVREye::Left, texture, bounds, dst, 0);
+            }
+            let src_desc = Self::texture_desc(texture);
+            let (src_box, extent) = Self::rect_from_bounds(&src_desc, bounds);
+            let src = Self::borrow_texture(texture);
+            let dst = Self::borrow_texture(dst as *mut c_void);
+
+            unsafe {
+                self.context.CopySubresourceRegion(
+                    &*dst,
+                    0,
+                    0,
+                    0,
+                    0,
+                    &*src,
+                    0,
+                    Some(&src_box as *const D3D11_BOX),
+                );
+            }
+
+            extent
+        }
+
+        fn stage_swapchain_info(
+            &self,
+            width: u32,
+            height: u32,
+        ) -> Option<xr::SwapchainCreateInfo<Self::Api>> {
+            Some(xr::SwapchainCreateInfo {
+                create_flags: xr::SwapchainCreateFlags::EMPTY,
+                usage_flags: xr::SwapchainUsageFlags::COLOR_ATTACHMENT
+                    | xr::SwapchainUsageFlags::TRANSFER_DST,
+                format: 28,
+                sample_count: 1,
+                width,
+                height,
+                face_count: 1,
+                array_size: 2,
+                mip_count: 1,
+            })
+        }
+
+        fn render_stage(
+            &mut self,
+            stage: &crate::stage::StageAsset,
+            views: &[xr::View; 2],
+            image_index: usize,
+            extent: xr::Extent2Di,
+        ) -> Result<(), String> {
+            let Some(&dst) = self.images.get(image_index) else {
+                return Err(format!(
+                    "stage swapchain image index {image_index} is unavailable"
+                ));
+            };
+            let dst = Self::borrow_texture(dst as *mut c_void);
+
+            if self
+                .stage_renderer
+                .as_ref()
+                .is_none_or(|renderer| renderer.stage_id() != stage.id)
+            {
+                log::info!(
+                    "creating D3D11 stage renderer for {:?}: {} vertices, {} indices, texture {}x{}",
+                    stage.source_path,
+                    stage.vertices.len(),
+                    stage.indices.len(),
+                    stage.texture_width,
+                    stage.texture_height,
+                );
+                self.stage_renderer = Some(StageRenderer::new(&self.device, stage)?);
+            }
+
+            self.stage_renderer
+                .as_mut()
+                .expect("stage renderer was just initialized")
+                .render(&self.device, &self.context, stage, views, &dst, extent)
+        }
+
+        fn clear_stage(&mut self) {
+            self.stage_renderer = None;
+        }
+    }
+
+    #[cfg(test)]
+    mod format_tests {
+        use super::*;
+        #[test]
+        fn openvr_color_space_selects_compatible_typed_format() {
+            assert_eq!(color_format(28, vr::EColorSpace::Auto), Some(29));
+            assert_eq!(color_format(29, vr::EColorSpace::Linear), Some(28));
+            assert_eq!(color_format(27, vr::EColorSpace::Gamma), Some(29));
+            assert_eq!(color_format(90, vr::EColorSpace::Auto), Some(91));
+            assert_eq!(color_format(91, vr::EColorSpace::Linear), Some(87));
+            assert_eq!(color_format(10, vr::EColorSpace::Auto), Some(10));
+            assert_eq!(color_format(10, vr::EColorSpace::Gamma), None);
+            assert_eq!(color_format(40, vr::EColorSpace::Auto), None);
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+mod platform {
+    use super::*;
+
+    pub enum DummyD3D11 {}
+
+    impl xr::Graphics for DummyD3D11 {
+        type Requirements = ();
+        type SessionCreateInfo = ();
+        type Format = u32;
+        type SwapchainImage = u64;
+
+        fn raise_format(x: i64) -> Self::Format {
+            x as u32
+        }
+
+        fn lower_format(x: Self::Format) -> i64 {
+            x as i64
+        }
+
+        fn requirements(
+            _instance: &xr::Instance,
+            _system: xr::SystemId,
+        ) -> xr::Result<Self::Requirements> {
+            unreachable!("D3D11 is unavailable on non-Windows targets")
+        }
+
+        unsafe fn create_session(
+            _instance: &xr::Instance,
+            _system: xr::SystemId,
+            _info: &Self::SessionCreateInfo,
+        ) -> xr::Result<xr::sys::Session> {
+            unreachable!("D3D11 is unavailable on non-Windows targets")
+        }
+
+        fn enumerate_swapchain_images(
+            _swapchain: &xr::Swapchain<Self>,
+        ) -> xr::Result<Vec<Self::SwapchainImage>> {
+            unreachable!("D3D11 is unavailable on non-Windows targets")
+        }
+    }
+
+    pub struct D3D11Data;
+
+    impl D3D11Data {
+        pub fn new(_texture: &vr::Texture_t) -> Option<Self> {
+            None
+        }
+    }
+
+    impl GraphicsBackend for D3D11Data {
+        type Api = DummyD3D11;
+        type OpenVrTexture = *mut std::ffi::c_void;
+        type NiceFormat = u32;
+
+        fn to_nice_format(format: u32) -> Self::NiceFormat {
+            format
+        }
+
+        fn session_create_info(&self) -> <Self::Api as xr::Graphics>::SessionCreateInfo {}
+
+        fn get_texture(_texture: &vr::Texture_t) -> Option<Self::OpenVrTexture> {
+            None
+        }
+
+        fn swapchain_info_for_texture(
+            &self,
+            _texture: Self::OpenVrTexture,
+            _bounds: vr::VRTextureBounds_t,
+            _color_space: vr::EColorSpace,
+        ) -> xr::SwapchainCreateInfo<Self::Api> {
+            unreachable!("D3D11 is unavailable on non-Windows targets")
+        }
+
+        fn store_swapchain_images(
+            &mut self,
+            _images: Vec<<Self::Api as xr::Graphics>::SwapchainImage>,
+            _format: <Self::Api as xr::Graphics>::Format,
+        ) {
+            unreachable!("D3D11 is unavailable on non-Windows targets")
+        }
+
+        fn copy_texture_to_swapchain(
+            &self,
+            _eye: vr::EVREye,
+            _texture: Self::OpenVrTexture,
+            _color_space: vr::EColorSpace,
+            _bounds: vr::VRTextureBounds_t,
+            _image_index: usize,
+            _submit_flags: vr::EVRSubmitFlags,
+        ) -> xr::Extent2Di {
+            unreachable!("D3D11 is unavailable on non-Windows targets")
+        }
+
+        fn copy_overlay_to_swapchain(
+            &mut self,
+            _texture: Self::OpenVrTexture,
+            _bounds: vr::VRTextureBounds_t,
+            _image_index: usize,
+        ) -> xr::Extent2Di {
+            unreachable!("D3D11 is unavailable on non-Windows targets")
+        }
+    }
+}
+
+pub use platform::D3D11Data;

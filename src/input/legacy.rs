@@ -447,6 +447,12 @@ mod tests {
     #[repr(C)]
     union EventData {
         controller: vr::VREvent_Controller_t,
+        // OpenVR deliberately packs VREvent_t to 4 bytes on Linux/macOS,
+        // but uses natural alignment on Windows. The real VREvent_Data_t
+        // union contains 64-bit members, so keep this intentionally small
+        // test union 8-byte aligned on Windows as well.
+        #[cfg(target_os = "windows")]
+        _windows_alignment: u64,
     }
 
     impl Default for EventData {

@@ -192,10 +192,8 @@ impl System {
         let mut views = self.views.lock().unwrap();
         views.get_views(&session, self.openxr.display_time.get(), ty)
     }
-}
 
-impl vr::IVRSystem026_Interface for System {
-    fn GetRecommendedRenderTargetSize(&self, width: *mut u32, height: *mut u32) {
+    pub fn recommended_render_target_size(&self) -> (u32, u32) {
         let views = self
             .openxr
             .instance
@@ -203,14 +201,35 @@ impl vr::IVRSystem026_Interface for System {
                 self.openxr.system_id,
                 xr::ViewConfigurationType::PRIMARY_STEREO,
             )
-            .unwrap();
+            .expect("Couldn't enumerate stereo view configuration");
+        (
+            views[0].recommended_image_rect_width,
+            views[0].recommended_image_rect_height,
+        )
+    }
+
+    #[cfg(target_os = "windows")]
+    fn d3d_adapter_luid(&self) -> Option<u64> {
+        let requirements = self
+            .openxr
+            .instance
+            .graphics_requirements::<xr::D3D11>(self.openxr.system_id)
+            .ok()?;
+        let luid = requirements.adapter_luid;
+        Some(((luid.HighPart as u32 as u64) << 32) | luid.LowPart as u64)
+    }
+}
+
+impl vr::IVRSystem026_Interface for System {
+    fn GetRecommendedRenderTargetSize(&self, width: *mut u32, height: *mut u32) {
+        let (recommended_width, recommended_height) = self.recommended_render_target_size();
 
         if !width.is_null() {
-            unsafe { *width = views[0].recommended_image_rect_width };
+            unsafe { *width = recommended_width };
         }
 
         if !height.is_null() {
-            unsafe { *height = views[0].recommended_image_rect_height };
+            unsafe { *height = recommended_height };
         }
     }
     fn GetProjectionMatrix(&self, eye: vr::EVREye, near_z: f32, far_z: f32) -> vr::HmdMatrix44_t {
@@ -524,7 +543,14 @@ impl vr::IVRSystem026_Interface for System {
         if got_event && !pose.is_null() {
             unsafe {
                 let index = (&raw const (*event).trackedDeviceIndex).read();
-                pose.write(input.get_device_pose(index, Some(origin)).unwrap());
+                // Global/system events use an invalid tracked-device index and
+                // therefore have no corresponding device pose. PollNextEventWithPose
+                // must still deliver those events rather than panicking.
+                pose.write(
+                    input
+                        .get_device_pose(index, Some(origin))
+                        .unwrap_or_default(),
+                );
             }
         }
         got_event
@@ -578,10 +604,25 @@ impl vr::IVRSystem026_Interface for System {
                 // something to even get the game to recognize the HMD's location. However, the value
                 // itself doesn't appear to be that important.
                 vr::ETrackedDeviceProperty::SerialNumber_String
-                | vr::ETrackedDeviceProperty::ManufacturerName_String
                 | vr::ETrackedDeviceProperty::ControllerType_String => {
                     Some(CString::new("<unknown>").unwrap())
                 }
+                // OpenXR does not name a manufacturer: report the runtime and system
+                // names, as SteamVR drivers built on OpenXR runtimes do.
+                vr::ETrackedDeviceProperty::ManufacturerName_String => Some(
+                    self.openxr
+                        .instance
+                        .properties()
+                        .ok()
+                        .and_then(|p| CString::new(p.runtime_name).ok())
+                        .unwrap_or_else(|| CString::new("<unknown>").unwrap()),
+                ),
+                vr::ETrackedDeviceProperty::ModelNumber_String => self
+                    .openxr
+                    .instance
+                    .system_properties(self.openxr.system_id)
+                    .ok()
+                    .and_then(|p| CString::new(p.system_name).ok()),
                 _ => None,
             },
             _ => self
@@ -708,6 +749,9 @@ impl vr::IVRSystem026_Interface for System {
             return 0.0;
         }
 
+        if let Some(error) = unsafe { error.as_mut() } {
+            *error = vr::ETrackedPropertyError::Success;
+        }
         match prop {
             vr::ETrackedDeviceProperty::UserIpdMeters_Float => {
                 let views = self.get_views(xr::ReferenceSpaceType::VIEW).views;
@@ -812,12 +856,24 @@ impl vr::IVRSystem026_Interface for System {
     }
     fn GetSortedTrackedDeviceIndicesOfClass(
         &self,
-        _: vr::ETrackedDeviceClass,
-        _: *mut vr::TrackedDeviceIndex_t,
-        _: u32,
-        _: vr::TrackedDeviceIndex_t,
+        class: vr::ETrackedDeviceClass,
+        indices: *mut vr::TrackedDeviceIndex_t,
+        index_count: u32,
+        _relative_to: vr::TrackedDeviceIndex_t,
     ) -> u32 {
-        0
+        let Some(input) = self.input.get() else {
+            return 0;
+        };
+
+        let devices = input.connected_device_indices_of_class(class);
+        if index_count != 0 && !indices.is_null() {
+            let output = unsafe { std::slice::from_raw_parts_mut(indices, index_count as usize) };
+            for (dst, src) in output.iter_mut().zip(devices.iter().copied()) {
+                *dst = src;
+            }
+        }
+
+        devices.len() as u32
     }
     fn GetRawZeroPoseToStandingAbsoluteTrackingPose(&self) -> vr::HmdMatrix34_t {
         xr::Posef::IDENTITY.into()
@@ -853,26 +909,38 @@ impl vr::IVRSystem026_Interface for System {
         texture_type: vr::ETextureType,
         instance: *mut vr::VkInstance_T,
     ) {
-        if texture_type != vr::ETextureType::Vulkan {
-            // Proton doesn't seem to properly translate this function, but it doesn't appear to
-            // actually matter.
-            log::error!("Unsupported texture type: {texture_type:?}");
+        if device.is_null() {
             return;
         }
 
-        unsafe {
-            *device = self
-                .openxr
-                .instance
-                .vulkan_graphics_device(self.openxr.system_id, instance as _)
-                .expect("Failed to get vulkan physical device") as _;
+        let output = match texture_type {
+            vr::ETextureType::Vulkan if !instance.is_null() => unsafe {
+                self.openxr
+                    .instance
+                    .vulkan_graphics_device(self.openxr.system_id, instance as _)
+                    .map(|device| device as u64)
+                    .unwrap_or(0)
+            },
+            #[cfg(target_os = "windows")]
+            vr::ETextureType::DirectX | vr::ETextureType::DirectX12 => {
+                self.d3d_adapter_luid().unwrap_or(0)
+            }
+            other => {
+                log::warn!("No output-device mapping for texture type: {other:?}");
+                0
+            }
+        };
+
+        unsafe { *device = output };
+    }
+    fn GetDXGIOutputInfo(&self, adapter_index: *mut i32) {
+        if let Some(adapter_index) = unsafe { adapter_index.as_mut() } {
+            // Our Wine/DXMT path currently exposes a single DXGI adapter.
+            *adapter_index = 0;
         }
     }
-    fn GetDXGIOutputInfo(&self, _: *mut i32) {
-        todo!()
-    }
     fn GetD3D9AdapterIndex(&self) -> i32 {
-        todo!()
+        0
     }
 }
 
@@ -910,9 +978,19 @@ impl vr::IVRSystem017On019 for System {
 }
 
 impl vr::IVRSystem016On017 for System {
-    fn GetOutputDevice(&self, _device: *mut u64, _texture_type: vr::ETextureType) {
-        // TODO: figure out what to pass for the instance...
-        todo!()
+    fn GetOutputDevice(&self, device: *mut u64, texture_type: vr::ETextureType) {
+        if device.is_null() {
+            return;
+        }
+
+        let output = match texture_type {
+            #[cfg(target_os = "windows")]
+            vr::ETextureType::DirectX | vr::ETextureType::DirectX12 => {
+                self.d3d_adapter_luid().unwrap_or(0)
+            }
+            _ => 0,
+        };
+        unsafe { *device = output };
     }
 }
 
@@ -1046,7 +1124,25 @@ mod tests {
     use super::*;
     use crate::{clientcore::Injector, openxr_data::OpenXrData};
     use std::ffi::CStr;
+    use std::sync::atomic::Ordering;
     use vr::IVRSystem022_Interface;
+
+    #[test]
+    fn display_frequency_is_a_rate() {
+        let xr = Arc::new(OpenXrData::new(&Injector::default()).unwrap());
+        let system = System::new(xr.clone(), &Injector::default());
+        xr.display_period_nanos.store(8_333_333, Ordering::Relaxed);
+
+        // Callers such as Half-Life: Alyx treat an untouched error as a failure.
+        let mut err = vr::ETrackedPropertyError::UnknownProperty;
+        let rate = system.GetFloatTrackedDeviceProperty(
+            vr::k_unTrackedDeviceIndex_Hmd,
+            vr::ETrackedDeviceProperty::DisplayFrequency_Float,
+            &mut err,
+        );
+        assert_eq!(err, vr::ETrackedPropertyError::Success);
+        assert!((rate - 120.0).abs() < 0.01, "{rate}");
+    }
 
     #[test]
     fn unity_required_properties() {
@@ -1087,6 +1183,7 @@ mod tests {
 
         test_prop(vr::ETrackedDeviceProperty::SerialNumber_String);
         test_prop(vr::ETrackedDeviceProperty::ManufacturerName_String);
+        test_prop(vr::ETrackedDeviceProperty::ModelNumber_String);
         test_prop(vr::ETrackedDeviceProperty::ControllerType_String);
     }
 }
