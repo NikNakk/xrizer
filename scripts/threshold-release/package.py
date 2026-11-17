@@ -61,8 +61,10 @@ def relocate(root):
     queue = [p for p in root.rglob('*') if macho(p)]
     processed = set()
     originals = {}
+    original_hashes = {}
     for path in queue:
-        originals.setdefault(path.name, []).append((path, digest(path)))
+        original_hashes[path] = digest(path)
+        originals.setdefault(path.name, []).append((path, original_hashes[path]))
     while queue:
         binary = queue.pop()
         if binary in processed:
@@ -95,14 +97,21 @@ def relocate(root):
             else:
                 if '.framework/' in str(source):
                     raise ValueError(f'External framework needs explicit packaging: {source}')
-                matches = [p for p, sha in originals.get(source.name, []) if sha == digest(source)]
-                target = matches[0] if len(matches) == 1 else root / 'lib' / source.name
+                source_hash = digest(source)
+                matches = [p for p, sha in originals.get(source.name, []) if sha == source_hash]
+                target = sorted(matches)[0] if matches else root / 'lib' / source.name
                 target.parent.mkdir(parents=True, exist_ok=True)
-                if not matches and target.exists() and digest(target) != digest(source):
-                    raise ValueError(f'Dylib name collision: {source}')
+                if not matches and target.exists():
+                    target_hash = original_hashes.get(target) or digest(target)
+                    if target_hash != source_hash:
+                        raise ValueError(f'Dylib name collision: {source}')
                 if not target.exists():
                     shutil.copy2(source, target)
                     queue.append(target)
+                    # Relocation changes the copy's bytes. Keep its input identity so
+                    # later references to the same dependency still reuse that copy.
+                    original_hashes[target] = source_hash
+                    originals.setdefault(source.name, []).append((target, source_hash))
             relative = '@loader_path/' + os.path.relpath(target, binary.parent)
             run('install_name_tool', '-change', dependency, relative, str(binary))
         if ids:
