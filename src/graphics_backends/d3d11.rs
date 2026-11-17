@@ -218,8 +218,21 @@ mod platform {
                 return Some(texture.handle);
             }
             let desc = Self::texture_desc(texture.handle);
-            // Resolving MSAA and choosing an array source require separate paths.
-            if desc.SampleDesc.Count != 1 || desc.ArraySize != 1 {
+            // Resolving MSAA requires a separate path. A texture array is accepted, as
+            // SteamVR does for single-pass stereo: each eye reads its own slice.
+            if desc.SampleDesc.Count != 1 || desc.ArraySize == 0 {
+                static REPORTED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    log::warn!(
+                        "Unsupported D3D11 texture: {}x{} format={} samples={} array={}",
+                        desc.Width,
+                        desc.Height,
+                        desc.Format.0,
+                        desc.SampleDesc.Count,
+                        desc.ArraySize
+                    );
+                }
                 return None;
             }
             Some(texture.handle)
@@ -293,6 +306,13 @@ mod platform {
             let (src_box, extent) = Self::rect_from_bounds(&src_desc, bounds);
             let src = Self::borrow_texture(texture);
             let dst = Self::borrow_texture(dst as *mut c_void);
+            // Single-pass stereo submits one array for both eyes: left in slice 0,
+            // right in slice 1 (D3D11CalcSubresource for mip 0). Otherwise slice 0.
+            let src_subresource = if src_desc.ArraySize > 1 {
+                (eye as u32).min(src_desc.ArraySize - 1) * src_desc.MipLevels.max(1)
+            } else {
+                0
+            };
 
             unsafe {
                 self.context.CopySubresourceRegion(
@@ -302,7 +322,7 @@ mod platform {
                     0,
                     0,
                     &*src,
-                    0,
+                    src_subresource,
                     Some(&src_box),
                 );
             }
