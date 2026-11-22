@@ -563,11 +563,12 @@ impl VulkanData {
             .split_ascii_whitespace()
             .map(|ext| CString::new(ext).unwrap())
             .collect();
-        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+        #[cfg_attr(any(not(target_os = "macos"), test), allow(unused_mut))]
         let mut inst_exts = inst_exts;
-        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+        #[cfg_attr(any(not(target_os = "macos"), test), allow(unused_mut))]
         let mut inst_flags = vk::InstanceCreateFlags::empty();
-        #[cfg(target_os = "macos")]
+        // The test entry is fakexr's, which has no loader to ask.
+        #[cfg(all(target_os = "macos", not(test)))]
         portability::add_instance_enumeration(&entry, &mut inst_exts, &mut inst_flags);
         let inst_exts: Vec<*const c_char> = inst_exts.iter().map(|ext| ext.as_ptr()).collect();
 
@@ -599,9 +600,10 @@ impl VulkanData {
             .split_ascii_whitespace()
             .map(|ext| CString::new(ext).unwrap())
             .collect();
-        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+        #[cfg_attr(any(not(target_os = "macos"), test), allow(unused_mut))]
         let mut dev_exts = dev_exts;
-        #[cfg(target_os = "macos")]
+        // The test entry is fakexr's, which has no loader to ask.
+        #[cfg(all(target_os = "macos", not(test)))]
         portability::add_device_subset(&instance, physical_device, &mut dev_exts);
         let dev_exts: Vec<*const c_char> = dev_exts.iter().map(|ext| ext.as_ptr()).collect();
 
@@ -971,6 +973,7 @@ fn new_entry() -> ash::Entry {
 /// VK_KHR_portability_subset must have it enabled. Apps that hand xrizer their own instance and
 /// device have done this themselves; this is for the temporary session xrizer makes itself.
 #[cfg(target_os = "macos")]
+#[cfg_attr(test, allow(dead_code))]
 mod portability {
     use ash::vk;
     use log::{info, warn};
