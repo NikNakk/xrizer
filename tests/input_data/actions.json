@@ -75,6 +75,11 @@
 			"name": "/actions/set1/in/Vib",
 			"requirement": "mandatory",
 			"type": "vibration"
+		},
+		{
+			"name": "/actions/set2/in/boolact",
+			"type": "boolean",
+			"requirement": "optional"
 		}
 	],
 	"default_bindings": [

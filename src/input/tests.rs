@@ -451,6 +451,72 @@ fn input_state_flow() {
 }
 
 #[test]
+fn restricted_action_set_activates_secondary_set_for_other_hand() {
+    let mut f = Fixture::new();
+
+    let set1 = f.get_action_set_handle(c"/actions/set1");
+    let set2 = f.get_action_set_handle(c"/actions/set2");
+    let boolact1 = f.get_action_handle(c"/actions/set1/in/boolact");
+    let boolact2 = f.get_action_handle(c"/actions/set2/in/boolact");
+    let left = f.get_input_source_handle(c"/user/hand/left");
+
+    f.load_actions(c"actions.json");
+    fakexr::set_action_state(
+        f.get_action::<bool>(boolact1),
+        fakexr::ActionState::Bool(true),
+        LeftHand,
+    );
+    fakexr::set_action_state(
+        f.get_action::<bool>(boolact2),
+        fakexr::ActionState::Bool(true),
+        RightHand,
+    );
+
+    f.sync(vr::VRActiveActionSet_t {
+        ulActionSet: set1,
+        ulRestrictedToDevice: left,
+        ulSecondaryActionSet: set2,
+        ..Default::default()
+    });
+
+    assert!(f.get_bool_state(boolact1).unwrap().bActive);
+    assert!(f.get_bool_state(boolact2).unwrap().bActive);
+}
+
+#[test]
+fn non_hand_restriction_activates_only_secondary_set_for_hands() {
+    let mut f = Fixture::new();
+
+    let set1 = f.get_action_set_handle(c"/actions/set1");
+    let set2 = f.get_action_set_handle(c"/actions/set2");
+    let boolact1 = f.get_action_handle(c"/actions/set1/in/boolact");
+    let boolact2 = f.get_action_handle(c"/actions/set2/in/boolact");
+    let gamepad = f.get_input_source_handle(c"/user/gamepad");
+
+    f.load_actions(c"actions.json");
+    fakexr::set_action_state(
+        f.get_action::<bool>(boolact1),
+        fakexr::ActionState::Bool(true),
+        LeftHand,
+    );
+    fakexr::set_action_state(
+        f.get_action::<bool>(boolact2),
+        fakexr::ActionState::Bool(true),
+        RightHand,
+    );
+
+    f.sync(vr::VRActiveActionSet_t {
+        ulActionSet: set1,
+        ulRestrictedToDevice: gamepad,
+        ulSecondaryActionSet: set2,
+        ..Default::default()
+    });
+
+    assert!(!f.get_bool_state(boolact1).unwrap().bActive);
+    assert!(f.get_bool_state(boolact2).unwrap().bActive);
+}
+
+#[test]
 fn reload_manifest_on_session_restart() {
     let mut f = Fixture::new();
 
@@ -736,6 +802,47 @@ fn pose_action_no_restrict() {
         assert!(p.bPoseIsValid);
         compare_pose(expected, p.mDeviceToAbsoluteTracking.into());
     }
+}
+
+#[test]
+fn action_origins_match_pose_and_skeleton_hands() {
+    let mut f = Fixture::new();
+    let set = f.get_action_set_handle(c"/actions/set1");
+    let posel = f.get_action_handle(c"/actions/set1/in/posel");
+    let poser = f.get_action_handle(c"/actions/set1/in/poser");
+    let skellyl = f.get_action_handle(c"/actions/set1/in/skellyl");
+    let skellyr = f.get_action_handle(c"/actions/set1/in/skellyr");
+    let left = f.get_input_source_handle(c"/user/hand/left");
+    let right = f.get_input_source_handle(c"/user/hand/right");
+
+    f.load_actions(c"actions.json");
+    f.set_interaction_profile::<Knuckles>(LeftHand);
+    f.set_interaction_profile::<Knuckles>(RightHand);
+    f.sync(vr::VRActiveActionSet_t {
+        ulActionSet: set,
+        ..Default::default()
+    });
+
+    let get_origins = |action| {
+        let mut origins = [vr::k_ulInvalidInputValueHandle; 2];
+        assert_eq!(
+            f.input
+                .GetActionOrigins(set, action, origins.as_mut_ptr(), origins.len() as u32),
+            vr::EVRInputError::None
+        );
+        origins
+    };
+
+    assert_eq!(get_origins(posel), [left, vr::k_ulInvalidInputValueHandle]);
+    assert_eq!(get_origins(poser), [right, vr::k_ulInvalidInputValueHandle]);
+    assert_eq!(
+        get_origins(skellyl),
+        [left, vr::k_ulInvalidInputValueHandle]
+    );
+    assert_eq!(
+        get_origins(skellyr),
+        [right, vr::k_ulInvalidInputValueHandle]
+    );
 }
 
 #[test]
@@ -1084,4 +1191,134 @@ fn load_actions_race() {
 
     let res = f.get_bool_state(boolact);
     assert!(res.is_ok(), "{res:?}");
+}
+
+#[test]
+fn binding_query_with_session_restart_pending() {
+    let f = Fixture::new();
+    f.load_actions(c"actions.json");
+    let handle = f.get_action_handle(c"/actions/set1/in/boolact");
+    let session = f.input.openxr.session_data.get();
+    let barrier = Barrier::new(2);
+    std::thread::scope(|scope| {
+        let writer = scope.spawn(|| {
+            barrier.wait();
+            f.input.openxr.restart_session();
+        });
+        barrier.wait();
+        // Keep our read guard while the restart queues its exclusive guard.
+        // A second read would wait behind that writer, which needs our guard.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        f.input.state_from_bindings(&session, handle, 0);
+        f.input
+            .state_from_bindings(&session, handle, f.input.left_hand_key.0.as_ffi());
+        f.input
+            .state_from_bindings(&session, handle, f.input.right_hand_key.0.as_ffi());
+        drop(session);
+        writer.join().unwrap();
+    });
+}
+
+/// Copies a test manifest (without its binding files) into a fresh directory of its own.
+fn manifest_copy(test: &str, source: &str) -> std::ffi::CString {
+    let dir = std::env::temp_dir().join(format!("xrizer-{test}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/input_data")
+        .join(source);
+    let copy = dir.join("actions.json");
+    std::fs::copy(source, &copy).unwrap();
+    std::ffi::CString::new(copy.to_str().unwrap()).unwrap()
+}
+
+fn verify_set1_boolact_wand_bindings(f: &Fixture) {
+    f.verify_bindings::<bool>(
+        ViveWands::profile_path(),
+        c"/actions/set1/in/boolact",
+        [
+            "/user/hand/left/input/squeeze/click".into(),
+            "/user/hand/right/input/squeeze/click".into(),
+            "/user/hand/left/input/menu/click".into(),
+            "/user/hand/right/input/menu/click".into(),
+            "/user/hand/left/input/trackpad/click".into(),
+            "/user/hand/left/input/trackpad/touch".into(),
+        ],
+    );
+}
+
+#[test]
+fn identical_manifest_at_another_path() {
+    let mut f = Fixture::new();
+    let set1 = f.get_action_set_handle(c"/actions/set1");
+    let boolact = f.get_action_handle(c"/actions/set1/in/boolact");
+    f.load_actions(c"actions.json");
+    let action = f.get_action::<bool>(boolact);
+
+    // The copy has no binding files beside it: reloading from it would lose the bindings.
+    let copy = manifest_copy("identical-manifest", "actions.json");
+    assert_eq!(
+        f.input.SetActionManifestPath(copy.as_ptr()),
+        vr::EVRInputError::None
+    );
+    assert_eq!(f.get_action_handle(c"/actions/set1/in/boolact"), boolact);
+    assert_eq!(
+        f.get_action::<bool>(boolact),
+        action,
+        "actions were reinitialised"
+    );
+
+    // A session restart reloads the first manifest, with bindings relative to it.
+    f.input.openxr.restart_session();
+    verify_set1_boolact_wand_bindings(&f);
+    fakexr::set_action_state(
+        f.get_action::<bool>(boolact),
+        fakexr::ActionState::Bool(true),
+        LeftHand,
+    );
+    f.sync(vr::VRActiveActionSet_t {
+        ulActionSet: set1,
+        ..Default::default()
+    });
+    assert!(f.get_bool_state(boolact).unwrap().bState);
+}
+
+#[test]
+fn different_manifest_is_mismatched() {
+    let f = Fixture::new();
+    let boolact = f.get_action_handle(c"/actions/set1/in/boolact");
+    f.load_actions(c"actions.json");
+    let action = f.get_action::<bool>(boolact);
+
+    let other = manifest_copy("different-manifest", "actions_toggle.json");
+    assert_eq!(
+        f.input.SetActionManifestPath(other.as_ptr()),
+        vr::EVRInputError::MismatchedActionManifest
+    );
+    assert_eq!(f.get_action::<bool>(boolact), action);
+    verify_set1_boolact_wand_bindings(&f);
+}
+
+#[test]
+fn manifest_path_normalisation() {
+    use super::action_manifest::normalise_manifest_path as n;
+    let windows = |a, b| n(a, true) == n(b, true);
+    // Paths as Outer Wilds and NomaiVR pass them through Wine.
+    assert!(windows(
+        r"Z:/Games/Outer Wilds/OuterWilds_Data/StreamingAssets\SteamVR\actions.json",
+        r"z:\games\outer wilds\OuterWilds_Data\StreamingAssets\\SteamVR\.\actions.json",
+    ));
+    assert!(windows(
+        r"\\server\share\actions.json",
+        "//server/share/actions.json"
+    ));
+    assert!(!windows(
+        r"\\server\share\actions.json",
+        r"\server\share\actions.json"
+    ));
+    assert!(!windows(r"C:\a\actions.json", r"C:\b\actions.json"));
+
+    // Elsewhere a backslash is part of a file name, and case matters.
+    assert_eq!(n(r"/a\b/Actions.json", false), r"/a\b/Actions.json");
+    assert_ne!(n("/a/actions.json", false), n("/a/Actions.json", false));
 }
