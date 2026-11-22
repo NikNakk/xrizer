@@ -34,6 +34,69 @@ fn action_map_to_secondary<T>(
         .collect()
 }
 
+/// Whether two manifest paths name the same file. Windows (and Wine, which hands us Windows
+/// paths) treats `/` and `\` alike, ignores repeated separators and is case-insensitive, so
+/// games can pass the same file as e.g. `C:/Game/Data\SteamVR\actions.json` and
+/// `c:\game\data\steamvr\actions.json`.
+fn manifest_paths_match(a: &Path, b: &Path) -> bool {
+    a == b
+        || normalise_manifest_path(&a.to_string_lossy(), cfg!(windows))
+            == normalise_manifest_path(&b.to_string_lossy(), cfg!(windows))
+}
+
+pub(super) fn normalise_manifest_path(path: &str, windows: bool) -> String {
+    if !windows {
+        return path.to_owned();
+    }
+    let path = path.replace('\\', "/").to_lowercase();
+    let prefix = if path.starts_with("//") {
+        "//"
+    } else if path.starts_with('/') {
+        "/"
+    } else {
+        ""
+    };
+    let components: Vec<_> = path
+        .split('/')
+        .filter(|c| !c.is_empty() && *c != ".")
+        .collect();
+    format!("{prefix}{}", components.join("/"))
+}
+
+/// A second manifest path is acceptable if it holds exactly the manifest already loaded.
+fn check_same_manifest_contents(loaded: &Path, requested: &Path) -> Result<(), vr::EVRInputError> {
+    let requested_data = std::fs::read(requested).map_err(|e| {
+        error!("Failed to read manifest {}: {e}", requested.display());
+        vr::EVRInputError::InvalidParam
+    })?;
+    match std::fs::read(loaded) {
+        Ok(loaded_data) if loaded_data == requested_data => {
+            info!(
+                "action manifest {} is identical to the loaded {}; keeping the loaded actions",
+                requested.display(),
+                loaded.display()
+            );
+            Ok(())
+        }
+        Ok(_) => {
+            error!(
+                "action manifest {} differs from the already loaded {}",
+                requested.display(),
+                loaded.display()
+            );
+            Err(vr::EVRInputError::MismatchedActionManifest)
+        }
+        Err(e) => {
+            error!(
+                "Failed to reread loaded manifest {} to compare with {}: {e}",
+                loaded.display(),
+                requested.display()
+            );
+            Err(vr::EVRInputError::MismatchedActionManifest)
+        }
+    }
+}
+
 impl<C: openxr_data::Compositor> Input<C> {
     pub(super) fn load_action_manifest(
         &self,
@@ -42,7 +105,12 @@ impl<C: openxr_data::Compositor> Input<C> {
     ) -> Result<(), vr::EVRInputError> {
         match self.loaded_actions_path.get() {
             Some(p) => {
-                assert_eq!(p, manifest_path);
+                // Some games set the manifest more than once, not always from the same file:
+                // Outer Wilds sets its own, then NomaiVR sets an identical copy from its mod
+                // folder. Only a manifest with different contents is a real mismatch.
+                if !manifest_paths_match(p, manifest_path) {
+                    check_same_manifest_contents(p, manifest_path)?;
+                }
                 if session_data.input_data.actions.get().is_some() {
                     return Ok(());
                 }
@@ -64,6 +132,9 @@ impl<C: openxr_data::Compositor> Input<C> {
                     .unwrap();
             }
         }
+        // Always (re)load from the first manifest path, so that relative binding paths keep
+        // resolving against the directory the actions were first loaded from.
+        let manifest_path = self.loaded_actions_path.get().unwrap().as_path();
 
         let data = std::fs::read(manifest_path).map_err(|e| {
             error!("Failed to read manifest {}: {e}", manifest_path.display());
