@@ -1085,3 +1085,107 @@ fn load_actions_race() {
     let res = f.get_bool_state(boolact);
     assert!(res.is_ok(), "{res:?}");
 }
+
+/// Copies a test manifest (without its binding files) into a fresh directory of its own.
+fn manifest_copy(test: &str, source: &str) -> std::ffi::CString {
+    let dir = std::env::temp_dir().join(format!("xrizer-{test}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/input_data")
+        .join(source);
+    let copy = dir.join("actions.json");
+    std::fs::copy(source, &copy).unwrap();
+    std::ffi::CString::new(copy.to_str().unwrap()).unwrap()
+}
+
+fn verify_set1_boolact_wand_bindings(f: &Fixture) {
+    f.verify_bindings::<bool>(
+        ViveWands::profile_path(),
+        c"/actions/set1/in/boolact",
+        [
+            "/user/hand/left/input/squeeze/click".into(),
+            "/user/hand/right/input/squeeze/click".into(),
+            "/user/hand/left/input/menu/click".into(),
+            "/user/hand/right/input/menu/click".into(),
+            "/user/hand/left/input/trackpad/click".into(),
+            "/user/hand/left/input/trackpad/touch".into(),
+        ],
+    );
+}
+
+#[test]
+fn identical_manifest_at_another_path() {
+    let mut f = Fixture::new();
+    let set1 = f.get_action_set_handle(c"/actions/set1");
+    let boolact = f.get_action_handle(c"/actions/set1/in/boolact");
+    f.load_actions(c"actions.json");
+    let action = f.get_action::<bool>(boolact);
+
+    // The copy has no binding files beside it: reloading from it would lose the bindings.
+    let copy = manifest_copy("identical-manifest", "actions.json");
+    assert_eq!(
+        f.input.SetActionManifestPath(copy.as_ptr()),
+        vr::EVRInputError::None
+    );
+    assert_eq!(f.get_action_handle(c"/actions/set1/in/boolact"), boolact);
+    assert_eq!(
+        f.get_action::<bool>(boolact),
+        action,
+        "actions were reinitialised"
+    );
+
+    // A session restart reloads the first manifest, with bindings relative to it.
+    f.input.openxr.restart_session();
+    verify_set1_boolact_wand_bindings(&f);
+    fakexr::set_action_state(
+        f.get_action::<bool>(boolact),
+        fakexr::ActionState::Bool(true),
+        LeftHand,
+    );
+    f.sync(vr::VRActiveActionSet_t {
+        ulActionSet: set1,
+        ..Default::default()
+    });
+    assert!(f.get_bool_state(boolact).unwrap().bState);
+}
+
+#[test]
+fn different_manifest_is_mismatched() {
+    let f = Fixture::new();
+    let boolact = f.get_action_handle(c"/actions/set1/in/boolact");
+    f.load_actions(c"actions.json");
+    let action = f.get_action::<bool>(boolact);
+
+    let other = manifest_copy("different-manifest", "actions_toggle.json");
+    assert_eq!(
+        f.input.SetActionManifestPath(other.as_ptr()),
+        vr::EVRInputError::MismatchedActionManifest
+    );
+    assert_eq!(f.get_action::<bool>(boolact), action);
+    verify_set1_boolact_wand_bindings(&f);
+}
+
+#[test]
+fn manifest_path_normalisation() {
+    use super::action_manifest::normalise_manifest_path as n;
+    let windows = |a, b| n(a, true) == n(b, true);
+    // Paths as Outer Wilds and NomaiVR pass them through Wine.
+    assert!(windows(
+        r"Z:/Games/Outer Wilds/OuterWilds_Data/StreamingAssets\SteamVR\actions.json",
+        r"z:\games\outer wilds\OuterWilds_Data\StreamingAssets\\SteamVR\.\actions.json",
+    ));
+    assert!(windows(
+        r"\\server\share\actions.json",
+        "//server/share/actions.json"
+    ));
+    assert!(!windows(
+        r"\\server\share\actions.json",
+        r"\server\share\actions.json"
+    ));
+    assert!(!windows(r"C:\a\actions.json", r"C:\b\actions.json"));
+
+    // Elsewhere a backslash is part of a file name, and case matters.
+    assert_eq!(n(r"/a\b/Actions.json", false), r"/a\b/Actions.json");
+    assert_ne!(n("/a/actions.json", false), n("/a/Actions.json", false));
+}
